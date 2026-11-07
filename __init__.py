@@ -1266,6 +1266,12 @@ class MusicSynthPlugin(NekoPluginBase):
                          / "pretrain" / "bases" / defaults[tier])
             if candidate.is_file():
                 return candidate
+        # 同一目录下其它名字的官方包：跟首次检测共用一套判定（结构优先），
+        # 免得检测说「已就绪」、训练却悄悄回退到中档。
+        if path_key:
+            found = setup_mod.resolve_tier_base(self._pipeline.paths, tier, installed)
+            if found is not None:
+                return found
         return Path(str(self._pipeline.paths.get("ddsp_pretrain_reflow") or ""))
 
     def _train_runs_root(self) -> Path:

@@ -223,6 +223,26 @@ ACE 原曲是立体声（左右相关约 0.93），经过「让她唱」后成�
 - 训练时自动把 `.sf_dlc` 转成 `model_0.pt`，并按推断的 arch 覆盖训练配置。
 - 自动 batch 估算会按底模层数/通道放大每 batch 显存，避免高档底模直接 OOM。
 
+## 首次检测认可 bases 下的 .sf_dlc（2026-11-07）
+
+背景：用户机器上早已放好官方 `ddsp6.3_6x512_10x2048.sf_dlc` /
+`ddsp6.3_6x512_6x512.sf_dlc`，但 `ms_setup_check` 只找转好的 `high.pt` /
+`low.pt`，把两项报成「可选缺失 · 1.1GB」，误导用户以为要下载。
+
+- `setup.py` 里 `ddsp_base_low/high` 增加 `tier` 字段；`_missing_files` 判定缺失后，
+  `_find_tier_base` 会扫 `<ddsp_root>/pretrain/bases/*.sf_dlc`。
+- 档位优先按 `workers/base_ckpt.py`（DDSP 环境自己的解析器）读出的
+  `n_layers/n_chans` 判定：6 层/512 → 低，10 层/2048 → 高；结构读出来但不符
+  档位的不会被文件名放行。解析器不可用（DDSP 环境没装好）时才退回官方文件名
+  `ddsp6.3_6x512_<层>x<通道>.sf_dlc`。
+- 解析结果按「路径+大小+mtime」缓存在进程内，冷启动一次约 1.5 秒/文件，
+  之后重复检测不再起子进程（实测第二次 `check_dependencies` 0.11 秒）。
+- 报告条目新增 `resolved_path` / `detected_by`（`arch` 或 `filename`），`detail`
+  写明「已就绪：结构 10 层 / 2048 通道」。两项仍是 `optional=true`，可选组、
+  跳过引导的语义不变；判定就绪后 `install(items=None)` 自然不会再排这两项下载。
+- `setup.resolve_tier_base` 与 `_train_base_ckpt` 共用同一判定（官方文件名之后的
+  兜底），避免「检测说已就绪、训练却回退中档」。
+
 ## 分享/冷启动链路（2026-11-07）
 
 - 低/高训练底模纳入 `setup.MODEL_ITEMS`（kind=dlc，hf-mirror + HuggingFace 回退），

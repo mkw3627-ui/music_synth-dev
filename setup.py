@@ -125,6 +125,8 @@ MODEL_ITEMS = {
         "files": ("low.pt",),
         # 质量档位，不装也能训练（自动回退到中档），所以不是必需项。
         "optional": True,
+        # 同一个 bases 目录里直接放官方 .sf_dlc 包也算就绪（见 _find_tier_base）。
+        "tier": "low",
     },
     "ddsp_base_high": {
         "label": "高质量训练底模（10x2048）",
@@ -136,6 +138,7 @@ MODEL_ITEMS = {
         "files": ("high.pt",),
         # 质量档位，不装也能训练（自动回退到中档），所以不是必需项。
         "optional": True,
+        "tier": "high",
     },
     "sep_karaoke": {
         "label": "人声分离权重（Mel-Band RoFormer Karaoke）",
@@ -464,6 +467,124 @@ def _missing_files(spec: dict, target: Path) -> list[str]:
     return missing
 
 
+# 低/高两档底模有两种落盘方式：安装清单转好的 low.pt / high.pt，或者用户
+# 直接放进来的官方 .sf_dlc 包。后者是官方发布格式，训练侧本来就会用
+# （见 _train_base_ckpt 的 bases 回退），检测不能只看 low.pt / high.pt。
+SF_DLC_TIER_ARCH = {"low": (6, 512), "high": (10, 2048)}
+_SF_DLC_CACHE: dict[tuple, dict] = {}
+_SF_DLC_CACHE_LOCK = threading.Lock()
+
+
+def _tier_of_arch(n_layers, n_chans) -> str:
+    """把结构参数归到质量档位；不是官方档位就返回空串。"""
+    try:
+        layers, chans = int(n_layers or 0), int(n_chans or 0)
+    except (TypeError, ValueError):
+        return ""
+    for tier, (want_layers, want_chans) in SF_DLC_TIER_ARCH.items():
+        if layers == want_layers and chans == want_chans:
+            return tier
+    return ""
+
+
+def _tier_of_name(path: Path) -> str:
+    """官方命名 ddsp6.3_6x512_<层>x<通道>.sf_dlc 的兜底判断（解析器不可用时）。"""
+    match = re.search(r"_(\d+)x(\d+)$", Path(path).stem)
+    if not match:
+        return ""
+    return _tier_of_arch(match.group(1), match.group(2))
+
+
+def _inspect_sf_dlc(path: Path, python: Path, cwd: Path) -> dict:
+    """用 DDSP 环境自己的底模解析器读 .sf_dlc 的网络结构。
+
+    返回 {"ok": True, "n_layers": int, "n_chans": int} 或 {"ok": False, "error": str}；
+    解析器缺失 / 报错 / 超时都只当作「没读到」，由调用者退回文件名判断。
+    """
+    script = Path(__file__).resolve().parent / "workers" / "base_ckpt.py"
+    if not Path(python).is_file() or not script.is_file():
+        return {"ok": False, "error": "没有可用的 DDSP 环境或底模解析器"}
+    try:
+        info = runtime.run_worker(Path(python), script, {"path": str(path)},
+                                  cwd=cwd, timeout=180)
+    except Exception as exc:  # noqa: BLE001 - 检测失败不是致命错误
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    arch = info.get("arch") if isinstance(info, dict) else None
+    if not (isinstance(info, dict) and info.get("ok")
+            and info.get("supported") and isinstance(arch, dict)):
+        return {"ok": False, "error": str(
+            (info or {}).get("error") or "底模解析器没读出结构")}
+    layers, chans = arch.get("n_layers"), arch.get("n_chans")
+    if not layers or not chans:
+        return {"ok": False, "error": "底模里没有网络结构信息"}
+    return {"ok": True, "n_layers": int(layers), "n_chans": int(chans)}
+
+
+def _sf_dlc_arch(path: Path, python: Path, cwd: Path) -> dict:
+    """带缓存的结构探测：同一文件（大小+mtime 不变）只解析一次。"""
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        return {"ok": False, "error": f"读不到文件：{exc}"}
+    key = (str(path), stat.st_size, stat.st_mtime_ns)
+    with _SF_DLC_CACHE_LOCK:
+        hit = _SF_DLC_CACHE.get(key)
+    if hit is not None:
+        return hit
+    info = _inspect_sf_dlc(path, python, cwd)
+    if info.get("ok"):
+        with _SF_DLC_CACHE_LOCK:
+            _SF_DLC_CACHE[key] = info
+            while len(_SF_DLC_CACHE) > 32:
+                _SF_DLC_CACHE.pop(next(iter(_SF_DLC_CACHE)))
+    return info
+
+
+def _find_tier_base(paths: dict, spec: dict, target: Path) -> tuple[Path | None, str, str]:
+    """在 bases 目录里找与该档位匹配的官方 .sf_dlc。
+
+    返回 (路径, 判定说明, 判定方式)；判定方式为 ``arch``（读结构）或
+    ``filename``（文件名兜底）。档位优先按底模解析器读出来的结构（层数/
+    通道数）判定；解析器不可用时才退回官方文件名。结构读出来但不符档位的，
+    不会因为文件名像就放行。
+    """
+    tier = str(spec.get("tier") or "")
+    if tier not in SF_DLC_TIER_ARCH:
+        return None, "", ""
+    bases = target.parent
+    try:
+        candidates = sorted(p for p in bases.glob("*.sf_dlc") if p.is_file())
+    except OSError:
+        return None, "", ""
+    python = Path(str(paths.get("synth_python") or ""))
+    cwd = Path(tempfile.gettempdir()) / "neko_music_synth_base_scan"
+    for cand in candidates:
+        info = _sf_dlc_arch(cand, python, cwd)
+        if info.get("ok"):
+            if _tier_of_arch(info.get("n_layers"), info.get("n_chans")) == tier:
+                return (cand, f"结构 {info['n_layers']} 层 / {info['n_chans']} 通道",
+                        "arch")
+            continue
+        if _tier_of_name(cand) == tier:
+            return cand, "官方文件名档位", "filename"
+    return None, "", ""
+
+
+def resolve_tier_base(paths: dict, tier: str, target: Path | None = None) -> Path | None:
+    """给训练侧用：bases 下对应这个质量档位的官方 .sf_dlc（没有就 None）。
+
+    和首次检测共用同一套判定，避免「检测说已就绪、训练却回退中档」。
+    """
+    tier = str(tier or "").strip().lower()
+    if tier not in SF_DLC_TIER_ARCH:
+        return None
+    if target is None:
+        root = Path(str(paths.get("ddsp_root") or ""))
+        target = root / "pretrain" / "bases" / f"{tier}.pt"
+    found, _how, _method = _find_tier_base(paths, {"tier": tier}, Path(target))
+    return found
+
+
 def _install_zip(spec: dict, dest_root: Path, progress, label: str) -> None:
     """Download a release zip and place its contents under ``dest_root``.
 
@@ -775,16 +896,28 @@ def check_dependencies(paths: dict, probe: dict | None = None) -> dict:
         base = _model_base(spec, target)
         dest = str(_model_zip_dir(spec, target) if spec["kind"] == "zip" else base)
         missing = _missing_files(spec, base)
+        resolved, detected_by, detected_method = None, "", ""
+        if missing and spec.get("tier"):
+            # 没转好的 low.pt / high.pt 时，bases 里的官方 .sf_dlc 也算就绪。
+            resolved, detected_by, detected_method = _find_tier_base(paths, spec, target)
+            if resolved is not None:
+                missing = []
         optional = bool(spec.get("optional"))
-        items.append(_item(
+        item = _item(
             key, spec["label"], "ready" if not missing else "missing",
-            (f"{dest}（已就绪）" if not missing
+            (f"{resolved}（已就绪：{detected_by}）" if resolved is not None else
+             f"{dest}（已就绪）" if not missing
              else f"缺少 {len(missing)}/{len(spec['files'])} 个文件 · {dest}"),
             required=not optional, installable=bool(missing),
             fix=("自动下载并支持断点续传" if not missing else
                  f"自动下载到 {dest}（约 {spec['size_gb']}GB，支持断点续传）"),
             size_gb=0.0 if not missing else float(spec["size_gb"]),
-            action="" if not missing else f"model:{key}"))
+            action="" if not missing else f"model:{key}")
+        if resolved is not None:
+            # 报告里标明是哪个文件、按什么判定的（arch=结构，filename=文件名）。
+            item["resolved_path"] = str(resolved)
+            item["detected_by"] = detected_method
+        items.append(item)
 
     # disk -----------------------------------------------------------------
     root = Path(paths["compute_root"])
