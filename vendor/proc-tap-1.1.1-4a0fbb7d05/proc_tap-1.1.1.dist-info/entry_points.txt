@@ -1,2 +1,0 @@
-[console_scripts]
-proctap = proctap.__main__:main

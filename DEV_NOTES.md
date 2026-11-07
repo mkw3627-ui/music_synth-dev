@@ -319,3 +319,19 @@ v0.2.28 的发布任务就是死在这一条上，被点名的有：
 实测：在 `E:/NekoMusicSynth/envs/ddsp` 里 `pip install proc-tap==1.1.1 winrt-Windows.Media.Control`
 后，用插件同样的隔离方式 `python -I -S` 可以正常 `import proctap` 和
 `from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager`。
+
+### 0.2.30：过 2 MiB 单文件上限
+
+v0.2.29 的发布检查已经不再报二进制，但换成两条新问题：
+
+- `[ERROR] the Market rejects package files over 2 MiB: vendor/acestep/genres_vocab.txt`
+  —— 市场对**单个文件**还有 2 MiB 上限。这个词表只被 ACE 的
+  `MetadataConstrainedLogitsProcessor`（LLM 约束解码）用到，而本插件
+  `ace_runtime.py` 固定 `use_constrained_decoding=False`、也不加载 LM，
+  所以直接删掉，不再随包发。
+- `[WARN] could not derive plugin metadata (staged tree contains directories that
+  cannot survive packaging (['vendor/proc-tap-1.1.1-4a0fbb7d05/bin']))`
+  —— 排除 .exe 之后留下一个空目录，导致插件元数据推断失败、入口参数 schema 丢失。
+  处理：`vendor/proc-tap-1.1.1-4a0fbb7d05/` 与 `vendor/smtc_vendor/` 整个从仓库移除，
+  原生组件统一走安装时 pip（`CAPTURE_NATIVE_PACKAGES`）。备份留在
+  `D:\ruanjian\N.E.K.O\_vendor_backup_20261107\`（也在 git 历史里）。
