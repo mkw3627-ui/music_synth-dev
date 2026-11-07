@@ -22,18 +22,20 @@ import uuid
 from pathlib import Path
 
 from plugin.sdk.plugin import (
-    NekoPluginBase, Ok, lifecycle, llm_tool, neko_plugin, plugin_entry, ui,
+    NekoPluginBase,
+    Ok,
+    lifecycle,
+    llm_tool,
+    neko_plugin,
+    plugin_entry,
+    ui,
 )
 
-from . import runtime
-from . import vram_policy
-from . import model_package
+from . import cache_cleanup, lips_server, lipsync, model_package, runtime, vram_policy
 from . import setup as setup_mod
-from . import lipsync
-from . import lips_server
-from .pipeline import Pipeline, STEP_ORDER
+from .pipeline import STEP_ORDER as STEP_ORDER
+from .pipeline import Pipeline
 from .song_listener import SongListener
-from . import cache_cleanup
 
 PLUGIN_ID = "music_synth"
 
@@ -3908,7 +3910,6 @@ class MusicSynthPlugin(NekoPluginBase):
         target = self._trash_dir() / f"{int(time.time() * 1000)}_{path.name}"
         try:
             shutil.move(str(path), str(target))
-            moved = True
         except OSError as exc:
             return {"ok": False, "error": f"{exc}", "moved": False}
         manifest = self._trash_manifest()

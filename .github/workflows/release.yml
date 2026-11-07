@@ -1,0 +1,19 @@
+name: Release N.E.K.O Plugin
+
+# 市场发布版本走 GitHub Release：推一个 v<plugin.toml 里的 version> 标签，
+# 由 N.E.K.O 官方可复用工作流打包、跑 market check、生成 market-evidence.json
+# 并创建 Release（附件就是 .neko-plugin）。市场页面再从这个 Release 选版本发布。
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: Project-N-E-K-O/N.E.K.O/.github/workflows/plugin-market-release.yml@main
+    with:
+      plugin-id: music_synth
+      neko-ref: main

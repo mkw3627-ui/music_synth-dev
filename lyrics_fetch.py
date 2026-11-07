@@ -261,7 +261,7 @@ def fetch_official_lrc(title: str, artist: str, source_path: str | None = None,
                     cleaned = clean_lrc(lrc, artist)
                     if cleaned:
                         return cleaned, f"netease:{sid}"
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             pass  # 降级到下一来源，不抛
 
     # 3) lrclib.net
