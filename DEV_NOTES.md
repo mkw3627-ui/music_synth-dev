@@ -488,3 +488,24 @@ config.example.toml」，但移动会改变默认值来源，这次只记录不�
   拦（`knownMissing` 只看 `required && !ok && installable`）。
 
 
+
+## 0.2.33：内置体验音色 + 新手引导重做（2026-11-08）
+
+- **内置体验音色「沫沫」**：原 `voice_20261107_104445` 改名为沫沫（3 个 LoRA 变体、
+  exp 目录、`ddsp_ckpt` 同步改，仍然是同一个 `model_2000.pt`，1,037,295,771 字节）。
+  新增 `data/bundled_voices.json` 登记表（名字 → 试听样曲），`ms_ace_loras` /
+  `ms_state` 给登记过的音色补 `bundled` / `demo` 标记，卡片显示「内置 · 体验」；
+  `ms_ace_preview` / `ms_train_preview` 命中内置音色时直接返回自带 demo，不跑推理。
+  试听是整首 mp3：2,029,100 字节（1.94 MiB）、253.6 秒、48 kHz 双声道，市场允许
+  `.mp3` 资产不受 2 MiB 单文件限制，也不会触发二进制扫描。
+- **新手引导重做（五页）**：体验（大播放器放沫沫 demo）→ 功能（7 项翻页）→
+  用法（导入→选音色→生成→试听导出）→ 环境（17 项检测、单项/一键安装）→ 开始。
+  旧引导约 40 条原文逐条保留（对照表 `_backup_onboarding/old-content-mapping.md`）。
+  安装位置改为系统「选择文件夹」：宿主桥 `nekoHost.pickDirectory` → 新入口
+  `ms_setup_browse`（ctypes `SHBrowseForFolderW`，tkinter 兜底）。
+- **高低质量训练底模改为可选**：`optional=true`，缺了不拦跳过引导；概览把
+  「必需 / 可选」体积分开显示。
+- **底模检测修复**：`pretrain/bases` 下的官方 `.sf_dlc` 按结构认档位
+  （`workers/base_ckpt.py` 读 `n_layers`/`n_chans`；6 层/512=低档，10 层/2048=高档），
+  解析器不可用时退回官方文件名；`_train_base_ckpt` 共用同一判定。首次检测不再
+  把已放好的底模报成「缺 1.1GB」。
