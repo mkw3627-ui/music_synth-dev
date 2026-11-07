@@ -31,8 +31,15 @@ from plugin.sdk.plugin import (
     ui,
 )
 
-from . import cache_cleanup, lips_server, lipsync, model_package, runtime, vram_policy
-from . import vram_release
+from . import (
+    cache_cleanup,
+    lips_server,
+    lipsync,
+    model_package,
+    runtime,
+    vram_policy,
+    vram_release,
+)
 from . import setup as setup_mod
 from .pipeline import STEP_ORDER as STEP_ORDER
 from .pipeline import Pipeline
