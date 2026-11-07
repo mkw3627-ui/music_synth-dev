@@ -3491,7 +3491,10 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     recorded: ["录好了 · 等着唱", "success"],
     running: ["正在处理", "warning"],
     done: ["做好啦", "success"],
-    failed: ["没成功", "error"]
+    failed: ["没成功", "error"],
+    instrumental: ["纯音乐 · 唱不了", "neutral"],
+    incomplete: ["没放完整 · 唱不了", "warning"],
+    silent: ["录音没声音", "warning"]
   };
   var JOB_STATE = {
     queued: ["排队", "neutral"],
@@ -3759,6 +3762,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
                 ] })
               ] }) : null,
               t.error ? /* @__PURE__ */ jsx(Err, { children: t.error }) : null,
+              t.check_reason ? /* @__PURE__ */ jsx(Muted, { style: { color: "#b9750f" }, children: t.check_reason }) : null,
               art.final ? /* @__PURE__ */ jsxs(Muted, { style: { wordBreak: "break-all" }, children: [
                 "成品在 ",
                 art.final

@@ -360,3 +360,44 @@ v0.2.29 的发布检查已经不再报二进制，但换成两条新问题：
 未动：`[music_synth]` 段里的旧运行配置（`sep_backend` / `precision` / `max_parallel` /
 `download_source` / `auto_setup`）。校验器对它的提示是「仍兼容，建议移到
 config.example.toml」，但移动会改变默认值来源，这次只记录不动。
+
+## 0.2.32：合并本地已装版本的功能（2026-11-07）
+
+本地安装目录（`.neko-plugin-installations/plugins/music_synth`，0.2.25 + 后续本地改动）
+和仓库（0.2.31）是两条分叉。这次把两边合到一起，功能不删减。
+
+从本地合入：
+
+- **口型轨**：`lipsync.build_track_payload` / `track_lyrics`（payload v3）、
+  `_carry_visemes`（长音符/促音/表外字沿用邻字口型）、`vocal_syllable_onsets` +
+  `_snap_bounds`（行内字边界吸附到干声起音）。流水线处理时预生成 `lips.json`，
+  播放只读盘；播放侧 `_lips_payload` 优先用缓存，歌词变了会自动重算。
+- **翻唱可用性判断**：`workers/song_check_worker.py` + `Pipeline._check_song`
+  （纯音乐 / 录音不完整 / 空录音）。`ms_sing_anchor(force=true)` 可强制照唱；
+  面板显示 `instrumental` / `incomplete` / `silent` 与 `check_reason`。
+- **录音完整性**：`app_song_worker` 记录播放器报的整首时长与起止进度
+  （`expected_s` / `start_position_s` / `end_position_s`），`song_listener` 同步给
+  「为她所听」；播放器不报时用 `lyrics_fetch.fetch_song_duration` 兜底。
+- **训练前释放显存**：`vram_release.py`。先请求「为她所听」只停 GPU 模型，
+  失败再整插件停掉；训练进入等待/结束后空闲 45 秒，由后台线程恢复。
+- **语料流程**：`_slice_bounds` 两级切口（长静音 + 句间换气）、`_snap_cut` 切到
+  附近最安静的一帧；`dry_sing` 改为 bg_probe 粗筛 + 伴奏轨核对
+  （`workers/stem_check_worker.py`）+ 纯音乐跳过（`song_check_worker`）；
+  `ms_corpus_reprocess` 按新流程重跑历史素材。**取消去混响**：anvuew 会把
+  6~11 kHz（齿音、气声、咬字）压掉 20~37 dB，人声发闷，训练素材同样不再走这一步。
+
+保留仓库侧（不回退）：
+
+- 0.2.27 采集 stderr 排障、0.2.28 CPU 降级、0.2.29 原生组件改 pip、
+  0.2.30 过 2 MiB、0.2.31 入口去重与 plugin.toml 字段合规。
+- `_run_attempts`：DDSP / SoulX 变声 OOM 自动改走 CPU（本地版还没迁到这两处）。
+- **`runtime.is_oom`**：0.2.31 的 runtime.py 里漏了这个函数，而 `pipeline.py` 与
+  `__init__.py` 都在调用它——任何 worker 失败都会 `AttributeError`。这次补回。
+
+验证（本机用 stub 的 `plugin.sdk` 真实 import 插件包）：
+
+- 合并后 75 个唯一 `@plugin_entry`、0 重复、3 个 `@llm_tool`，
+  所有 `@ui.action` 指向的入口都存在。
+- 本地安装版是 76 个声明（含重复的 `ms_set_active_model`），仓库 0.2.31 是 74 个；
+  合并后 75 = 74 + `ms_corpus_reprocess`，入口 id 集合与本地版完全一致
+  （`ms_set_active_model` 只注册 1 次，保留 0.2.31 的修复）。

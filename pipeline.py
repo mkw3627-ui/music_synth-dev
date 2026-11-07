@@ -162,6 +162,9 @@ class Pipeline:
         self.last_probe: dict = {}
         self.last_plan: dict = {}
         self.last_probe_at = ""
+        # 插件构造时挂上：track -> (lrc_text, source)。流水线里预生成口型轨
+        # 要用它去抓官方歌词，和播放时走同一条逻辑。
+        self.lrc_fetcher = None
 
     # ---------------- helpers ----------------
     def _log(self, message: str) -> None:
@@ -405,11 +408,15 @@ class Pipeline:
         self._log(f"[{track_id}] soulx convert: {result.get('wav')}")
         return result
 
-    # 开唱前的人声清理链：和训练素材的处理保持一致（去混响 → 去噪）。
+    # 开唱前的人声清理链：只去噪，不去混响。
+    # 去混响（anvuew）会把 6~11 kHz（齿音、气声、咬字的清晰度）压掉 20~37 dB，
+    # 人声立刻发闷发糊；训练素材那边也已经把这一步整个拿掉了，两边保持一致。
     _CLEAN_MODELS = [
-        ("dereverb", "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt", "noreverb"),
         ("denoise", "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt", "dry"),
     ]
+    # 2 = 不含去混响。旧目录里的 clean/denoise/_dry.wav 是拿去混响之后的结果再降噪的，
+    # 不能当缓存复用，否则等于把去混响偷偷带回来。
+    _CLEAN_VERSION = "2"
 
     def _clean_vocal(self, track_id: str, out_dir: Path, vocals: str, plan: dict,
                      resume: bool = True) -> dict:
@@ -421,6 +428,14 @@ class Pipeline:
         python = Path(self.paths["sep_python"])
         if not python.is_file() or not vocals:
             return {"ok": False, "error": "分离环境未就绪"}
+        # 清理链版本对不上就重算（旧缓存是「去混响 + 去噪」两步出来的）
+        ver_file = out_dir / "clean" / "version.txt"
+        try:
+            cached_ver = ver_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            cached_ver = ""
+        if cached_ver != self._CLEAN_VERSION:
+            resume = False
         cur = vocals
         for name, model, stem in self._CLEAN_MODELS:
             stage_dir = out_dir / "clean" / name
@@ -460,6 +475,11 @@ class Pipeline:
                 return {"ok": False, "step": name, "error": f"{name} 未产出 {stem} 轨"}
             cur = str(nxt)
             self._log(f"[{track_id}] clean/{name} -> {cur}")
+        try:
+            ver_file.parent.mkdir(parents=True, exist_ok=True)
+            ver_file.write_text(self._CLEAN_VERSION, encoding="utf-8")
+        except OSError:
+            pass
         return {"ok": True, "wav": cur}
 
     def _ref_f0_hz(self) -> float:
@@ -541,6 +561,79 @@ class Pipeline:
             })
         return self._run_attempts(python, self.workers / "separate_worker.py", job,
                                   out_dir, 3600, attempts, f"[{track.get('id')}] 分离")
+
+    def _check_song(self, track: dict, vocals: str) -> dict:
+        """能不能翻唱：纯音乐没人声、录音残缺、采集到静音。
+
+        人声判断直接用刚分离出来的人声轨（不额外占显存）；完整性优先用
+        播放器报的整首时长和播放进度，播放器不报就只做「缺头 / 太短」这类
+        能确定的判断，其余标成未确认——没证据就不拦歌。
+        """
+        python = Path(str(self.paths.get("synth_python") or ""))
+        if not python.is_file():
+            return {"ok": False, "error": f"计算环境未就绪（缺少 {python}）"}
+        job = {
+            "input": str(track.get("source") or ""),
+            "vocals": str(vocals or ""),
+            "expected_s": 0.0,
+            "start_position_s": track.get("start_position_s"),
+            "end_position_s": track.get("end_position_s"),
+            "min_song_s": float(self.paths.get("min_song_s") or 25.0),
+        }
+        expected = float(track.get("expected_s") or 0.0)
+        expected_from = "player" if expected > 0 else ""
+        if expected <= 0 and track.get("auto_recorded"):
+            # 播放器（老版本网易云）不报整首时长时，用公开搜索接口查唱片版本
+            # 的时长兜底；查不到就保持未知，不拦歌。
+            try:
+                from . import lyrics_fetch
+                sec = lyrics_fetch.fetch_song_duration(
+                    str(track.get("title") or ""), str(track.get("artist") or ""),
+                    timeout=6.0)
+            except Exception as exc:  # noqa: BLE001 - 查不到不影响判断
+                sec = None
+                self._log(f"[{track.get('id')}] 查整首时长失败：{exc}")
+            if sec:
+                expected, expected_from = float(sec), "lookup"
+                self._log(f"[{track.get('id')}] 整首时长（查询）：{expected:.1f}s")
+        job["expected_s"] = expected
+        job["expected_from"] = expected_from
+        return runtime.run_worker(python, self.workers / "song_check_worker.py", job,
+                                  cwd=self.work_dir, timeout=900,
+                                  log_path=self.log_path)
+
+    # ---------------- 口型轨 ----------------
+    def _build_lips(self, track: dict, out_dir: Path, stem: str,
+                    duration: float = 0.0) -> dict:
+        """逐字口型轨算一次、落盘成 ``<track>/lips.json``。
+
+        唱的时候读进度条只要把这份数据直接发布出去就行，不用现场抓歌词、
+        算包络、做对齐——这几个动作加起来就是几秒的「嘴不动」。
+        """
+        from . import lipsync
+
+        track_id = str(track.get("id") or "")
+        payload = lipsync.build_track_payload(
+            track, stem=stem, duration=duration, lrc_fetcher=self.lrc_fetcher)
+        target = out_dir / "lips.json"
+        tmp = target.with_suffix(".json.part")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, target)
+        official = payload.get("official_lyrics")
+        if official and track_id:
+            # 歌词顺手存回曲目，下次播放/重跑不用再联网找一遍。
+            try:
+                self.store.update(track_id, official_lyrics=official)
+            except Exception:  # noqa: BLE001 - 存不下来不影响口型
+                pass
+        return {"path": str(target), "mode": payload.get("mode"),
+                "cues": len(payload.get("cues") or []),
+                "env": len(payload.get("env") or []),
+                "align": payload.get("align"),
+                "source": payload.get("source"),
+                "chars": sum(1 for cue in (payload.get("cues") or [])
+                             if isinstance(cue, list) and len(cue) > 1
+                             and cue[1] != "rest")}
 
     # ---------------- full track ----------------
     def _trash_path(self, path: Path) -> None:
@@ -634,6 +727,54 @@ class Pipeline:
                           artifacts={"vocals": vocals, "instrumental": instrumental,
                                      "separate_files": sep.get("files", [])})
 
+            # 1.2) 能不能唱：纯音乐 / 残缺录音 / 空录音 → 在这里停住 -----
+            # 后面是最吃显存的变声和混音；不能唱的歌不该白跑一遍。
+            check_step = steps0.get("check") or {}
+            if bool(track.get("check_override")):
+                self._step(track_id, "check", "skipped", note="用户要求照唱")
+                self._log(f"[{track_id}] 用户要求照唱，跳过可用性判断")
+            else:
+                reused_check = (resume and str(check_step.get("state") or "") == "done"
+                                and check_step.get("singable") is not None)
+                if reused_check:
+                    verdict = {"singable": bool(check_step.get("singable")),
+                               "status": str(check_step.get("verdict") or "ok"),
+                               "reason": str(check_step.get("reason") or ""),
+                               "detail": check_step.get("detail") or {}}
+                    self._log(f"[{track_id}] resume: 复用可用性判断 "
+                              f"{verdict['status']} singable={verdict['singable']}")
+                else:
+                    self._step(track_id, "check", "running")
+                    chk = self._check_song(track, vocals)
+                    if chk.get("ok"):
+                        verdict = chk
+                        self._step(track_id, "check", "done",
+                                   singable=bool(chk.get("singable")),
+                                   verdict=chk.get("status"),
+                                   reason=chk.get("reason") or "",
+                                   detail=chk.get("detail") or {})
+                        self._log(f"[{track_id}] 可用性：{chk.get('status')} "
+                                  f"has_vocals={chk.get('has_vocals')} "
+                                  f"complete={chk.get('complete')} "
+                                  f"{chk.get('reason') or ''}")
+                    else:
+                        # 判断不了不能当成「不能唱」：宁可放过去，也不能凭
+                        # 一次检查失败把歌拦死。
+                        verdict = {"singable": True, "status": "ok", "reason": ""}
+                        self._step(track_id, "check", "skipped", error=chk.get("error"))
+                        self._log(f"[{track_id}] 可用性判断没做成，按能唱继续："
+                                  f"{chk.get('error')}")
+                if verdict.get("singable") is False:
+                    status = str(verdict.get("status") or "incomplete")
+                    reason = str(verdict.get("reason") or "这首歌暂时不能翻唱")
+                    self._set(track_id, status=status, progress=100, error="",
+                              check_status=status, check_reason=reason,
+                              check_detail=verdict.get("detail") or {})
+                    self._log(f"[{track_id}] 不能翻唱（{status}）：{reason}")
+                    return {"ok": True, "blocked": True, "step": "check",
+                            "status": status, "note": reason,
+                            "detail": verdict}
+
             # 1.5) 人声清理（去混响 → 去噪），和训练素材对齐 ---------------
             clean_step = steps0.get("clean") or {}
             vocal_clean = str(art0.get("vocal_clean") or "")
@@ -653,6 +794,27 @@ class Pipeline:
                     self._step(track_id, "clean", "skipped", error=cleaned.get("error"))
                     self._log(f"[{track_id}] 清理失败，直接用分离结果：{cleaned.get('error')}")
             self._set(track_id, progress=45, artifacts={"vocal_clean": vocal_input})
+
+            # 1.5) 口型轨：不占 GPU，和后面的配调/变声/混音并行算 ------------
+            # 读整首干声的包络 + 逐行对齐是几秒纯 CPU，正好搭变声那段的便车。
+            # 算完落盘成 lips.json，唱的时候直接读，不再现场抓歌词/算包络。
+            lips_holder: dict = {}
+            lips_error = ""
+
+            def _lips_job() -> None:
+                nonlocal lips_error
+                try:
+                    lips_holder.update(self._build_lips(
+                        self.store.get(track_id) or track, out_dir, vocal_input,
+                        float(track.get("duration_s") or 0.0)))
+                except Exception as exc:  # noqa: BLE001 - 口型失败不能拖垮出歌
+                    lips_error = f"{type(exc).__name__}: {exc}"
+                    self._log(f"[{track_id}] 口型轨计算失败：{lips_error}")
+
+            self._step(track_id, "lips", "running")
+            lips_thread = threading.Thread(target=_lips_job,
+                                           name=f"ms-lips-{track_id}", daemon=True)
+            lips_thread.start()
 
             # 1.55) 混响跟随原曲：用原始分离人声估计原曲人声的混响量 --------
             reverb_raw = self.paths.get("raw") or {}
@@ -807,10 +969,24 @@ class Pipeline:
                           error=mix.get("error") or "混音失败")
                 return {"ok": False, "step": "mix", "error": mix.get("error"),
                         "detail": mix}
+            # 口型轨一般早就跟变声一起跑完了；这里只是收个尾。
+            lips_thread.join(timeout=240)
+            lips_info = dict(lips_holder)
+            if lips_info.get("path"):
+                self._step(track_id, "lips", "done", mode=lips_info.get("mode"),
+                           cues=lips_info.get("cues"), align=lips_info.get("align"),
+                           source=lips_info.get("source"))
+                self._log(f"[{track_id}] 口型轨就绪：{lips_info.get('mode')} "
+                          f"cues={lips_info.get('cues')} align={lips_info.get('align')} "
+                          f"source={lips_info.get('source')}")
+            else:
+                self._step(track_id, "lips", "skipped",
+                           error=lips_error or "口型轨没算完，播放时再补")
             self._step(track_id, "mix", "done", engine="ddsp")
             self._set(track_id, status="done", progress=100, error="",
                       artifacts={"final": mix.get("final", ""),
-                                 "vocal_mixed": mix.get("vocal_only", "")})
+                                 "vocal_mixed": mix.get("vocal_only", ""),
+                                 "lips": lips_info.get("path", "")})
             self._log(f"[{track_id}] done: {mix.get('final')}")
             return {"ok": True, "track": self.store.get(track_id), "detail": mix}
         except _TrackCancelled:

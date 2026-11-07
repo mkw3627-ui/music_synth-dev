@@ -821,6 +821,17 @@ def run_worker(python: Path, script: Path, job: dict, *, cwd: Path,
                 pass
 
 
+def is_oom(payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    text = " ".join(str(payload.get(k) or "") for k in ("error", "trace", "hint")).lower()
+    return any(token in text for token in (
+        "out of memory", "cuda error", "cublas_status_alloc_failed",
+        "cudnn_status_alloc_failed", "not enough memory", "insufficient memory",
+        "allocation failed", "oom",
+    ))
+
+
 def is_quant_failure(payload: dict | None) -> bool:
     """量化本身跑不起来（不是显存不够）：换下一种策略而不是直接失败。
 

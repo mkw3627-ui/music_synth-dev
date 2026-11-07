@@ -12,8 +12,9 @@ Pipeline (per source file, called from ms_corpus_add):
      does the *slicing + QC* on an already-produced dry stem.  The full chain
      orchestration lives in the plugin (ms_corpus_add → _corpus_pipeline),
      which reuses ``separate_worker`` for each model hop.
-  2. Slice the dry vocal into 2–15 s clips at silence / energy-valley
-     boundaries (reuses the same envelope approach as split_worker).
+  2. Slice the dry vocal into 2–15 s clips at sentence boundaries: long
+     silences plus short breath gaps (see ``_slice_bounds``), so each clip is
+     roughly one sung phrase instead of an arbitrary equal-length chunk.
   3. QC each clip: peak >= 0.999 => clipping (reject); silence ratio > 50%
      => reject; record pitch range (median F0 via librosa if present, else
      "未跑").
@@ -31,6 +32,8 @@ Input job keys:
   max_s       (float, default 15.0)
   silence_s   (float, default 0.35)  quiet run that counts as a cut point
   silence_db  (float, default 28.0)  dB below loud body treated as quiet
+  breath_db   (float, default 14.0)  dB below loud body treated as a breath gap
+  breath_s    (float, default 0.20)  breath gap that can end a sentence
   peak_limit  (float, default 0.999)  >= this => reject (clipping)
   max_silence_ratio (float, default 0.5)  silence ratio above which reject
 Output result keys:
@@ -119,9 +122,36 @@ def _quality(data: np.ndarray, rate: int, peak_limit: float,
     }
 
 
+def _snap_cut(rms: np.ndarray, hop_s: float, ideal: float, lo: float, hi: float,
+              search_s: float = 1.0) -> float:
+    """把切口从理想位置挪到 ±search_s 内能量最低的一帧。
+
+    长段没有长静音时只能按 max_s 均分，均分点经常正落在字中间或长音上；
+    挪到附近最安静的地方，切出来的片段更像一句完整的句子。
+    """
+    if rms.size == 0:
+        return ideal
+    lo = max(lo, 0.0)
+    hi = max(hi, lo)
+    a = int(max(0, np.floor((ideal - search_s) / hop_s)))
+    b = int(min(rms.size, np.ceil((ideal + search_s) / hop_s) + 1))
+    if b <= a:
+        return ideal
+    idx = a + int(np.argmin(rms[a:b]))
+    return float(min(max(idx * hop_s, lo), hi))
+
+
 def _slice_bounds(mono: np.ndarray, rate: int, min_s: float, max_s: float,
-                  silence_s: float, silence_db: float) -> list[tuple[float, float]]:
-    """Return (start_s, end_s) segments, 2–15 s, cut at quiet runs."""
+                  silence_s: float, silence_db: float,
+                  breath_db: float = 14.0, breath_s: float = 0.20) -> list[tuple[float, float]]:
+    """Return (start_s, end_s) segments, 2–15 s, cut at sentence boundaries.
+
+    两级切口：
+      1. 长静音（``silence_s`` 以上、低于响段 ``silence_db``）——一定有；
+      2. 换气/句间停顿（低于响段 ``breath_db`` 且持续 ``breath_s`` 以上）——
+         清唱很少掉到 -28 dB，但句子之间会明显掉下去，靠这一级才能切到「每一句」。
+    切口放在该段能量最低的一帧，而不是中点。
+    """
     total = len(mono) / float(rate)
     if total <= max_s:
         return [(0.0, total)] if total >= min_s else []
@@ -143,6 +173,25 @@ def _slice_bounds(mono: np.ndarray, rate: int, min_s: float, max_s: float,
     if run_start is not None and len(quiet) - run_start >= need:
         cuts.append((run_start + len(quiet)) / 2.0 * hop_s)
 
+    # 第二级：句间换气。找「明显低于响段」的短暂停顿，切口取其中最低的一帧。
+    db = 20.0 * np.log10(np.maximum(rms, 1e-9))
+    breath_floor = float(np.percentile(db, 90)) - float(breath_db)
+    breath_need = max(1, int(float(breath_s) / hop_s))
+    below = db < breath_floor
+    run_start = None
+    for idx, is_gap in enumerate(below):
+        if is_gap and run_start is None:
+            run_start = idx
+        elif not is_gap and run_start is not None:
+            if idx - run_start >= breath_need:
+                span = rms[run_start:idx]
+                cuts.append((run_start + int(np.argmin(span))) * hop_s)
+            run_start = None
+    if run_start is not None and len(below) - run_start >= breath_need:
+        span = rms[run_start:]
+        cuts.append((run_start + int(np.argmin(span))) * hop_s)
+    cuts = sorted(set(round(c, 3) for c in cuts))
+
     # Walk boundaries, never produce a segment outside [min_s, max_s].
     bounds = [0.0] + [c for c in cuts if min_s < c < total - min_s] + [total]
     segs: list[tuple[float, float]] = []
@@ -152,14 +201,21 @@ def _slice_bounds(mono: np.ndarray, rate: int, min_s: float, max_s: float,
             continue
         span = b - cursor
         if span >= max_s:
-            # Split long spans into max_s-sized chunks at the nearest quiet cut.
+            # Split long spans into max_s-sized chunks; each cut is nudged to the
+            # quietest frame nearby so a segment rarely ends mid-syllable.
             n = int(np.ceil(span / max_s))
             step = span / n
-            for i in range(n):
-                s = cursor + i * step
-                e = min(total, cursor + (i + 1) * step)
-                if e - s >= min_s:
-                    segs.append((s, e))
+            start = cursor
+            for i in range(1, n):
+                ideal = cursor + i * step
+                lo = max(start + min_s, b - (n - i) * max_s)
+                hi = min(start + max_s, b - min_s)
+                cut = _snap_cut(rms, hop_s, ideal, lo, hi)
+                if cut - start >= min_s:
+                    segs.append((start, cut))
+                    start = cut
+            if b - start >= min_s:
+                segs.append((start, b))
             cursor = b
         elif span >= min_s:
             segs.append((cursor, b))
@@ -184,13 +240,16 @@ def main() -> int:
         max_s = float(job.get("max_s") or 15.0)
         silence_s = float(job.get("silence_s") or 0.35)
         silence_db = float(job.get("silence_db") or 28.0)
+        breath_db = float(job.get("breath_db") or 14.0)
+        breath_s = float(job.get("breath_s") or 0.20)
         peak_limit = float(job.get("peak_limit") or 0.999)
         max_silence_ratio = float(job.get("max_silence_ratio") or 0.5)
 
         import soundfile as sf
         data, rate = _read(str(src))
         mono = data.mean(axis=1) if data.ndim > 1 else data
-        bounds = _slice_bounds(mono, rate, min_s, max_s, silence_s, silence_db)
+        bounds = _slice_bounds(mono, rate, min_s, max_s, silence_s, silence_db,
+                               breath_db, breath_s)
 
         clips, rejected = [], []
         valid_s = 0.0

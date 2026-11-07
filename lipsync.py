@@ -16,6 +16,7 @@ import bisect
 import json
 import re
 import struct
+import time
 import wave
 from pathlib import Path
 
@@ -114,6 +115,31 @@ def _latin_units(word: str) -> list[tuple[str, str]]:
     return units
 
 
+def _carry_visemes(units: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """让「占时值但不发音」的字沿用邻字的口型，别在句子中间闭嘴。
+
+    ``line_units`` 会把长音符「ー」、重复记号「々」、促音「っ」以及
+    ``lips_pinyin.json`` 里没有的汉字判成 rest；rest 在模型上等于
+    ParamMouthOpenY≈0.1 —— 一句话里每隔几个字嘴就闭一下，看起来像在嚼东西。
+    演唱时长音符是把上一个元音延长、促音只是把音顿一下马上接下去，
+    表外字至少也该沿用邻字的口型。所以行内所有 rest 都接到最近的有效口型
+    （行首的 rest 借后面第一个），只有整行都没有口型时才保持 rest。
+    """
+    if not units:
+        return units
+    out = list(units)
+    fill = next((vis for _, vis in out if vis != "rest"), "")
+    if not fill:
+        return out
+    last = fill
+    for pos, (ch, vis) in enumerate(out):
+        if vis == "rest":
+            out[pos] = (ch, last)
+        else:
+            last = vis
+    return out
+
+
 def line_units(line: str) -> list[tuple[str, str]]:
     """A lyric line → [(text, viseme)] in singing order."""
     units: list[tuple[str, str]] = []
@@ -127,7 +153,7 @@ def line_units(line: str) -> list[tuple[str, str]]:
     for ch in line[pos:]:
         if not _PUNCT.match(ch):
             units.append((ch, viseme_of_char(ch)))
-    return units
+    return _carry_visemes(units)
 
 
 def song_duration(path) -> float:
@@ -212,6 +238,30 @@ def vocal_onsets(env: dict, *, thr: float = 0.15) -> list[float]:
     for index in range(2, len(amp) - 1):
         if amp[index] >= thr and amp[index - 1] < thr and amp[index] >= amp[index + 1] * 0.6:
             out.append(index * hop)
+    return out
+
+
+def vocal_syllable_onsets(env: dict, *, floor: float = 0.12, delta: float = 0.05,
+                          min_gap: float = 0.10) -> list[float]:
+    """音节级起音：包络「明显往上跳」的那些帧，约 3~4 个/秒。
+
+    ``vocal_onsets`` 找的是从安静跨过门限的大起音，适合把整行歌词对到录音上；
+    但连唱时音量很少掉到门限以下，一整行里往往只剩一个起音。这里改看能量上升沿：
+    唱一个字通常伴随一次能量跳变，用来把行内的字边界吸到真正唱出来的位置上。
+    """
+    amp = list(env.get("amp") or [])
+    hop = float(env.get("hop") or 0.05)
+    if not amp or hop <= 0:
+        return []
+    out: list[float] = []
+    for index in range(1, len(amp) - 1):
+        if amp[index] < floor or amp[index] - amp[index - 1] < delta:
+            continue
+        if amp[index] < amp[index + 1] * 0.9:   # 只是上升沿中间，不是一次起音
+            continue
+        at = index * hop
+        if not out or at - out[-1] >= min_gap:
+            out.append(at)
     return out
 
 
@@ -478,11 +528,46 @@ def envelope_cues(env: dict, *, min_amp: float = 0.18,
     return cues
 
 
-def build_timed_cues(lines, duration: float) -> list[list]:
+def _snap_bounds(bounds: list[float], onsets: list[float],
+                 tol: float) -> tuple[list[float], int]:
+    """把行内按字数均分的字边界挪到干声的起音上——一个字 ≈ 一个音节。
+
+    每个内部边界只在 ``±tol`` 秒内找最近的起音；找不到就保留均分位置。
+    首尾边界不动（它们是真时间轴或整行的上下限），并且强制单调递增，
+    免得两段相邻的起音把某个字挤成负时长。
+    """
+    if len(bounds) < 3 or not onsets:
+        return bounds, 0
+    snapped = list(bounds)
+    moved = 0
+    floor = bounds[0] + 0.04
+    for pos in range(1, len(bounds) - 1):
+        target = bounds[pos]
+        ceiling = bounds[pos + 1] - 0.04
+        start = bisect.bisect_left(onsets, target - tol)
+        best, gap = 0.0, tol + 1e-6
+        index = start
+        while index < len(onsets) and onsets[index] <= target + tol:
+            value = onsets[index]
+            if floor < value < ceiling:
+                offset = abs(value - target)
+                if offset < gap:
+                    best, gap = value, offset
+            index += 1
+        if gap <= tol:
+            snapped[pos] = best
+            moved += 1
+        # 下一个边界至少留 50ms，别把某个字挤成一闪而过的口型。
+        floor = max(floor, snapped[pos] + 0.05)
+    return snapped, moved
+
+
+def build_timed_cues(lines, duration: float, *, onsets=None) -> list[list]:
     """``[{"at_s": 12.0, "text": "…"}]`` → cues using the real line timestamps.
 
     「为她所听」识别出的歌词带每行的起唱时间，比按字数铺满整首准得多：
-    行与行的边界是真时间，行内仍然按字数均分（没有音素级对齐）。
+    行与行的边界是真时间，行内仍然按字数均分；传了 ``onsets``（干声的起音
+    时刻）时再把这些均分边界吸到最近的起音上，就细化到「每个音节」了。
     """
     timed: list[tuple[float, str]] = []
     for row in lines or []:
@@ -499,6 +584,7 @@ def build_timed_cues(lines, duration: float) -> list[list]:
     if not timed:
         return []
     timed.sort(key=lambda item: item[0])
+    onset_list = sorted(float(x) for x in (onsets or []) if x is not None)
     total = float(duration or 0.0)
     cues: list[list] = []
     for index, (at, text) in enumerate(timed):
@@ -518,9 +604,16 @@ def build_timed_cues(lines, duration: float) -> list[list]:
         cap = max(1.2, len(units) * 0.42)
         end = min(end, at + cap)
         step = (end - at) / len(units)
+        bounds = [at + pos * step for pos in range(len(units) + 1)]
+        if onset_list and len(units) >= 2:
+            # 均分只是估计；真正唱出来的音节起点在干声的起音上。
+            bounds, _moved = _snap_bounds(bounds, onset_list, tol=step * 0.6)
         for pos, (ch, viseme) in enumerate(units):
-            begin = at + pos * step
-            cues.append([ch, viseme, round(begin, 3), round(begin + step, 3)])
+            begin = bounds[pos]
+            stop = bounds[pos + 1]
+            if stop <= begin:
+                stop = begin + 0.05
+            cues.append([ch, viseme, round(begin, 3), round(stop, 3)])
     return cues
 
 
@@ -629,3 +722,127 @@ def get_or_build(wav, lyrics: str, *, lang: str = "", duration: float | None = N
     payload = payload_for(wav, lyrics, lang=lang, duration=duration)
     write_sidecar(payload, wav)
     return payload
+
+
+# ---------------- 整首歌的口型包（流水线算一次，唱的时候直接读） ----------------
+
+def track_lyrics(track: dict) -> tuple[str, list, str]:
+    """曲目记录 → ``(歌词全文, 带 at_s 的行, 来源标签)``。"""
+    track = track or {}
+    timed: list = []
+    source = ""
+    for song in (track.get("lyrics_from_perception") or []):
+        if isinstance(song, dict) and song.get("lines"):
+            timed = song["lines"]
+            source = "perception_timed"
+            break
+    official = track.get("official_lyrics")
+    if not timed and isinstance(official, dict) and isinstance(official.get("timed"), list):
+        timed = official["timed"]
+        # 存下来的官方歌词带着抓取来源（lrclib.net / qq …），标签沿用，
+        # 这样处理期和播放期算出来的 source 完全一致。
+        source = str(official.get("source") or "official")
+    lyrics = str(track.get("lyrics") or "")
+    if not lyrics.strip():
+        preview = track.get("lyrics_preview") or []
+        if isinstance(preview, list):
+            lyrics = "\n".join(str(x) for x in preview if str(x).strip())
+    if not lyrics.strip() and isinstance(official, dict):
+        off_lines = official.get("lines")
+        if isinstance(off_lines, list):
+            lyrics = "\n".join(str(x) for x in off_lines if str(x).strip())
+    if not lyrics.strip() and timed:
+        lyrics = "\n".join(str(row.get("text") or "") for row in timed
+                           if isinstance(row, dict))
+    return lyrics, timed, source
+
+
+def build_track_payload(track: dict, *, stem: str = "", duration: float | None = None,
+                        lrc_fetcher=None) -> dict:
+    """一首歌的完整口型包：逐字 cue 轨 + 起音对齐 + （没有歌词时）响度包络。
+
+    处理曲目时跑一次、存成 ``lips.json``；唱的时候直接拿来用，不再现场
+    抓歌词、算包络、做对齐——那几秒的空白正是「嘴不动」的来源。
+
+    ``lrc_fetcher(track) -> (lrc_text, source)`` 由插件提供（带网络和缓存），
+    流水线和播放路径共用同一份逻辑，算出来的口型一定一致。
+    """
+    track = track or {}
+    lyrics, timed, lrc_source = track_lyrics(track)
+    official_saved: dict = {}
+    if not timed and lrc_fetcher is not None:
+        try:
+            lrc, how = lrc_fetcher(track)
+        except Exception:  # noqa: BLE001 - 网络失败只是回到「估计」路径
+            lrc, how = None, ""
+        if lrc:
+            parsed = parse_lrc(lrc)
+            if parsed:
+                timed = parsed
+                lrc_source = how or "lrc"
+                lyrics = "\n".join(row["text"] for row in parsed)
+                official_saved = {"source": lrc_source, "lrc": lrc,
+                                  "timed": parsed,
+                                  "lines": [row["text"] for row in parsed]}
+
+    stem = str(stem or "")
+    stem_ok = bool(stem) and Path(stem).is_file()
+    env: dict = {}
+    align = 0.0
+    if stem_ok:
+        try:
+            env = get_or_build_envelope(stem)
+        except Exception:  # noqa: BLE001
+            env = {}
+    if timed and env.get("amp"):
+        try:
+            align = align_offset(env, timed)
+        except Exception:  # noqa: BLE001
+            align = 0.0
+        if abs(align) >= 0.25:
+            timed = [dict(row, at_s=round(float(row["at_s"]) + align, 3))
+                     for row in timed]
+
+    dur = float(duration or 0.0) or float((env or {}).get("duration") or 0.0)
+    if dur <= 0 and stem_ok:
+        dur = song_duration(stem)
+    cues = build_timed_cues(timed, dur,
+                            onsets=vocal_syllable_onsets(env) if env.get("amp") else None)
+    if cues and lrc_source.startswith("perception"):
+        source = "perception_timed"
+    elif cues and lrc_source:
+        source = "lrc:" + lrc_source
+    else:
+        source = "estimate"
+    if not cues and not timed and lyrics.strip():
+        # 一行时间戳都没有（录下来的歌、也没抓到 LRC）：退到「按字数铺满整首」，
+        # 至少嘴会跟着歌词字数动，而不是只剩包络开合。
+        guess = dur or song_duration(stem)
+        cues = build_cues(lyrics, guess)
+        if cues:
+            dur = dur or guess
+            source = "estimate"
+    mode = "cues" if cues else ("envelope" if env.get("amp") else "none")
+    payload = {
+        # v3：长音符/促音/表外字不再单独给 rest（以前唱到就在句中闭一下嘴），
+        # 改成沿用邻字的口型。版本号进缓存，旧曲目的 lips.json 会自动重算。
+        "v": 3,
+        "track_id": str(track.get("id") or ""),
+        "song": str(track.get("title") or ""),
+        "duration": round(dur, 3),
+        "lang": str(track.get("vocal_language") or ""),
+        "source": source,
+        "mode": mode,
+        "align": round(float(align), 2),
+        "lyrics_key": lyrics_key(lyrics) if lyrics.strip() else "",
+        "stem": stem if stem_ok else "",
+        "cues": cues,
+        # 只在没有歌词时才把包络一起带上；有 cue 时桥优先读 cue，带上是白占体积。
+        "hop": float((env or {}).get("hop") or 0.05) if mode == "envelope" else 0.05,
+        "env": list((env or {}).get("amp") or []) if mode == "envelope" else [],
+        "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if official_saved:
+        payload["official_lyrics"] = official_saved
+    return payload
+

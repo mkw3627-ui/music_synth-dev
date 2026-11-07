@@ -80,8 +80,8 @@ def _artist_parts(artist: str) -> set[str]:
     return {p for p in parts if p}
 
 
-def _netease_search(title: str, artist: str, timeout: float) -> str | None:
-    """网易云搜索 → 最匹配的 song id（title+artist 双校验）。"""
+def _netease_best_song(title: str, artist: str, timeout: float) -> "dict | None":
+    """网易云搜索 → 最匹配的那条结果（title+artist 双校验）。"""
     q = urllib.parse.quote(f"{_core_title(title)} {artist}".strip())
     url = f"https://music.163.com/api/search/get?s={q}&type=1&limit=8&offset=0"
     try:
@@ -104,12 +104,146 @@ def _netease_search(title: str, artist: str, timeout: float) -> str | None:
                              for a in song_artists}
             if not (artist_set & song_artists):
                 continue
-        return str(s.get("id"))
+        return s
     # 放宽：核心标题匹配不到就取第一个名字含核心标题的
     for s in songs:
         if core and core in str(s.get("name") or ""):
-            return str(s.get("id"))
+            return s
     return None
+
+
+def _netease_search(title: str, artist: str, timeout: float) -> str | None:
+    """网易云搜索 → 最匹配的 song id（title+artist 双校验）。"""
+    song = _netease_best_song(title, artist, timeout)
+    return str(song.get("id")) if song else None
+
+
+_DURATION_CACHE: "dict[tuple[str, str], float | None]" = {}
+
+
+def _lrclib_duration(title: str, artist: str, timeout: float) -> float | None:
+    """lrclib.net 的曲目时长：同一首歌常有 Live/翻唱多个版本，取首条附近的中位数。
+
+    首条是相关度最高的版本；把和它相差 8% 以内的其余条目算作同一版本，
+    取中位数，避免某一条异常值（试听片段、超长 Live）带偏结论。
+    """
+    core = _core_title(title)
+    if not core:
+        return None
+    artist_set = {p.casefold() for p in _artist_parts(artist)}
+    q = urllib.parse.quote(f"{core} {artist}".strip())
+    try:
+        data = _http_json(f"https://lrclib.net/api/search?q={q}", timeout=timeout)
+    except Exception:  # noqa: BLE001 - lrclib 在国内可能不通
+        return None
+    if not isinstance(data, list):
+        return None
+    rows: "list[tuple[int, int, float]]" = []  # (歌手是否精确, 顺序, 秒)
+    for i, r in enumerate(data[:15]):
+        if not isinstance(r, dict):
+            continue
+        track = str(r.get("trackName") or "")
+        if core.casefold() not in track.casefold():
+            continue
+        aname = str(r.get("artistName") or "")
+        exact = 0
+        if artist_set:
+            hit = [p for p in artist_set
+                   if p and (p in aname.casefold() or aname.casefold() in p)]
+            if not hit:
+                continue
+            exact = 1 if any(p == aname.casefold() for p in artist_set) else 0
+        elif len(core) <= 2 and track.strip() != core:
+            # 两三个字的标题太容易撞歌：没歌手可核对就要求歌名完全一致。
+            continue
+        try:
+            dur = float(r.get("duration") or 0)
+        except (TypeError, ValueError):
+            continue
+        if 45.0 <= dur <= 3600.0:
+            rows.append((-exact, i, dur))
+    if not rows:
+        return None
+    rows.sort()
+    anchor = rows[0][2]
+    near = sorted(v for _, _, v in rows if abs(v - anchor) <= max(8.0, anchor * 0.08))
+    return round(near[len(near) // 2], 2)
+
+
+def fetch_song_duration(title: str, artist: str = "", timeout: float = 8.0) -> float | None:
+    """整首歌的时长（秒），只用公开搜索接口的元数据，不下载音频。
+
+    录音线程拿不到播放器时长时（老版本网易云没有系统媒体会话），用它来判断
+    「这段录音是不是整首」：录制时长明显短于唱片版本就是没放完。
+    版本差异（Live/翻唱）会让时长对不上，所以调用方给 10% 的容差。
+
+    顺序：lrclib.net（有准确时长、按相关度排序）→ 网易云搜索（曲库更全，
+    但匿名接口的排序被翻唱占满，且没有原始版本时会查不到，宁可返回 None）。
+    """
+    key = (str(title or "").strip().casefold(), str(artist or "").strip().casefold())
+    if not key[0]:
+        return None
+    if key in _DURATION_CACHE:
+        return _DURATION_CACHE[key]
+    sec = _lrclib_duration(title, artist, timeout)
+    if sec is None:
+        sec = _netease_duration(title, artist, timeout)
+    _DURATION_CACHE[key] = sec
+    return sec
+
+
+def _netease_duration(title: str, artist: str, timeout: float) -> float | None:
+    sec = None
+    try:
+        # 取时长比取歌词严：只认「歌名里包含完整标题」，有歌手就再核对歌手；
+        # 不用 _netease_best_song 的放宽分支——「不存在」⊂「不存在的歌名xyzzy」
+        # 这种反过来的模糊命中，时长得出的结论会错。
+        core = _core_title(title)
+        artist_set = _artist_parts(artist)
+        # 带歌手搜会被一堆翻唱占满（晴天 周杰伦 前几名全是翻唱），所以
+        # 带歌手搜不到就再用纯标题搜一遍；两遍都用同一套严格条件。
+        queries = [f"{core} {artist}".strip() if artist else core]
+        if artist:
+            queries.append(core)
+        cands: "list[tuple[int, int, float]]" = []  # (偏好分, 顺序, 毫秒)
+        idx = 0
+        for q_title in queries:
+            q = urllib.parse.quote(q_title)
+            url = f"https://music.163.com/api/search/get?s={q}&type=1&limit=8&offset=0"
+            data = _http_json(url, timeout=timeout)
+            songs = ((data.get("result") or {}).get("songs")) or []
+            for s in songs:
+                idx += 1
+                name = str(s.get("name") or "")
+                if not core or core not in name:
+                    continue
+                if artist_set:
+                    names = {str(a.get("name") or "") for a in (s.get("artists") or [])}
+                    names |= {re.sub(r"[（(].*?[)）]", "", a).strip() for a in names}
+                    # 歌手名常被包一层（「冯沁苑(买辣椒也用券)」），用包含匹配
+                    if not any(p and n and (p in n or n in p)
+                               for p in artist_set for n in names):
+                        continue
+                elif len(core) <= 2 and name.strip() != core:
+                    # 两三个字的标题太容易撞歌：没歌手可核对就要求歌名完全一致。
+                    continue
+                try:
+                    ms = float(s.get("duration") or 0)
+                except (TypeError, ValueError):
+                    continue
+                # 45 秒以下的「歌」基本都是试听片段/拼盘，拿来判完整会误拦
+                if 45_000.0 <= ms <= 3_600_000.0:
+                    exact = name.strip() == core
+                    plain = "(" not in name and "（" not in name
+                    cands.append((0 if exact else (1 if plain else 2), idx, ms))
+            if cands:
+                break
+        if cands:
+            cands.sort()
+            sec = round(cands[0][2] / 1000.0, 2)
+    except Exception:  # noqa: BLE001 - 查不到就当不知道
+        sec = None
+    return sec
 
 
 def _netease_lrc(song_id: str, timeout: float) -> str | None:

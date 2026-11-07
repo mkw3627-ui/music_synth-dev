@@ -293,6 +293,29 @@ def _target_session(job: dict, smtc: dict) -> dict | None:
 
 
 
+def _match_timing(meta: dict, timing: dict) -> tuple[float, float]:
+    """把播放器刚报的整首时长/进度对到这首歌上；标题对不上就当没有。
+
+    SMTC 的标题可能是「歌名 - 歌手」，窗口标题/她给的歌名只是其中一段，
+    所以两边只要互相包含就算同一首。对不上返回 (0, -1)，让音频兜底。
+    """
+    row_title = str((timing or {}).get("title") or "").strip().casefold()
+    if not row_title:
+        return 0.0, -1.0
+    title = str((meta or {}).get("title") or "").strip().casefold()
+    if title and title not in row_title and row_title not in title:
+        return 0.0, -1.0
+    try:
+        duration = float((timing or {}).get("duration_s") or 0.0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    try:
+        position = float((timing or {}).get("position_s"))
+    except (TypeError, ValueError):
+        position = -1.0
+    return duration, position
+
+
 def main() -> int:
     job = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     out_path = Path(sys.argv[2])
@@ -335,6 +358,14 @@ def main() -> int:
         current_meta = {"title": "", "artist": ""}
         current_frames = 0
         current_started = 0.0
+        # 播放器自己报的时长/进度，用来判断这首是不是从头完整放的：
+        # expected_s=整首时长，song_pos_first=开始录时的进度，song_pos_last=收尾时
+        # 的进度。播放器不提供（网易云等）就留空，由音频兜底判据处理。
+        song_expected = 0.0
+        song_pos_first = -1.0
+        song_pos_last = -1.0
+        # 每次轮询 SMTC 得到的最新时长/进度，开新歌时按标题对号入座。
+        latest_timing = {"title": "", "duration_s": 0.0, "position_s": -1.0}
         silence_count = 0
         frame_index = 0
         last_status = 0.0
@@ -364,10 +395,22 @@ def main() -> int:
             tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
             os.replace(tmp, status_path)
 
+        def _timing_for(meta: dict) -> tuple[float, float]:
+            """把 SMTC 刚读到的时长/进度对到这首歌上；标题对不上就当没有。"""
+            return _match_timing(meta, latest_timing)
+
         def open_song(meta: dict, with_preroll: bool = True) -> None:
             nonlocal current_sf, current_tmp, current_meta, current_frames, current_started, song_seq
+            nonlocal song_expected, song_pos_first, song_pos_last
             song_seq += 1
             current_meta = dict(meta)
+            # 预卷是开录之前就已经放掉的一段，算进起始进度里，不然每首都会
+            # 被当成「从第 0 秒开始」；这首歌是不是完整就靠这两个数判断。
+            preroll_s = (sum(len(f) for f in rolling) / float(sample_rate)
+                         if with_preroll else 0.0)
+            song_expected, pos = _timing_for(current_meta)
+            song_pos_first = max(0.0, pos - preroll_s) if pos >= 0 else -1.0
+            song_pos_last = pos
             current_tmp = out_dir / f"._recording_{os.getpid()}_{song_seq}.wav"
             current_sf = sf.SoundFile(str(current_tmp), mode="w", samplerate=sample_rate,
                                       channels=2, subtype="FLOAT")
@@ -442,7 +485,12 @@ def main() -> int:
                      "title": current_meta.get("title") or "",
                      "artist": current_meta.get("artist") or "",
                      "duration_s": duration, "ended_at": _now(), "reason": reason,
-                     "sample_rate": sample_rate}
+                     "sample_rate": sample_rate,
+                     # 播放器报的整首时长 / 这段录音开始与结束时的播放进度，
+                     # 后台用它判断「是不是完整放完了」。
+                     "expected_s": round(float(song_expected or 0.0), 2),
+                     "start_position_s": round(float(song_pos_first or 0.0), 2),
+                     "end_position_s": round(float(song_pos_last or 0.0), 2)}
             if not event["ok"]:
                 event["error"] = state.get("error") or "录音为空"
             with events_path.open("a", encoding="utf-8") as fh:
@@ -532,6 +580,18 @@ def main() -> int:
                 linked_id = str(linked.get("song_id") or "")
                 linked_meta = {"title": str(linked.get("title") or "").strip()[:120],
                                "artist": str(linked.get("artist") or "").strip()[:120]}
+                if linked_id and linked.get("duration_s"):
+                    # 她那边知道整首时长/播放进度（同样的播放器接口），
+                    # 但系统媒体会话可能读不到，用它兜底。
+                    try:
+                        latest_timing.update({
+                            "title": linked_meta["title"],
+                            "duration_s": float(linked.get("duration_s") or 0.0),
+                            "position_s": float(linked.get("position_s")
+                                                if linked.get("position_s") is not None else -1.0),
+                        })
+                    except (TypeError, ValueError):
+                        pass
                 meta = None
                 if music:
                     title, artist = _split_title(str(music.get("title") or ""))
@@ -565,6 +625,26 @@ def main() -> int:
                         elif session.get("playing") is True and music is None:
                             # Chromium 的 playback_type 不是 music，也接受。
                             music = dict(session)
+                row = (session if browser_target and session else None) or music
+                if row:
+                    try:
+                        row_dur = float(row.get("duration_s") or 0.0)
+                        row_pos = float(row.get("position_s") or -1.0)
+                    except (TypeError, ValueError):
+                        row_dur, row_pos = 0.0, -1.0
+                    if str(row.get("title") or "") or row_dur > 0:
+                        latest_timing.update({"title": str(row.get("title") or ""),
+                                              "duration_s": row_dur,
+                                              "position_s": row_pos})
+                    if current_sf is not None and row_pos >= 0:
+                        # 进度只增：播放器偶尔报 0（切歌/读不到）时不能把
+                        # 已经记下的结尾进度冲掉。
+                        if song_pos_last < 0:
+                            song_pos_last = row_pos
+                        elif row_pos >= song_pos_last - 1.0:
+                            song_pos_last = max(song_pos_last, row_pos)
+                        if song_pos_first < 0:
+                            song_pos_first = row_pos
                 if paused:
                     # 暂停时不切歌：只记下新标题，恢复播放时再接上开头。
                     candidate = linked_meta if linked_id else meta

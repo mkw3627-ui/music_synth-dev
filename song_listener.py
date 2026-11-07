@@ -327,6 +327,10 @@ class SongListener:
         payload = {"song_id": str(status.get("song_id") or ""),
                    "title": str(status.get("song_title") or ""),
                    "artist": str(status.get("song_artist") or ""),
+                   # 播放器报的整首时长和当前进度（没有就是 None）：录音线程
+                   # 靠这两个数判断「这首歌是不是从头完整放完的」。
+                   "duration_s": status.get("song_duration_s"),
+                   "position_s": status.get("song_position_s"),
                    "at": time.time()}
         tmp = self._perception_song.with_suffix(".tmp.json")
         try:

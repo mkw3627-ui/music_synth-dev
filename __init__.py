@@ -32,6 +32,7 @@ from plugin.sdk.plugin import (
 )
 
 from . import cache_cleanup, lips_server, lipsync, model_package, runtime, vram_policy
+from . import vram_release
 from . import setup as setup_mod
 from .pipeline import STEP_ORDER as STEP_ORDER
 from .pipeline import Pipeline
@@ -143,6 +144,9 @@ class MusicSynthPlugin(NekoPluginBase):
         self._data_dir = self.data_path(".")
         self._data_dir.mkdir(parents=True, exist_ok=True)
         self._pipeline = Pipeline(self._data_dir, self._plugin_dir)
+        # 流水线预生成口型轨时要抓官方歌词：和播放走同一个取词函数（只是
+        # 处理时强制重试一次，错过就没有第二次机会了）。
+        self._pipeline.lrc_fetcher = lambda _track: self._fetch_lyrics(_track, force=True)
         # 口型服务随插件一起起来：主窗口的 bridge 每 3 秒探一次端口，
         # 等第一首歌开播才监听的话，头 3 秒的对嘴会丢。
         try:
@@ -504,6 +508,75 @@ class MusicSynthPlugin(NekoPluginBase):
         except Exception:  # noqa: BLE001 - 互斥判断不能拖垮入口
             return None
         return None
+
+    async def _free_vram_for_training(self) -> dict:
+        """训练前腾显存：先让「为她所听」暂停分离/歌词模型，不行再整插件停掉。
+
+        温和那条路走它自己的「唱歌优先」入口：只停 GPU 模型（人声分离、歌词、
+        专业歌声音色），录音和采集继续跑；整插件停掉只是兜底，因为那会把它的
+        采集/Live2D 联动一起关掉。
+        """
+        result: dict = {"stopped": [], "paused": [], "skipped": [], "summary": ""}
+        try:
+            data = await self._perception_priority(True, collect_lyrics=False)
+        except Exception as exc:  # noqa: BLE001 - 让位失败就走兜底
+            self.logger.warning("[train] 请为她所听让出显存失败：%s", exc)
+            data = {}
+        if isinstance(data, dict) and data.get("ok"):
+            result["paused"] = ["music_perception:stem", "music_perception:lyrics"]
+            result["summary"] = ("已暂停为她所听的人声分离/歌词模型"
+                                 "（给训练腾显存，训练结束后自动恢复）")
+            self.logger.info("[train] %s", result["summary"])
+            return result
+        try:
+            fallback = await asyncio.to_thread(vram_release.release_for_training,
+                                               log=self.logger)
+        except Exception as exc:  # noqa: BLE001 - 停不下来也继续训练
+            self.logger.warning("[train] 停止占显存的插件失败：%s", exc)
+            return result
+        for key in ("stopped", "pending", "skipped", "summary"):
+            if fallback.get(key):
+                result[key] = fallback.get(key)
+        return result
+
+    def _restore_after_training(self, plugins: list[str],
+                                restore_perception: bool = False) -> None:
+        """训练收尾后把为训练让出显存的插件重新拉起来。
+
+        判据用 ``_training_active()``：进入 awaiting_choice（等选检查点）或训练
+        结束都不占 GPU。连续 45 秒空闲才恢复，免得训练在节点之间短暂停顿就被
+        提前拉起来又互相抢显存。
+        """
+        deadline = time.time() + 12 * 3600
+        idle_since = 0.0
+        while time.time() < deadline:
+            time.sleep(10.0)
+            try:
+                # 训练之外，ACE 原创训练/翻唱/处理中的曲目同样吃显存，一起等。
+                busy = self._training_active() or self._singing_active()
+            except Exception:  # noqa: BLE001 - 判断失败就当已经空闲
+                busy = None
+            if busy is None:
+                idle_since = idle_since or time.time()
+                if time.time() - idle_since >= 45:
+                    break
+            else:
+                idle_since = 0.0
+        else:
+            self.logger.info("[train] 等训练结束超时（12h），不再自动恢复插件")
+            return
+        if restore_perception:
+            try:
+                restored = self._apply_perception_priority_sync(False)
+                self.logger.info("[train] 恢复为她所听的分离/歌词模型：%s", restored)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("[train] 恢复为她所听失败：%s", exc)
+        if not plugins:
+            return
+        try:
+            vram_release.start_plugins(list(plugins), log=self.logger)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("[train] 重新拉起插件失败：%s", exc)
 
     def _singing_active(self) -> dict | None:
         """唱歌 / 原创生成 / ACE 训练是否正占着 GPU 锁或还在排队。"""
@@ -1940,6 +2013,16 @@ class MusicSynthPlugin(NekoPluginBase):
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         runtime._atomic_write(run_dir / "state.json", state)
+        # 训练要显存吃得比较满：先把「为她所听」这些常驻 GPU 模型停掉，
+        # 训练收尾再由后台线程拉回来（只重启这次真的停掉的）。
+        freed: dict = {}
+        try:
+            freed = await self._free_vram_for_training()
+            if freed.get("summary"):
+                quality_warnings.append(freed["summary"])
+        except Exception as exc:  # noqa: BLE001 - 停不下来也得继续训练
+            self.logger.warning("[train] 释放显存失败：%s", exc)
+            quality_warnings.append(f"没能暂停其它占显存的插件：{exc}")
         try:
             info = self._train_launch(run_id)
         except Exception as exc:  # noqa: BLE001
@@ -1947,6 +2030,11 @@ class MusicSynthPlugin(NekoPluginBase):
             state["error"] = f"{type(exc).__name__}: {exc}"
             runtime._atomic_write(run_dir / "state.json", state)
             return Ok({"ok": False, "error": state["error"], "run_id": run_id})
+        paused = list(freed.get("stopped") or [])
+        yielded = bool(freed.get("paused"))
+        if paused or yielded:
+            self._thread(f"ms-vram-restore-{run_id}", self._restore_after_training,
+                         paused, yielded)
         if ace_models_list:
             chain = {
                 "ace_models": ace_models_list,
@@ -1969,7 +2057,8 @@ class MusicSynthPlugin(NekoPluginBase):
         return Ok({"ok": True, "run_id": run_id, "dir": str(run_dir), "name": clean_name,
                    "quality": quality, "warnings": quality_warnings,
                    "inputs": [c["copied"] for c in copied], "pid": info.get("pid"),
-                   "auto": _as_bool(auto), "ace_models": ace_models_list})
+                   "auto": _as_bool(auto), "ace_models": ace_models_list,
+                   "vram_paused": paused + (["music_perception:models"] if yielded else [])})
 
     @plugin_entry(id="ms_train_runs", name="为她而唱 · 训练任务列表",
                   description="列出所有训练任务（正在训练 / 等你选择 / 已结束）",
@@ -2354,6 +2443,11 @@ class MusicSynthPlugin(NekoPluginBase):
             self._pipeline.store.update(
                 track["id"], status="recorded", step="recorded", progress=0,
                 auto_recorded=True, anchor=True,
+                # 播放器报的整首时长/播放起止进度：处理时用它判断这首歌
+                # 是不是从头完整放完的（纯音乐另看人声轨）。
+                expected_s=event.get("expected_s") or 0.0,
+                start_position_s=event.get("start_position_s"),
+                end_position_s=event.get("end_position_s"),
                 recorded_at=time.strftime("%Y-%m-%d %H:%M:%S"), error="")
             self._song_listener._current_track = track["id"]
             self._enforce_song_slots(keep_id=track["id"])
@@ -2396,6 +2490,9 @@ class MusicSynthPlugin(NekoPluginBase):
                     "song_id": str(st.get("current_song_id") or ""),
                     "song_title": str(st.get("current_song_title") or ""),
                     "song_artist": str(st.get("current_song_artist") or ""),
+                    # 播放器报的整首时长/当前进度：判断这段录音是否完整要用。
+                    "song_duration_s": st.get("estimated_media_duration_s"),
+                    "song_position_s": st.get("estimated_player_position_s"),
                     "play_history": st.get("play_history") or [],
                     "next_song": st.get("next_song"),
                 }
@@ -2694,9 +2791,11 @@ class MusicSynthPlugin(NekoPluginBase):
                       "anchor": {"type": "string",
                                  "enum": ["current", "previous", "now", "last"]},
                       "track_id": {"type": "string"},
-                      "when_ready": {"type": "boolean"}}})
+                      "when_ready": {"type": "boolean"},
+                      "force": {"type": "boolean",
+                                "description": "纯音乐/残缺录音也想硬唱时才用"}}})
     async def ms_sing_anchor(self, anchor: str = "current", track_id: str = "",
-                             when_ready: bool = True, **_):
+                             when_ready: bool = True, force: bool = False, **_):
         kind = ""
         target = None
         if track_id:
@@ -2725,6 +2824,18 @@ class MusicSynthPlugin(NekoPluginBase):
         if status in ("running", "queued"):
             return Ok({"ok": True, "already": True, "track": target,
                        "note": "这首歌正在处理"})
+        if status in ("instrumental", "incomplete", "silent"):
+            reason = str(target.get("check_reason") or "")
+            if not force:
+                return Ok({"ok": False, "status": status, "track": target,
+                           "error": reason or "这首歌不能翻唱",
+                           "note": ("纯音乐没有人声、或者这段录音没放完整。"
+                                    "确实想硬唱可以带 force=true，但不建议")})
+            # 用户明确要求照唱：记住这个决定，后面的流水线不再拦。
+            self._pipeline.store.update(str(target["id"]), check_override=True)
+            self.logger.warning("用户要求硬唱 %s（%s）：%s",
+                                target.get("title") or target["id"], status, reason)
+            target = self._pipeline.store.get(str(target["id"])) or target
         if status == "done":
             return Ok({"ok": True, "already_done": True, "track": target,
                        "note": "这首已经唱好了，可在列表里试听或重新唱"})
@@ -3140,112 +3251,94 @@ class MusicSynthPlugin(NekoPluginBase):
         writes ParamMouthOpenY / ParamMouthForm, which is what makes the mouth
         follow the sung syllables instead of flapping at random.
         """
-        lyrics = str(track.get("lyrics") or "")
-        if not lyrics.strip():
-            preview = track.get("lyrics_preview") or []
-            if isinstance(preview, list):
-                lyrics = "\n".join(str(x) for x in preview if str(x).strip())
-        if not lyrics.strip():
-            # 录下来的歌没有 lyrics 字段：优先用「为她所听」抓到的官方歌词，
-            # 再退到它识别出来的带时间戳的句子。
-            official = track.get("official_lyrics") or {}
-            off_lines = official.get("lines") if isinstance(official, dict) else None
-            if isinstance(off_lines, list):
-                lyrics = "\n".join(str(x) for x in off_lines if str(x).strip())
-        duration = float(track.get("duration_s") or 0.0) or None
+        payload = self._lips_payload(track, target)
+        cues = payload.get("cues") or []
+        duration = float(payload.get("duration") or track.get("duration_s") or 0.0)
+        song = str(payload.get("song") or track.get("title") or "")
+        track_id = str(track.get("id") or "")
+        if cues:
+            state = lips_server.set_playing(cues=cues, song=song, track_id=track_id,
+                                            duration=duration)
+            return {**state, "source": payload.get("source"),
+                    "align": payload.get("align"),
+                    "lang": payload.get("lang") or str(track.get("vocal_language") or "")}
 
-        # 带 at_s 的行是真时间轴，比按字数铺满整首准；有就优先用。
-        timed: list = []
-        for song in (track.get("lyrics_from_perception") or []):
-            if isinstance(song, dict) and song.get("lines"):
-                timed = song["lines"]
-                break
-        official = track.get("official_lyrics")
-        if not timed and isinstance(official, dict) and isinstance(official.get("timed"), list):
-            timed = official["timed"]
-        lrc_source = ""
-        if not timed:
-            # 没有逐行时间轴时先问一句公开歌词库：有了时间戳，每个字才能挂在
-            # 自己那一刻上，而不是整首均摊（那正是「对不上一句」的来源）。
-            lrc, lrc_source = self._fetch_lyrics(track)
-            if lrc:
-                timed = lipsync.parse_lrc(lrc)
-                if timed:
-                    lyrics = "\n".join(row["text"] for row in timed)
-                    try:
-                        self._pipeline.store.update(
-                            str(track.get("id") or ""),
-                            official_lyrics={"source": lrc_source, "lrc": lrc,
-                                             "timed": timed,
-                                             "lines": [row["text"] for row in timed]})
-                    except Exception:  # noqa: BLE001 - 存不下来不影响这次唱
-                        pass
-                    self.logger.info("[playback] 取到官方歌词 source=%s 行数=%d",
-                                     lrc_source, len(timed))
-                else:
-                    lrc_source = ""
+        # 没有歌词也得动嘴：用分离出来的干声算响度包络，跟着「真的在唱」的地方开合。
+        # 日文/冷门歌经常抓不到歌词，这条兜底决定它到底是「哑唱」还是「唱」。
+        env_amp = payload.get("env") or []
+        hop = float(payload.get("hop") or 0.05)
+        if env_amp:
+            # 新版桥按包络平滑驱动；旧版桥只认歌词 cue，就给它一份从包络切出来的
+            # 粗口型轨——不刷新页面也能立刻动嘴。
+            state = lips_server.set_playing(
+                cues=lipsync.envelope_cues({"amp": env_amp, "hop": hop}),
+                env=env_amp, hop=hop, mode="vocal_envelope",
+                song=song, track_id=track_id, duration=duration)
+            return {**state, "source": "vocal_envelope", "stem": payload.get("stem")}
+        lips_server.clear()
+        return {"ok": True, "active": False, "reason": "no_cues",
+                "stem": payload.get("stem")}
 
-        # 分离出来的干声：既能做「没歌词」的兜底，也能用来把歌词轨对齐到录音上。
+    def _lips_payload(self, track: dict, target: str) -> dict:
+        """这首歌的口型包：流水线算过就直接读 ``lips.json``，没有才现场补算。
+
+        「读进度条的时候把口型数据全弄出来」就是这一步：处理曲目时
+        ``Pipeline._build_lips`` 已经算好落盘，播放时只剩一次读盘 + 一次发布。
+        """
         artifacts = track.get("artifacts") or {}
+        cached = str(artifacts.get("lips") or "")
+        if cached and Path(cached).is_file():
+            try:
+                data = json.loads(Path(cached).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = None
+            if isinstance(data, dict) and data.get("mode") in ("cues", "envelope"):
+                # 口型轨 v3 起「不发音的字」沿用邻字口型（句中不再闭嘴）；
+                # 更早的缓存按旧规则生成了 rest cue，直接重算。
+                try:
+                    old_v = int(data.get("v") or 0)
+                except (TypeError, ValueError):
+                    old_v = 0
+                if old_v < 3:
+                    data = None
+            if isinstance(data, dict):
+                # 歌词后来又变了（比如处理完之后「为她所听」才认出这首歌），
+                # 缓存的口型轨就过期了，重算一份。
+                lyrics_now, _timed, _src = lipsync.track_lyrics(track)
+                key_now = lipsync.lyrics_key(lyrics_now) if lyrics_now.strip() else ""
+                if str(data.get("lyrics_key") or "") == key_now:
+                    return data
+        # 老曲目（或者口型那一步被跳过）：现场补算一份，顺手落盘给下次用。
         stem = ""
         for key in ("vocal_mixed", "vocals", "vocal_wav", "final"):
             candidate = str(artifacts.get(key) or "")
             if candidate and Path(candidate).is_file():
                 stem = candidate
                 break
-
-        align = 0.0
-        env: dict = {}
-        if timed and stem:
-            # 官方 LRC 的时间是原曲的，录音可能晚一两秒才开始录；拿干声的能量
-            # 找最佳平移量，把每个字对到真正在唱的位置上。
+        payload = lipsync.build_track_payload(
+            track, stem=stem, duration=float(track.get("duration_s") or 0.0),
+            lrc_fetcher=self._fetch_lyrics)
+        official = payload.pop("official_lyrics", None)
+        if official:
             try:
-                env = lipsync.get_or_build_envelope(stem)
-                align = lipsync.align_offset(env, timed)
-            except Exception as exc:  # noqa: BLE001 - 对齐失败就用原时间轴
-                self.logger.warning("[playback] 歌词对齐失败：%s", exc)
-            if abs(align) >= 0.25:
-                timed = [dict(row, at_s=round(float(row["at_s"]) + align, 3))
-                         for row in timed]
-                self.logger.info("[playback] 歌词轨平移 %+.2fs 对齐干声", align)
-
-        cues = lipsync.build_timed_cues(timed, duration or lipsync.song_duration(target))
-        source = ("lrc:" + lrc_source) if (cues and lrc_source) else (
-            "perception_timed" if cues else "estimate")
-
-        payload: dict = {}
-        if not cues and lyrics.strip():
-            payload = lipsync.get_or_build(
-                target, lyrics, lang=str(track.get("vocal_language") or ""),
-                duration=duration)
-            cues = payload.get("cues") or []
-            source = str(payload.get("source") or "estimate")
-        if cues:
-            state = lips_server.set_playing(
-                cues=cues, song=str(track.get("title") or ""),
-                track_id=str(track.get("id") or ""),
-                duration=float(payload.get("duration") or duration or 0.0))
-            return {**state, "source": source, "align": align,
-                    "lang": (payload.get("lang") or str(track.get("vocal_language") or ""))}
-
-        # 没有歌词也得动嘴：用分离出来的干声算响度包络，跟着「真的在唱」的地方开合。
-        # 日文/冷门歌经常抓不到歌词，这条兜底决定它到底是「哑唱」还是「唱」。
-        if stem:
-            env = env or lipsync.get_or_build_envelope(stem)
-            if env.get("amp"):
-                # 新版桥按包络平滑驱动；旧版桥只认歌词 cue，就给它一份从包络切出来的
-                # 粗口型轨——不刷新页面也能立刻动嘴。
-                state = lips_server.set_playing(
-                    cues=lipsync.envelope_cues(env), env=env["amp"],
-                    hop=float(env.get("hop") or 0.05),
-                    mode="vocal_envelope", song=str(track.get("title") or ""),
-                    track_id=str(track.get("id") or ""),
-                    duration=float(env.get("duration") or duration or 0.0))
-                return {**state, "source": "vocal_envelope", "stem": stem}
-        lips_server.clear()
-        return {"ok": True, "active": False,
-                "reason": "no_lyrics" if not lyrics.strip() else "no_cues",
-                "stem": stem}
+                self._pipeline.store.update(str(track.get("id") or ""),
+                                            official_lyrics=official)
+            except Exception:  # noqa: BLE001 - 存不下来不影响这次唱
+                pass
+        track_id = str(track.get("id") or "")
+        if track_id and payload.get("mode") in ("cues", "envelope"):
+            try:
+                folder = self._pipeline.work_dir / "tracks" / track_id
+                folder.mkdir(parents=True, exist_ok=True)
+                target_file = folder / "lips.json"
+                tmp = target_file.with_suffix(".json.part")
+                tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                os.replace(tmp, target_file)
+                self._pipeline.store.update(track_id,
+                                            artifacts={"lips": str(target_file)})
+            except Exception:  # noqa: BLE001 - 缓存不写也能唱
+                pass
+        return payload
 
     @staticmethod
     def _clean_song_title(title: str) -> str:
@@ -3258,13 +3351,13 @@ class MusicSynthPlugin(NekoPluginBase):
                       flags=re.IGNORECASE)
         return re.sub(r"\s+", " ", text).strip()
 
-    def _fetch_lyrics(self, track: dict) -> tuple[str, str]:
+    def _fetch_lyrics(self, track: dict, force: bool = False) -> tuple[str, str]:
         """标题/歌手 → 带时间戳的官方 LRC。同一首每次进程只试一次。"""
         track_id = str(track.get("id") or "")
         tried = getattr(self, "_lrc_tried", None)
         if tried is None:
             tried = self._lrc_tried = set()
-        if track_id and track_id in tried:
+        if not force and track_id and track_id in tried:
             return "", ""
         if track_id:
             tried.add(track_id)
@@ -3546,7 +3639,9 @@ class MusicSynthPlugin(NekoPluginBase):
             elif hits:
                 # 歌在库里，只是还没唱过（录下来的原曲 / 刚生成的原曲）：直接开唱。
                 idle = [t for t in hits
-                        if str(t.get("status") or "") not in ("running", "queued")]
+                        if str(t.get("status") or "") not in ("running", "queued",
+                                                              "instrumental", "incomplete",
+                                                              "silent")]
                 if idle:
                     return await self._begin_sing(idle[-1])
                 return await self._begin_sing(hits[-1])
@@ -3567,6 +3662,14 @@ class MusicSynthPlugin(NekoPluginBase):
         """还没成品的歌：开始处理，并记下来，做完自动播放。"""
         track_id = str(track.get("id") or "")
         status = str(track.get("status") or "")
+        if status in ("instrumental", "incomplete", "silent") and not track.get("check_override"):
+            # 纯音乐 / 没放完整 / 空录音：别再排一遍队白等，直接说清楚。
+            reason = str(track.get("check_reason") or "") or "这首歌不能翻唱"
+            self.logger.info("[playback] ms_sing 拒绝不能唱的歌 track=%s status=%s",
+                             track_id, status)
+            return Ok({"ok": False, "track_id": track_id, "title": track.get("title"),
+                       "status": status, "error": reason,
+                       "note": "纯音乐没有人声、或者这段录音没放完整；完整听一遍再唱"})
         self._pending_play.add(track_id)
         if status in ("running", "queued"):
             self.logger.info("[playback] ms_sing 已在处理，登记自动播放 track=%s", track_id)
@@ -3918,6 +4021,32 @@ class MusicSynthPlugin(NekoPluginBase):
         self._trash_write_manifest(manifest)
         return {"ok": True, "moved": True, "to": str(target), "bytes": size, "sha256": digest}
 
+    def _trash_tree(self, root: Path) -> int:
+        """把一个目录里的文件全部挪进回收站，再删掉空目录；返回挪走的文件数。
+
+        只动文件、只删空目录：万一有文件没搬成功，那个目录会原样留着，不会误删。
+        ``hash_file=False`` —— 这些是模型中间产物（往往几百 MB），重算 sha256 没必要。
+        """
+        root = Path(root)
+        if not root.is_dir():
+            return 0
+        moved = 0
+        for f in sorted(root.rglob("*"), reverse=True):
+            try:
+                if f.is_file() and self._trash_move(f, hash_file=False).get("moved"):
+                    moved += 1
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            for d in sorted((p for p in root.rglob("*") if p.is_dir()), reverse=True):
+                if not any(d.iterdir()):
+                    d.rmdir()
+            if not any(root.iterdir()):
+                root.rmdir()
+        except Exception:  # noqa: BLE001
+            pass
+        return moved
+
     def _corpus_backfill_durations(self) -> None:
         """给老数据补上每个文件的 dur_s（训练步数要用）。"""
         try:
@@ -4151,19 +4280,18 @@ class MusicSynthPlugin(NekoPluginBase):
     # Per-slot separation chain.  Each stage name maps to the separate_worker
     # model + which output stem feeds the next stage.  Ordered as listed.
     _CORPUS_CHAINS = {
-        # song: 人声提取 → 去和声 → 去混响 → 去噪
+        # song: 人声提取 → 去和声/伴唱。只做分离，不碰混响和降噪：
+        # 数据集要的是原声，任何"重建波形"的模型都会让高保真变成模型味。
         "song": [
             ("separating", "model_bs_roformer_ep_317_sdr_12.9755.ckpt", "vocals"),
             ("separating", "mel_band_roformer_karaoke_becruily.ckpt", "vocals"),
-            ("dereverb", "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt", "noreverb"),
-            ("denoise", "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt", "dry"),
         ],
-        # dry_sing: 跳过人声提取，只去混响 + 去噪
+        # dry_sing: 只有检测到整首有背景音乐才走这一步；干净的清唱保持原声，
+        # 连切片都不碰模型（见 _corpus_pipeline 里的说明）。
         "dry_sing": [
-            ("dereverb", "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt", "noreverb"),
-            ("denoise", "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt", "dry"),
+            ("separating", "model_bs_roformer_ep_317_sdr_12.9755.ckpt", "vocals"),
         ],
-        # speech: 只去噪
+        # speech: 只去噪（说话素材最需要的是压掉环境底噪）
         "speech": [
             ("denoise", "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt", "dry"),
         ],
@@ -4254,43 +4382,30 @@ class MusicSynthPlugin(NekoPluginBase):
 
             # Per-source: run the separation chain, then slice the final dry stem.
             all_clips, rejected = [], []
+            checks: list = []
             valid_s = 0.0
             out_root = self._corpus_root() / slot / source_id
             out_root.mkdir(parents=True, exist_ok=True)
             log_path = out_root / "corpus.log"
 
-            # 清唱：先探一下背景声。背景声偏大（底下垫着音乐、环境很吵）就先补一步人声分离，
-            # 再做去混响 + 去噪；安静的干声按原流程走，不多跑模型。
+            # 清唱素材：一律先做人声/伴奏分离，再按伴奏轨电平决定用哪一版。
+            #
+            # 以前先用 bg_probe 粗筛「整首有没有背景音乐」，没有就跳过分离直接切。
+            # 实测它的判据太松：伴奏压在 -24 ~ -43 dB 的素材（41972533853 实测
+            # -24.5 dB、32558222369 实测 -29.8 dB）全被判成「干净」，结果这些素材
+            # 切出来的片段整段都带着伴奏。原因在它的度量方式——只看「唱段附近
+            # ±1 s 内最低能掉多深」，唱得密、句间没有长停顿的素材掉不下去，就会
+            # 被当成清唱。现在不再靠粗筛，分离本身就是检测：
+            #   1) 全部分离（BS-RoFormer，人声/伴奏两轨）；
+            #   2) 看伴奏轨相对原素材的电平（stem_check_worker）：
+            #      -55 dB 左右 = 模型残渣，本来就没伴奏 -> 丢掉模型输出保留原声；
+            #      -43 dB 以上 = 真的有伴奏 -> 用分离后的人声轨切片。
+            #
+            # 去混响这一步已经彻底拿掉：实测它会把 6~11 kHz（齿音、气声、咬字的清晰度）
+            # 压掉 20~37 dB，而 1~5 kHz 只掉 5~11 dB，频谱上被挖出一个洞，人声听着"闷、糊"。
+            # 训练数据集要的是原声，这类重建波形的模型只会让数据变差。
             if slot == "dry_sing" and paths:
-                try:
-                    probe_worker = self._train_worker("bg_probe_worker.py")
-                    if probe_worker.is_file():
-                        self._job_update(job_id, phase="checking", pct=3, stage_text="检查背景声…")
-                        noisy_hits = []
-                        for raw in paths:
-                            pr = runtime.run_worker(
-                                sep_py, probe_worker, {"input": str(raw)},
-                                cwd=self._corpus_root(), timeout=180, log_path=log_path)
-                            try:
-                                self.logger.info(
-                                    "背景声检测 %s：%s", Path(str(raw)).name,
-                                    {k: pr.get(k) for k in ("ok", "noisy", "gap_db", "quiet_db", "reason")})
-                            except Exception:  # noqa: BLE001
-                                pass
-                            if pr.get("ok") and pr.get("noisy"):
-                                noisy_hits.append((Path(str(raw)).name, pr.get("gap_db")))
-                        if noisy_hits:
-                            chain = [("separating",
-                                      "model_bs_roformer_ep_317_sdr_12.9755.ckpt", "vocals")] + list(chain)
-                            try:
-                                self.logger.info("清唱背景声偏大，追加人声分离：%s", noisy_hits)
-                            except Exception:  # noqa: BLE001
-                                pass
-                except Exception as exc:  # noqa: BLE001
-                    try:
-                        self.logger.warning("背景声检测失败，按原流程继续：%s", exc)
-                    except Exception:  # noqa: BLE001
-                        pass
+                chain = list(self._CORPUS_CHAINS["dry_sing"])
 
             # A single source_id may carry several files; slice each but reuse
             # the chain per file.  Track a running phase index for progress.
@@ -4317,6 +4432,76 @@ class MusicSynthPlugin(NekoPluginBase):
                         sep_py, sep_worker, current, stage_dir, model, stem_key,
                         model_dir, plan,
                         job_id=job_id, pct_from=p_from, pct_to=p_to, dur_s=dur_s)
+                # 分完核对伴奏轨：几乎没东西就说明本来就没有背景音乐，
+                # 模型重建过的干声不如直接用原声，回退到原文件再切片。
+                if slot == "dry_sing" and chain and current != Path(raw):
+                    try:
+                        check_worker = self._train_worker("stem_check_worker.py")
+                        if check_worker.is_file():
+                            ck = runtime.run_worker(
+                                sep_py, check_worker,
+                                {"input": str(raw), "stem": str(current)},
+                                cwd=self._corpus_root(), timeout=300, log_path=log_path)
+                            if ck.get("ok"):
+                                checks.append({
+                                    "file": Path(str(raw)).name,
+                                    "music_db": ck.get("background_db"),
+                                    "has_music": bool(ck.get("has_music")),
+                                    "used": "separated" if ck.get("has_music") else "original",
+                                })
+                                try:
+                                    self.logger.info(
+                                        "伴奏轨 %s dB，%s：%s", ck.get("background_db"),
+                                        "用分离后的人声" if ck.get("has_music") else "保留原声",
+                                        Path(str(raw)).name)
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            if ck.get("ok") and not ck.get("has_music"):
+                                current = Path(raw)
+                                # 这次分离是白跑的：产物直接清掉，别占着磁盘
+                                try:
+                                    self._trash_tree(stems_dir)
+                                except Exception as exc:  # noqa: BLE001
+                                    try:
+                                        self.logger.warning("清理分离产物失败：%s", exc)
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                    except Exception as exc:  # noqa: BLE001
+                        try:
+                            self.logger.warning("伴奏轨核对失败，按分离结果继续：%s", exc)
+                        except Exception:  # noqa: BLE001
+                            pass
+                # 纯音乐检查：整首都没人声的话，分离出来的人声轨就是残渣，
+                # 切出来的片段只会教坏模型——直接跳过这首。
+                if slot == "song" and chain and current != Path(raw):
+                    try:
+                        vworker = self._train_worker("song_check_worker.py")
+                        synth_py = Path(str(self._pipeline.paths.get("synth_python") or ""))
+                        if vworker.is_file() and synth_py.is_file():
+                            vc = runtime.run_worker(
+                                synth_py, vworker,
+                                {"input": str(raw), "vocals": str(current)},
+                                cwd=self._corpus_root(), timeout=900, log_path=log_path)
+                            if vc.get("ok") and vc.get("has_vocals") is False:
+                                self.logger.info(
+                                    "纯音乐（人声轨 %.1f dB），跳过：%s",
+                                    float((vc.get("detail") or {}).get("vocal_med_db") or 0.0),
+                                    Path(str(raw)).name)
+                                self._trash_tree(stems_dir)
+                                rejected.append({
+                                    "id": f"{source_id}_instr{idx:02d}", "slot": slot,
+                                    "src": source_id, "path": "", "start_s": 0.0,
+                                    "end_s": round(dur_s, 3), "dur_s": round(dur_s, 3),
+                                    "status": "rejected", "reason": "纯音乐·没有人声",
+                                    "peak": None, "silence_ratio": None,
+                                    "f0_hz_median": None, "f0_hz_min": None,
+                                    "f0_hz_max": None, "voiced_ratio": None})
+                                continue
+                    except Exception as exc:  # noqa: BLE001
+                        try:
+                            self.logger.warning("人声检查失败，按分离结果继续：%s", exc)
+                        except Exception:  # noqa: BLE001
+                            pass
                 # slice + QC the final dry stem
                 clips_dir = out_root / "clips"
                 clips_dir.mkdir(parents=True, exist_ok=True)
@@ -4338,8 +4523,11 @@ class MusicSynthPlugin(NekoPluginBase):
                     valid_s += float(c.get("dur_s", 0))
                 rejected.extend(res.get("rejected", []))
             self._job_update(job_id, phase="checking", pct=95, stage_text="质检完成")
-            self._corpus_update_source(source_id, clips=all_clips, valid_s=round(valid_s, 3),
-                                       status="done", error="")
+            _instr = any("纯音乐" in str(r.get("reason") or "") for r in rejected)
+            self._corpus_update_source(
+                source_id, clips=all_clips, valid_s=round(valid_s, 3), status="done",
+                checks=checks,
+                error=("纯音乐，没有可切的人声" if _instr and not all_clips else ""))
             result = {"phase": "done", "pct": 100, "stage_text": "完成", "error": "",
                       "clips": all_clips, "rejected": rejected}
         except Exception as exc:  # noqa: BLE001
@@ -4359,7 +4547,7 @@ class MusicSynthPlugin(NekoPluginBase):
                              detail=result.get("error") or result.get("stage_text") or "")
 
     @plugin_entry(id="ms_corpus_add", name="为她而唱 · 投递训练素材",
-                  description="把音频投进语料库（song 全链分离 / dry_sing 去混响去噪 / speech 去噪）→ 自动切片 → 质检；返回 job_id",
+                  description="把音频投进语料库（song 全链分离 / dry_sing 检测并分离伴奏 / speech 去噪）→ 自动切片 → 质检；返回 job_id",
                   input_schema={"type": "object", "properties": {
                       "slot": {"type": "string", "enum": ["song", "dry_sing", "speech"]},
                       "path": {"type": "string"},
@@ -4746,6 +4934,72 @@ class MusicSynthPlugin(NekoPluginBase):
         clip["status"] = new_status
         self._corpus_write_index(index)
         return Ok({"ok": True, "clip_id": clip_id, "status": new_status})
+
+    @plugin_entry(id="ms_corpus_reprocess", name="为她而唱 · 重新处理素材",
+                  description="按当前流程把已有素材重跑一遍（先分离、按伴奏轨电平决定用分离人声还是原声）；"
+                              "不传参数就重跑全部清唱素材",
+                  input_schema={"type": "object", "properties": {
+                      "source_id": {"type": "string"},
+                      "slot": {"type": "string"}},
+                      "required": []})
+    async def ms_corpus_reprocess(self, source_id: str = "", slot: str = "", **_):
+        """重跑已有素材，不用重新上传。
+
+        之前上传的清唱都被送进过去混响/去噪模型（频谱上挖掉 6~11 kHz，听感发糊），
+        原始文件还在库里，直接按新流程重切一遍就能恢复清晰度。重复上传会被去重拦住，
+        所以修完历史素材走这个入口。
+        """
+        index = self._corpus_index()
+        targets = []
+        for src in index.get("sources", []):
+            sid = str(src.get("id") or "")
+            src_slot = str(src.get("slot") or "")
+            if source_id and sid != source_id:
+                continue
+            if not source_id and slot and src_slot != slot:
+                continue
+            if not source_id and not slot and src_slot != "dry_sing":
+                continue
+            if str(src.get("status")) == "processing":
+                continue
+            files = [f for f in (src.get("files") or [])
+                     if isinstance(f, dict) and f.get("path") and Path(str(f["path"])).is_file()]
+            if not files:
+                continue
+            targets.append((src, files))
+        if not targets:
+            return Ok({"ok": False, "error": "没有可重跑的素材（原始文件已经不在了，或者正在处理）"})
+        queued = []
+        for src, files in targets:
+            # 旧切片先清掉：新流程切出的段数可能不同，留着会在磁盘上变成孤儿文件
+            for clip in src.get("clips") or []:
+                path = Path(str((clip or {}).get("path") or ""))
+                try:
+                    if path.is_file():
+                        self._trash_move(path)
+                except Exception:  # noqa: BLE001
+                    pass
+            # 旧的模型输出（去混响/去噪/分离的中间产物）一起清掉：那是上一版流程
+            # 留下的、已经被确认会把声音弄糊的波形，留着既占地又容易看混。
+            self._trash_tree(self._corpus_root() / str(src.get("slot") or "dry_sing")
+                             / str(src.get("id") or "") / "stems")
+            job_id = self._job_begin(f"corpus_{src.get('slot') or 'dry_sing'}")
+            src["clips"] = []
+            src["valid_s"] = 0.0
+            src["status"] = "queued"
+            src["error"] = ""
+            src["job_id"] = job_id
+            queued.append((job_id, str(src.get("slot") or ""), str(src.get("id") or ""), files))
+        self._corpus_write_index(index)
+        ahead = 0
+        for job_id, src_slot, sid, files in queued:
+            ahead = self._corpus_enqueue(job_id, src_slot, sid, files)
+            self._job_update(job_id, phase="queued", pct=0,
+                             stage_text=("排队中，前面还有 %d 个" % ahead) if ahead else "排队中",
+                             slot=src_slot, source_id=sid)
+        return Ok({"ok": True, "queued": len(queued),
+                   "source_ids": [q[2] for q in queued],
+                   "job_id": queued[0][0]})
 
     def _corpus_find_source(self, index: dict, source_id: str):
         for src in index.get("sources", []):
