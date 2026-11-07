@@ -377,6 +377,12 @@ class MusicSynthPlugin(NekoPluginBase):
         models = runtime.list_ddsp_models(paths.get("ddsp_root"), ckpt_now,
                                           self._active_train_run_ids(),
                                           Path(str(paths.get("ddsp_pretrain_reflow") or "")))
+        for _m in models:
+            _bundled = self._bundled_voice(str(_m.get("exp_dir") or ""))
+            if _bundled:
+                _m["bundled"] = True
+                _m["demo"] = _bundled["demo"]
+                _m["demo_title"] = _bundled["title"]
         tracks = pipeline.store.all()
         # 标一下「成品到底还在不在」：记录里常见文件早被删了，面板据此禁用试听，而不是点了才报错
         for _t in tracks:
@@ -2234,6 +2240,12 @@ class MusicSynthPlugin(NekoPluginBase):
                       "step": {"type": "integer", "minimum": 1}},
                       "required": ["run_id"]})
     async def ms_train_preview(self, run_id: str = "", step: int = 0, **_):
+        demo = self._bundled_voice(run_id)
+        if demo:
+            payload = await asyncio.to_thread(self._audio_payload, Path(demo["demo"]))
+            return Ok({"ok": True, "run_id": run_id, "step": 0,
+                       "file": demo["demo"], "name": Path(demo["demo"]).name,
+                       "bundled": True, "stats": {}, **payload})
         run_dir = self._train_run_dir(run_id)
         state = runtime.read_training_state(run_dir)
         if not state:
@@ -5602,6 +5614,33 @@ class MusicSynthPlugin(NekoPluginBase):
         self._thread(f"ms-soulx-install-{job_id}", run)
         return Ok({"ok": True, "job_id": job_id})
 
+    def _bundled_voice(self, name: str) -> dict | None:
+        """插件自带的体验音色：data/bundled_voices.json 里登记的名字 → 试听样曲。
+
+        内置音色不是用户训练的，列表里标「内置」；试听直接放打包好的整首歌，
+        不占显存、也不用先生成。没登记或文件不在就当普通音色处理。
+        """
+        stem = Path(str(name or "").strip()).name
+        if not stem:
+            return None
+        try:
+            data = json.loads((self._plugin_dir / "data" / "bundled_voices.json")
+                              .read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        item = data.get(stem) if isinstance(data, dict) else None
+        if not isinstance(item, dict):
+            return None
+        demo = Path(str(item.get("demo") or ""))
+        if not demo.is_absolute():
+            demo = self._plugin_dir / demo
+        if not demo.is_file():
+            return None
+        return {"name": stem,
+                "label": str(item.get("label") or "内置 · 体验"),
+                "title": str(item.get("title") or f"{stem} · 试听"),
+                "demo": str(demo)}
+
     def _ace_loras(self) -> list:
         """Installed ACE voices, grouped by name.
 
@@ -5648,6 +5687,12 @@ class MusicSynthPlugin(NekoPluginBase):
                 "bases": [v["base"] for v in variants],
                 "variants": variants,
             })
+        for row in rows:
+            bundled = self._bundled_voice(row["name"])
+            if bundled:
+                row["bundled"] = True
+                row["demo"] = bundled["demo"]
+                row["demo_title"] = bundled["title"]
         return rows
 
     def _ace_lora_group(self, name: str) -> dict | None:
@@ -6478,6 +6523,11 @@ class MusicSynthPlugin(NekoPluginBase):
                       "name": {"type": "string"},
                       "model": {"type": "string"}}})
     async def ms_ace_preview(self, name: str = "", model: str = "", **_):
+        demo = self._bundled_voice(name)
+        if demo:
+            payload = await asyncio.to_thread(self._audio_payload, Path(demo["demo"]))
+            return Ok({"ok": True, "name": demo["name"], "model": "bundled",
+                       "file": demo["demo"], "bundled": True, **payload})
         busy = self._training_active()
         if busy:
             return Ok({"ok": False, "busy": busy,

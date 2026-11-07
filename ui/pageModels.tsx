@@ -191,7 +191,10 @@ export function PageModels(props: { api: any; snap: any; onRefresh: () => void; 
             <div style={{ fontSize: 11.5, color: INK_2 }}>{m.mtime || ""}{m.size_mb ? " · " + m.size_mb + " MB" : ""}</div>
           </div>
         </div>
-        {m.current ? <Pill tone="success">正在使用</Pill> : isWorking ? <Pill tone="warning">还没训完</Pill> : null}
+        <Row style={{ gap: 6 }}>
+          {m.bundled ? <Pill tone="success">内置 · 体验</Pill> : null}
+          {m.current ? <Pill tone="success">正在使用</Pill> : isWorking ? <Pill tone="warning">还没训完</Pill> : null}
+        </Row>
       </Row>
       <Row>
         {m.has_config ? null : <StatusBadge tone="warning">缺少配置文件，可能用不了</StatusBadge>}
@@ -278,7 +281,7 @@ export function PageModels(props: { api: any; snap: any; onRefresh: () => void; 
                         <div style={{ fontSize: 11.5, color: INK_2 }}>基于 {bases.join(" / ") || "未知底模"}</div>
                       </div>
                     </Row>
-                    <Pill tone={isCur ? "success" : "neutral"}>{isCur ? "正在使用" : "原创音色"}</Pill>
+                    <Pill tone={isCur || l.bundled ? "success" : "neutral"}>{isCur ? "正在使用" : l.bundled ? "内置 · 体验" : "原创音色"}</Pill>
                   </Row>
                   {open === "ace:" + l.name ? (
                     <div style={{ padding: 10, borderRadius: 12, background: "rgba(248,250,252,0.95)", border: "1px solid " + LINE }}>

@@ -3348,7 +3348,10 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
             ] })
           ] })
         ] }),
-        m.current ? /* @__PURE__ */ jsx(Pill, { tone: "success", children: "正在使用" }) : isWorking ? /* @__PURE__ */ jsx(Pill, { tone: "warning", children: "还没训完" }) : null
+        /* @__PURE__ */ jsxs(Row, { style: { gap: 6 }, children: [
+          m.bundled ? /* @__PURE__ */ jsx(Pill, { tone: "success", children: "内置 · 体验" }) : null,
+          m.current ? /* @__PURE__ */ jsx(Pill, { tone: "success", children: "正在使用" }) : isWorking ? /* @__PURE__ */ jsx(Pill, { tone: "warning", children: "还没训完" }) : null
+        ] })
       ] }),
       /* @__PURE__ */ jsxs(Row, { children: [
         m.has_config ? null : /* @__PURE__ */ jsx(StatusBadge, { tone: "warning", children: "缺少配置文件，可能用不了" }),
@@ -3427,7 +3430,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
                   ] })
                 ] })
               ] }),
-              /* @__PURE__ */ jsx(Pill, { tone: isCur ? "success" : "neutral", children: isCur ? "正在使用" : "原创音色" })
+              /* @__PURE__ */ jsx(Pill, { tone: isCur || l.bundled ? "success" : "neutral", children: isCur ? "正在使用" : l.bundled ? "内置 · 体验" : "原创音色" })
             ] }),
             open === "ace:" + l.name ? /* @__PURE__ */ jsx("div", { style: { padding: 10, borderRadius: 12, background: "rgba(248,250,252,0.95)", border: "1px solid " + LINE }, children: /* @__PURE__ */ jsx(Muted, { style: { wordBreak: "break-all" }, children: l.path || "" }) }) : null,
             /* @__PURE__ */ jsxs(Row, { style: { marginTop: "auto", flexWrap: "wrap" }, children: [
