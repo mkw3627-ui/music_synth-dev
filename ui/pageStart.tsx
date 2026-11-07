@@ -115,7 +115,10 @@ export function PageStart(props: { api: any; snap: any; onGo: (page: string) => 
 
       <Soft style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", justifyContent: "space-between" }}>
         <Muted>所有处理都在本机完成，不会把音频上传到网上。小提示：「{materialTitle("song")}」这类素材效果最自然。</Muted>
-        <Btn onClick={() => onGo("settings")}>看看电脑状态</Btn>
+        <Row style={{ gap: 8 }}>
+          <Btn onClick={() => onGo("wizard")}>重新查看引导</Btn>
+          <Btn onClick={() => onGo("settings")}>看看电脑状态</Btn>
+        </Row>
       </Soft>
     </Col>
   )

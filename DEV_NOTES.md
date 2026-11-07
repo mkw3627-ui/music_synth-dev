@@ -401,3 +401,28 @@ config.example.toml」，但移动会改变默认值来源，这次只记录不�
 - 本地安装版是 76 个声明（含重复的 `ms_set_active_model`），仓库 0.2.31 是 74 个；
   合并后 75 = 74 + `ms_corpus_reprocess`，入口 id 集合与本地版完全一致
   （`ms_set_active_model` 只注册 1 次，保留 0.2.31 的修复）。
+
+## 首次使用引导重做（2026-11-07）
+
+旧的四步「欢迎 / 安装位置 / 安装 / 完成」向导换成五页新手引导
+（`ui/onboarding.tsx`，`ui/setupWizard.tsx` 只保留同名转导出）：
+
+1. 体验：直接播放内置音色「沫沫」的试听样曲（`ms_ace_preview`，失败回退
+   `ms_train_preview`；都是 `data/demo/momo_demo.mp3`，不占显存）。
+2. 功能一览：听歌识曲 / 人声分离 / 翻唱变声 / 训练自己的音色 / 原创歌曲 /
+   混音出曲 / AI 可调用演唱，横向翻页。
+3. 使用流程：导入歌曲 → 选择音色 → 生成 → 试听导出。
+4. 依赖与环境：原向导的全部文案、安装位置选择、17 个检测项、单项安装 /
+   一键安装 / 进度轮询 / 失败重试都在这一页；操作栏固定在卡片底部。
+5. 完成：全部就绪 + 开始使用。
+
+- 旧向导的说明文字、依赖项标签、安装/失败/完成提示都保留，只是排版和分页重做
+  （对照表见 `D:\ruanjian\N.E.K.O\_backup_onboarding\old-content-mapping.md`）。
+- 「已经引导过」记在 localStorage `ms_onboarding_v2_done`（完成或跳过都会写）。
+  首页「重新查看引导」和设置页入口都能重新打开，从第 1 页开始。
+- 必需项还能在本页安装时，跳过会被拦回第 4 页；检测失败 / 没有可安装项时不拦。
+- **`ms_setup_check` 在「环境未就绪」时会返回 `ok=false`**，而 `ui/api.ts` 的
+  `unpack` 把 `ok=false` 当业务失败。新加了 `callEntryLoose`（只剥
+  `success/data` 外壳，不看 `ok`），向导检测走它；其它入口仍走原来的
+  `callEntry`，避免把真正的失败吞掉。
+

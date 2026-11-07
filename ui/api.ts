@@ -55,6 +55,11 @@ export function readExport(payload: any): any {
 }
 
 export async function viaRuns(entryId: string, args: any, timeoutMs: number): Promise<any> {
+  return readExport(await runsPayload(entryId, args, timeoutMs))
+}
+
+/** 跑一次入口，返回 /runs/{id}/export 的原始载荷（不剥壳）。 */
+async function runsPayload(entryId: string, args: any, timeoutMs: number): Promise<any> {
   const resp = await fetch(ORIGIN + "/runs", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -76,7 +81,7 @@ export async function viaRuns(entryId: string, args: any, timeoutMs: number): Pr
     if (status === "succeeded") {
       const er = await fetch(ORIGIN + "/runs/" + encodeURIComponent(String(runId)) + "/export")
       if (!er.ok) throw Error("读取结果失败：HTTP " + er.status)
-      return readExport(await er.json())
+      return await er.json()
     }
     if (status === "failed" || status === "canceled" || status === "timeout") {
       const detail: any = rec && (rec.error || rec.message)
@@ -86,6 +91,46 @@ export async function viaRuns(entryId: string, args: any, timeoutMs: number): Pr
     }
   }
   throw Error("任务超时（" + Math.round(timeoutMs / 1000) + " 秒）")
+}
+
+/** 不按 ok=false 判失败地剥壳：登录/检测类入口常用 ok=false 表示「还没就绪」。 */
+function unwrapLoose(response: any): any {
+  let data = response
+  for (let i = 0; i < 8; i++) {
+    if (!data || typeof data !== "object") break
+    if (data.value !== undefined && data.data === undefined) { data = data.value; continue }
+    if (data.data !== undefined && data.ok === undefined) { data = data.data; continue }
+    if (data.result !== undefined && data.ok === undefined) { data = data.result; continue }
+    break
+  }
+  return data || {}
+}
+
+/** 读原始 JSON 项，不做 unpck 的 ok=false 拦截。 */
+function readExportLoose(payload: any): any {
+  const items = Array.isArray(payload?.items) ? payload.items : []
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue
+    if (item.type === "json" && item.json) return item.json
+    if (item.type === "text" && typeof item.text === "string") {
+      try { return JSON.parse(item.text) } catch (e) { /* 继续找下一条 */ }
+    }
+  }
+  return {}
+}
+
+/**
+ * 宽松调用：ok=false 不算失败（由调用方自己看 ready/items）。
+ * 只给 ms_setup_check 这类「未就绪也会返回 ok=false」的入口用。
+ */
+export async function callEntryLoose(api: Api, entryId: string, args: any = {},
+                                     timeoutMs = 120000): Promise<any> {
+  try {
+    return unwrapLoose(readExportLoose(await runsPayload(entryId, args, timeoutMs)))
+  } catch (first: any) {
+    if (!api || typeof api.call !== "function") throw first
+    return unwrapLoose(await api.call(entryId, args, { userInitiated: true }))
+  }
 }
 
 /** 调一个插件入口。timeoutMs 是等结果的上限（安装、训练收尾这类要给足）。 */

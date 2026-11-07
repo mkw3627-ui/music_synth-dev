@@ -16,18 +16,26 @@ import { PageCreate } from "./pageCreate"
 import { PageSettings } from "./pageSettings"
 import { SetupWizard } from "./setupWizard"
 
-/** 开发预览用：?wizard=1/2/3 直接打开向导第几步；宿主里没有这个参数，恒为 0。 */
+/** 开发预览用：?wizard=1..5 直接打开引导第几页；宿主里没有这个参数，恒为 0。 */
 function wizardStartAt(): number {
   try {
     const q = String((window as any).location && (window as any).location.search || "")
     const m = q.match(/[?&]wizard=([a-z0-9]+)/)
     if (!m) return 0
     const v = m[1]
-    if (v === "2") return 2
-    if (v === "3") return 3
-    if (v === "1" || v === "fail" || v === "install") return 1
+    if (v === "1" || v === "2" || v === "3" || v === "4" || v === "5") return Number(v)
+    if (v === "fail" || v === "install") return 4
     return 0
   } catch (e) { return 0 }
+}
+
+/** 新手引导是否已经完整看过（完成或主动跳过）。存在本机 localStorage 里。 */
+const ONBOARDING_KEY = "ms_onboarding_v2_done"
+function onboarded(): boolean {
+  try { return window.localStorage.getItem(ONBOARDING_KEY) === "1" } catch (e) { return true }
+}
+function markOnboarded(): void {
+  try { window.localStorage.setItem(ONBOARDING_KEY, "1") } catch (e) { /* 隐私模式下忽略 */ }
 }
 
 const NAV = [
@@ -83,12 +91,21 @@ export default function Panel(props: any) {
   const hostState = (props as any).state
   const view = snap || (hostState && typeof hostState === "object" ? hostState : null)
 
-  // 第一次打开：环境没装全就先把向导挡在前面（必须显式 completed=true 才算装好）
+  // 第一次打开：先走五页新手引导（体验 → 功能介绍 → 用法 → 装环境 → 完成）。
+  //   · 没看过引导（本机没有记录）→ 从第 1 页开始
+  //   · 已经看过、但环境缺必需项 → 直接落在第 4 页，并把其它页面挡住
+  //   · 预览 ?wizard=… → 直接打开指定页
   const setupReady = !view || !view.setup || view.setup.completed === true
   useEffect(() => {
-    if (!setupReady) setWizard(true)
-    else if (wizardStartAt()) setWizard(true) // 预览：?wizard=… 直接打开向导
+    if (wizardStartAt() || !setupReady || !onboarded()) setWizard(true)
   }, [setupReady])
+  const wizardStart = (() => {
+    const forced = wizardStartAt()
+    if (forced) return forced
+    if (!setupReady && onboarded()) return 4
+    return undefined
+  })()
+  const closeWizard = () => { markOnboarded(); setWizard(false); refresh() }
 
   const go = (k: string) => {
     if (k === "wizard") { setWizard(true); return }
@@ -166,7 +183,7 @@ export default function Panel(props: any) {
         </div>
       </div>
 
-      {wizard ? <SetupWizard api={api} startAt={wizardStartAt() || undefined} onDone={() => { setWizard(false); refresh() }} /> : null}
+      {wizard ? <SetupWizard api={api} startAt={wizardStart} onDone={closeWizard} onSkip={closeWizard} /> : null}
     </div>
   )
 }

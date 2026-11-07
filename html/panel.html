@@ -489,6 +489,9 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     return {};
   }
   async function viaRuns(entryId, args, timeoutMs) {
+    return readExport(await runsPayload(entryId, args, timeoutMs));
+  }
+  async function runsPayload(entryId, args, timeoutMs) {
     const resp = await fetch(ORIGIN + "/runs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -512,7 +515,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       if (status === "succeeded") {
         const er = await fetch(ORIGIN + "/runs/" + encodeURIComponent(String(runId)) + "/export");
         if (!er.ok) throw Error("读取结果失败：HTTP " + er.status);
-        return readExport(await er.json());
+        return await er.json();
       }
       if (status === "failed" || status === "canceled" || status === "timeout") {
         const detail = rec && (rec.error || rec.message);
@@ -520,6 +523,48 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       }
     }
     throw Error("任务超时（" + Math.round(timeoutMs / 1e3) + " 秒）");
+  }
+  function unwrapLoose(response) {
+    let data = response;
+    for (let i = 0; i < 8; i++) {
+      if (!data || typeof data !== "object") break;
+      if (data.value !== void 0 && data.data === void 0) {
+        data = data.value;
+        continue;
+      }
+      if (data.data !== void 0 && data.ok === void 0) {
+        data = data.data;
+        continue;
+      }
+      if (data.result !== void 0 && data.ok === void 0) {
+        data = data.result;
+        continue;
+      }
+      break;
+    }
+    return data || {};
+  }
+  function readExportLoose(payload) {
+    const items = Array.isArray(payload == null ? void 0 : payload.items) ? payload.items : [];
+    for (const item of items) {
+      if (!item || typeof item !== "object") continue;
+      if (item.type === "json" && item.json) return item.json;
+      if (item.type === "text" && typeof item.text === "string") {
+        try {
+          return JSON.parse(item.text);
+        } catch (e) {
+        }
+      }
+    }
+    return {};
+  }
+  async function callEntryLoose(api, entryId, args = {}, timeoutMs = 12e4) {
+    try {
+      return unwrapLoose(readExportLoose(await runsPayload(entryId, args, timeoutMs)));
+    } catch (first) {
+      if (!api || typeof api.call !== "function") throw first;
+      return unwrapLoose(await api.call(entryId, args, { userInitiated: true }));
+    }
   }
   async function callEntry(api, entryId, args = {}, timeoutMs = 12e4) {
     try {
@@ -1639,7 +1684,10 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           materialTitle("song"),
           "」这类素材效果最自然。"
         ] }),
-        /* @__PURE__ */ jsx(Btn, { onClick: () => onGo("settings"), children: "看看电脑状态" })
+        /* @__PURE__ */ jsxs(Row, { style: { gap: 8 }, children: [
+          /* @__PURE__ */ jsx(Btn, { onClick: () => onGo("wizard"), children: "重新查看引导" }),
+          /* @__PURE__ */ jsx(Btn, { onClick: () => onGo("settings"), children: "看看电脑状态" })
+        ] })
       ] })
     ] });
   }
@@ -2124,7 +2172,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
   var STEP_NAMES = ["放素材", "训练设置", "看着她唱", "保存声音"];
   var ENDED = ["finished", "failed", "stopped"];
   var ACTIVE_PHASES = ["training", "preparing", "preprocessing", "previewing"];
-  var TRAIN_UI = { step: 1, maxStep: 1, runId: "", name: "" };
+  var TRAIN_UI = { step: 1, maxStep: 1, runId: "", name: "", autoJumped: "" };
   function PageTrain(props) {
     const { api, snap } = props;
     const c = useCorpus(api);
@@ -2141,7 +2189,6 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     };
     const [extraSteps, setExtraSteps] = useState("");
     const [stepMode, setStepMode] = useState("normal");
-    const [trainQuality, setTrainQuality] = useState("mid");
     const [customSteps, setCustomSteps] = useState("10000");
     const [customOpen, setCustomOpen] = useState(false);
     const [extraOpen, setExtraOpen] = useState(false);
@@ -2165,9 +2212,6 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const [aceStatus, setAceStatus] = useState(null);
     const [aceJobId, setAceJobId] = useState("");
     const [aceJob, setAceJob] = useState(null);
-    const [baseStatus, setBaseStatus] = useState(null);
-    const [baseJobId, setBaseJobId] = useState("");
-    const [baseJob, setBaseJob] = useState(null);
     const [aceEpochs, setAceEpochs] = useState("");
     const [aceRank, setAceRank] = useState("");
     const [aceAlpha, setAceAlpha] = useState("");
@@ -2268,6 +2312,20 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       const id = setInterval(() => loadStatus(runId), 4e3);
       return () => clearInterval(id);
     }, [runId]);
+    const chainDone = !chain || chain.done === true || String(chain.state || "") === "done";
+    const chainState = chain ? String(chain.state || "") : "";
+    const aceDone = String(aceJob && aceJob.state || "") === "done";
+    const allTrained = phase === "finished" && chainDone || !status && !chain && aceDone;
+    const jumpKey = (runId || aceJid || "") + "|" + phase + "|" + chainState + "|" + (aceDone ? "ace" : "");
+    useEffect(() => {
+      if (step !== 3 || !allTrained) return;
+      if (TRAIN_UI.autoJumped === jumpKey) return;
+      const t = setTimeout(() => {
+        TRAIN_UI.autoJumped = jumpKey;
+        if (props.onGo) props.onGo("models");
+      }, 2500);
+      return () => clearTimeout(t);
+    }, [step, allTrained, jumpKey]);
     useEffect(() => {
       if (aceJobId) return;
       const jobs = props.snap && props.snap.jobs || {};
@@ -2297,39 +2355,6 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         clearInterval(id);
       };
     }, [aceJid]);
-    const loadBaseStatus = async () => {
-      try {
-        const r = await callEntry(api, "ms_base_status", {}, 3e4);
-        setBaseStatus(r);
-      } catch (e) {
-      }
-    };
-    useEffect(() => {
-      loadBaseStatus();
-    }, []);
-    useEffect(() => {
-      if (!baseJobId) return;
-      let alive = true;
-      const tick = async () => {
-        try {
-          const r = await callEntry(api, "ms_ace_job", { job_id: baseJobId }, 3e4);
-          const j = r && r.job || null;
-          if (!alive) return;
-          setBaseJob(j);
-          if (!j || j.state === "done" || j.state === "failed") {
-            setBaseJobId("");
-            loadBaseStatus();
-          }
-        } catch (e) {
-        }
-      };
-      tick();
-      const id = setInterval(tick, 3e3);
-      return () => {
-        alive = false;
-        clearInterval(id);
-      };
-    }, [baseJobId]);
     useEffect(() => {
       if (!status) return;
       const last = milestones.length ? String(milestones[milestones.length - 1].step) : "";
@@ -2358,29 +2383,6 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         setBusy("");
       }
     }
-    const checkBase = () => run("base", async () => {
-      const r = await callEntry(api, "ms_base_inspect", { tier: trainQuality }, 12e4);
-      if (r && r.ok) {
-        const a = r.arch || {};
-        setMsg({
-          tone: "info",
-          text: "底模：" + (r.framework || "未知") + " · " + (a.n_layers || "?") + " 层 / " + (a.n_chans || "?") + " 通道" + (a.encoder ? " · " + a.encoder : "") + " · " + (r.path || "")
-        });
-      } else {
-        setMsg({ tone: "error", text: "底模检查失败：" + (r && r.error || "未知错误") });
-      }
-    });
-    const downloadBase = () => run("basedl", async () => {
-      const r = await callEntry(api, "ms_base_download", { tier: trainQuality }, 6e4);
-      if (r && r.ok && r.job_id) {
-        setBaseJobId(String(r.job_id));
-        setMsg({ tone: "info", text: "开始下载" + (trainQuality === "low" ? "低" : "高") + "质量底模…" });
-      } else if (r && r.ok && r.already) {
-        setMsg({ tone: "info", text: "这个档位的底模已经就绪" });
-      } else {
-        setMsg({ tone: "error", text: "没能开始下载：" + (r && r.error || "未知错误") });
-      }
-    });
     const deleteRun = async (withFiles) => {
       setDelRun(false);
       if (!runId) return;
@@ -2452,7 +2454,6 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       }
       const r = await callEntry(api, "ms_train_start", {
         steps,
-        quality: trainQuality,
         name: name.trim() || void 0,
         from_corpus: true,
         auto: !!doAce,
@@ -2467,10 +2468,9 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       }, 12e4);
       if (r && r.ok && r.run_id) {
         setAceJobId("");
-        const qWarn = Array.isArray(r.warnings) && r.warnings.length ? " 注意：" + r.warnings.join("；") : "";
         setMsg({
           tone: "info",
-          text: (doAce ? "开始训练翻唱声音；完成后会自动保存最佳节点，并接着训练原创歌曲声音。" : "开始训练了。每 2000 步会出试听，到目标步数才停；觉得够像了可以提前「停下来」保存。") + qWarn
+          text: doAce ? "开始训练翻唱声音；完成后会自动保存最佳节点，并接着训练原创歌曲声音。" : "开始训练了。每 2000 步会出试听，到目标步数才停；觉得够像了可以提前「停下来」保存。"
         });
         setRunId(String(r.run_id));
         setStep(3);
@@ -2688,31 +2688,6 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
                 effectiveBatch
               ] })
             ] }),
-            /* @__PURE__ */ jsxs(Row, { style: { gap: 8, flexWrap: "wrap" }, children: [
-              [["low", "低"], ["mid", "中"], ["high", "高"]].map(([k, label]) => /* @__PURE__ */ jsxs(Btn, {
-                style: trainQuality === k ? PRIMARY_BTN : void 0,
-                onClick: () => {
-                  setTrainQuality(k);
-                  setStepMode(k === "low" ? "speed" : k === "high" ? "quality" : "normal");
-                },
-                children: [label, "质量"]
-              }, k)),
-              /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: checkBase, children: busy === "base" ? "检查中…" : "检查底模" })
-            ] }),
-            /* @__PURE__ */ jsx(Muted, { style: { fontSize: 12 }, children: "低/中/高会换用对应的训练底模；显存或磁盘不够时会在这里提醒。" }),
-            (() => {
-              const info = baseStatus && baseStatus.tiers ? baseStatus.tiers[trainQuality] : null;
-              if (!info) return null;
-              if (info.exists) return /* @__PURE__ */ jsx(Muted, { style: { fontSize: 12 }, children: "底模已就绪：" + String(info.path || "").split(/[\\/]/).pop() + " · " + info.size_gb + " GB" });
-              return /* @__PURE__ */ jsxs(Row, { style: { gap: 8, flexWrap: "wrap", alignItems: "center" }, children: [
-                /* @__PURE__ */ jsx(Muted, { style: { fontSize: 12 }, children: "这档底模还没下载" }),
-                /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: downloadBase, children: busy === "basedl" ? "启动中…" : "下载底模" })
-              ] });
-            })(),
-            baseJob ? /* @__PURE__ */ jsxs(Col, { style: { gap: 6 }, children: [
-              /* @__PURE__ */ jsx(Bar, { pct: Number(baseJob.progress) || 0 }),
-              /* @__PURE__ */ jsx(Muted, { children: baseJob.detail || "正在下载底模…" })
-            ] }) : null,
             /* @__PURE__ */ jsxs(Row, { style: { gap: 8, flexWrap: "wrap" }, children: [
               STEPS_MODES.map((m) => /* @__PURE__ */ jsxs(
                 Btn,
@@ -3332,7 +3307,10 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
             ] })
           ] })
         ] }),
-        m.current ? /* @__PURE__ */ jsx(Pill, { tone: "success", children: "正在使用" }) : isWorking ? /* @__PURE__ */ jsx(Pill, { tone: "warning", children: "还没训完" }) : null
+        /* @__PURE__ */ jsxs(Row, { style: { gap: 6 }, children: [
+          m.bundled ? /* @__PURE__ */ jsx(Pill, { tone: "success", children: "内置 · 体验" }) : null,
+          m.current ? /* @__PURE__ */ jsx(Pill, { tone: "success", children: "正在使用" }) : isWorking ? /* @__PURE__ */ jsx(Pill, { tone: "warning", children: "还没训完" }) : null
+        ] })
       ] }),
       /* @__PURE__ */ jsxs(Row, { children: [
         m.has_config ? null : /* @__PURE__ */ jsx(StatusBadge, { tone: "warning", children: "缺少配置文件，可能用不了" }),
@@ -3411,7 +3389,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
                   ] })
                 ] })
               ] }),
-              /* @__PURE__ */ jsx(Pill, { tone: isCur ? "success" : "neutral", children: isCur ? "正在使用" : "原创音色" })
+              /* @__PURE__ */ jsx(Pill, { tone: isCur || l.bundled ? "success" : "neutral", children: isCur ? "正在使用" : l.bundled ? "内置 · 体验" : "原创音色" })
             ] }),
             open === "ace:" + l.name ? /* @__PURE__ */ jsx("div", { style: { padding: 10, borderRadius: 12, background: "rgba(248,250,252,0.95)", border: "1px solid " + LINE }, children: /* @__PURE__ */ jsx(Muted, { style: { wordBreak: "break-all" }, children: l.path || "" }) }) : null,
             /* @__PURE__ */ jsxs(Row, { style: { marginTop: "auto", flexWrap: "wrap" }, children: [
@@ -3475,10 +3453,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     recorded: ["录好了 · 等着唱", "success"],
     running: ["正在处理", "warning"],
     done: ["做好啦", "success"],
-    failed: ["没成功", "error"],
-    instrumental: ["纯音乐 · 唱不了", "neutral"],
-    incomplete: ["没放完整 · 唱不了", "warning"],
-    silent: ["录音没声音", "warning"]
+    failed: ["没成功", "error"]
   };
   var JOB_STATE = {
     queued: ["排队", "neutral"],
@@ -3594,6 +3569,10 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const live = listener.live || {};
     const captureRuntime = s.capture && s.capture.runtime || {};
     const listening = !!listener.running;
+    const link = s.link || {};
+    const linkedMode = listener.mode === "linked" || Boolean(
+      link.running && link.monitor && link.source_control && link.selected && link.selected.name
+    );
     const autoTracks = (s.tracks || []).filter((t) => t.auto_recorded);
     const startListen = () => run("listen", async () => {
       const args = targetPid ? { pid: Number(targetPid) } : {};
@@ -3682,17 +3661,18 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
             /* @__PURE__ */ jsx("div", { style: { fontSize: 15.5, fontWeight: 700, color: INK }, children: "听歌录制（只录选中的应用）" }),
             /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK_2, lineHeight: 1.8 }, children: "只采集一个播放器的声道，通知声、视频和 AI 自己的声音不会混进来。整首录完先存着不翻唱，等你说「唱一下这首」或「上一首」。" })
           ] }),
-          /* @__PURE__ */ jsx(Pill, { tone: listener.mode === "linked" ? "success" : "neutral", children: listener.mode === "linked" ? "已联动为她所听" : "独立模式" })
+          /* @__PURE__ */ jsx(Pill, { tone: linkedMode ? "success" : "neutral", children: linkedMode ? "已联动为她所听" : "独立模式" })
         ] }),
         /* @__PURE__ */ jsxs(Row, { style: { gap: 8, flexWrap: "wrap", marginTop: 12 }, children: [
-          /* @__PURE__ */ jsx(Btn, { style: listening ? void 0 : PRIMARY_BTN, disabled: !!busy || listening, onClick: startListen, children: busy === "listen" ? "正在开始…" : "开始听歌录制" }),
-          /* @__PURE__ */ jsx(Btn, { disabled: !!busy || !listening, onClick: stopListen, children: busy === "unlisten" ? "正在停止…" : "停止" }),
-          /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: checkNow, children: busy === "now" ? "读取中…" : "识别当前播放" }),
-          targets.length ? /* @__PURE__ */ jsxs(Select, { value: targetPid, onChange: (e) => setTargetPid(e.target.value), style: { minWidth: 180 }, children: [
+          /* @__PURE__ */ jsx(Btn, { style: listening ? void 0 : PRIMARY_BTN, disabled: !!busy || listening || linkedMode, onClick: startListen, children: busy === "listen" ? "正在开始…" : "开始听歌录制" }),
+          /* @__PURE__ */ jsx(Btn, { disabled: !!busy || !listening || linkedMode, onClick: stopListen, children: busy === "unlisten" ? "正在停止…" : "停止" }),
+          /* @__PURE__ */ jsx(Btn, { disabled: !!busy || linkedMode, onClick: checkNow, children: busy === "now" ? "读取中…" : "识别当前播放" }),
+          targets.length ? /* @__PURE__ */ jsxs(Select, { value: targetPid, onChange: (e) => setTargetPid(e.target.value), disabled: linkedMode, style: { minWidth: 180 }, children: [
             /* @__PURE__ */ jsx("option", { value: "", children: "自动选（第一个音乐应用）" }),
             targets.map((t) => /* @__PURE__ */ jsx("option", { value: String(t.pid), children: (t.name || "应用") + " · PID " + t.pid }, String(t.pid)))
           ] }) : null
         ] }),
+        linkedMode ? /* @__PURE__ */ jsx("div", { style: { marginTop: 10, fontSize: 12.5, color: INK_2, lineHeight: 1.8 }, children: "已联动为她所听：音源、开始和停止都由她管理，这里不需要操作；她开始监听后会自动录制。" }) : null,
         /* @__PURE__ */ jsx("div", { style: { marginTop: 10, fontSize: 12.5, color: INK_2, lineHeight: 1.8 }, children: listening ? String(live.state || "") === "recording" ? "正在录：" + (live.title || "（等识别歌名）") + (live.artist ? " · " + live.artist : "") + " · " + Math.round(Number(live.seconds || 0)) + " 秒" : String(live.state || "") === "waiting_for_source" ? "等待音乐应用开始播放…" : "已启动，正在等待第一首…" : "没在听。开始后，只有正在播放的歌曲会被录下来。" }),
         listener.error ? /* @__PURE__ */ jsx("div", { style: { marginTop: 6, fontSize: 12, color: "#b9750f" }, children: listener.error }) : null,
         !captureRuntime.ok ? /* @__PURE__ */ jsxs(Row, { style: { marginTop: 10, gap: 8, flexWrap: "wrap" }, children: [
@@ -3731,8 +3711,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
               /* @__PURE__ */ jsxs(Row, { style: { gap: 8 }, children: [
                 /* @__PURE__ */ jsx("span", { style: { fontSize: 13.5, fontWeight: 600, color: INK }, children: t.title || "（没取到歌名）" }),
                 t.artist ? /* @__PURE__ */ jsx(Muted, { children: t.artist }) : null,
-                /* @__PURE__ */ jsx(Pill, { tone: st.tone, children: st.label }),
-                /* @__PURE__ */ jsx(Pill, { tone: t.origin === "ace" ? "success" : "neutral", children: t.origin === "ace" ? "原创" : "翻唱" })
+                /* @__PURE__ */ jsx(Pill, { tone: st.tone, children: st.label })
               ] }),
               t.status === "running" || pct > 0 && pct < 100 ? /* @__PURE__ */ jsxs(Row, { children: [
                 /* @__PURE__ */ jsx(Bar, { pct }),
@@ -3742,14 +3721,13 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
                 ] })
               ] }) : null,
               t.error ? /* @__PURE__ */ jsx(Err, { children: t.error }) : null,
-              t.check_reason ? /* @__PURE__ */ jsx(Muted, { style: { color: "#b9750f" }, children: t.check_reason }) : null,
               art.final ? /* @__PURE__ */ jsxs(Muted, { style: { wordBreak: "break-all" }, children: [
                 "成品在 ",
                 art.final
               ] }) : null
             ] }),
             /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap", flex: "0 0 auto" }, children: [
-              t.playable === false ? /* @__PURE__ */ jsx(Muted, { children: "成品文件不在了" }) : (art.final || t.origin === "ace" && t.source) ? /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: () => preview(t), children: busy === "audio:" + t.id ? "读取中…" : "试听" }) : null,
+              t.playable === false ? /* @__PURE__ */ jsx(Muted, { children: "成品文件不在了" }) : art.final ? /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: () => preview(t), children: busy === "audio:" + t.id ? "读取中…" : "试听" }) : null,
               t.status !== "running" ? /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: () => processTrack(t, !!art.final), children: busy === "proc:" + t.id ? "启动中…" : art.final ? "重新唱一遍" : t.resumable || art.vocal_wav || art.vocal_clean || art.vocals ? "继续唱" : "让她唱" }) : null,
               /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: () => identify(t), children: busy === "id:" + t.id ? "识别中…" : "校准歌名" }),
               /* @__PURE__ */ jsx(Btn, { style: { color: "#c93c3c", borderColor: "rgba(201,60,60,0.28)" }, onClick: () => remove(t), children: "删除" })
@@ -3835,14 +3813,13 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const [language, setLanguage] = useState("auto");
     const [instrumental, setInstrumental] = useState(false);
     const [lora, setLora] = useState("");
-    const [postEngine, setPostEngine] = useState("ddsp");
+    const [postEngine, setPostEngine] = useState("");
     const [soulxStatus, setSoulxStatus] = useState(null);
     const [installConfirm, setInstallConfirm] = useState(null);
     const [openAdv, setOpenAdv] = useState(false);
     const [advSteps, setAdvSteps] = useState("0");
     const [advGuidance, setAdvGuidance] = useState("7");
     const [advSeed, setAdvSeed] = useState("-1");
-    const [candidates, setCandidates] = useState("4");
     const [model, setModel] = useState("");
     const modelTouched = useRef(false);
     const loraTouched = useRef(false);
@@ -3851,62 +3828,10 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const [job, setJob] = useState(null);
     const [notice, setNotice] = useState(null);
     const poll = useRef(null);
-    const CREATE_KEY = "ms_create_ui_v2";
-    const hydrated = useRef(false);
-    useEffect(() => {
-      try {
-        const raw = window.localStorage.getItem(CREATE_KEY);
-        if (raw) {
-          const v = JSON.parse(raw) || {};
-          if (typeof v.prompt === "string") setPrompt(v.prompt);
-          if (typeof v.lyrics === "string") setLyrics(v.lyrics);
-          if (typeof v.name === "string") setName(v.name);
-          if (typeof v.duration === "string") setDuration(v.duration);
-          if (typeof v.bpm === "string") setBpm(v.bpm);
-          if (typeof v.language === "string") setLanguage(v.language);
-          if (typeof v.instrumental === "boolean") setInstrumental(v.instrumental);
-          if (typeof v.postEngine === "string") setPostEngine(v.postEngine === "soulx" || v.postEngine === "" ? "ddsp" : v.postEngine);
-          if (typeof v.advSteps === "string") setAdvSteps(v.advSteps);
-          if (typeof v.advGuidance === "string") setAdvGuidance(v.advGuidance);
-          if (typeof v.advSeed === "string") setAdvSeed(v.advSeed);
-          if (typeof v.candidates === "string") setCandidates(v.candidates);
-          if (typeof v.openAdv === "boolean") setOpenAdv(v.openAdv);
-          if (typeof v.model === "string" && v.model) {
-            setModel(v.model);
-            modelTouched.current = true;
-          }
-          if (typeof v.lora === "string") {
-            setLora(v.lora);
-            if (v.lora) loraTouched.current = true;
-          }
-        }
-      } catch (e) {
-      }
-      hydrated.current = true;
-    }, []);
-    useEffect(() => {
-      if (!hydrated.current) return;
-      try {
-        window.localStorage.setItem(CREATE_KEY, JSON.stringify({
-          prompt, lyrics, name, duration, bpm, language, instrumental, lora,
-          postEngine, advSteps, advGuidance, advSeed, candidates, model, openAdv
-        }));
-      } catch (e) {
-      }
-    }, [prompt, lyrics, name, duration, bpm, language, instrumental, lora,
-        postEngine, advSteps, advGuidance, advSeed, candidates, model, openAdv]);
     const check = async () => {
       try {
         const r = await callEntry(api, "ms_ace_status", {}, 3e4);
         setStatus(r);
-        if (r && r.jobs) {
-          const active = Object.entries(r.jobs).filter(([, j]) => j && (j.state === "running" || j.state === "queued"));
-          if (active.length) {
-            const [jid, j] = active[active.length - 1];
-            setJobId((prev) => prev || jid);
-            setBusy((prev) => prev || (j.job === "ace-download" ? "download" : "gen"));
-          }
-        }
         if (r && r.model && !modelTouched.current) setModel(String(r.model));
         const cfgLora = String(r && r.ace_lora || "");
         if (cfgLora && !loraTouched.current) {
@@ -4009,7 +3934,6 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           inference_steps: Number(advSteps) || 0,
           guidance_scale: Number(advGuidance) || 7,
           seed: String(advSeed).trim() === "" ? -1 : Number(advSeed),
-          candidates: Math.max(1, Math.min(6, Number(candidates) || 1)),
           model,
           lora
         }, 6e4);
@@ -4082,49 +4006,15 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         setNotice({ tone: "error", text: String(e && e.message || e) });
       }
     };
-    const chooseModel = (v) => {
-      modelTouched.current = true;
-      setModel(v);
-      const variants = loraVariantsOf(lora);
-      if (lora && variants.length && !variants.some((x) => x.base === v)) {
-        setLora("");
-        setNotice({
-          tone: "info",
-          text: `已取消音色「${lora}」（它没有 ${v} 版本，可用于 ${variants.map((x) => x.base).join("、")}）`
-        });
-      }
-      if (Array.isArray(status == null ? void 0 : status.models) && status.models.includes(v)) {
-        callEntry(api, "ms_set_config", { ace_model: v }, 3e4).catch(() => {
-        });
-      }
-    };
-    const deleteModelOf = async (target) => {
-      if (busy) return;
-      const name2 = String(target || "").trim();
-      if (!name2) return;
-      if (!window.confirm("删除模型 " + name2 + "？会移进回收站，下次生成前要重新下载。")) return;
-      setBusy("delmodel");
-      try {
-        const r = await callEntry(api, "ms_ace_delete_model", { model: name2 }, 6e4);
-        if (r && r.ok) {
-          setNotice({ tone: "info", text: "已删除 " + name2 });
-          check();
-        } else {
-          setNotice({ tone: "error", text: "删除失败：" + (r && r.error || "未知错误") });
-        }
-      } catch (e) {
-        setNotice({ tone: "error", text: String(e && e.message || e) });
-      } finally {
-        setBusy("");
-      }
-    };
-    const deleteModel = () => deleteModelOf(model);
     const loras = status && Array.isArray(status.loras) ? status.loras : [];
     const catalog = status && Array.isArray(status.model_catalog) ? status.model_catalog : [];
     const modelMeta = (name2) => catalog.find((m) => m.name === name2) || null;
     const modelChoices = catalog.length ? catalog.map((m) => m.name) : status && Array.isArray(status.model_choices) && status.model_choices.length ? status.model_choices : status && status.model ? [status.model] : ["acestep-v15-turbo"];
     const MODEL_HINT = {
       "acestep-v15-turbo": "2B · 8 步 · 快",
+      "acestep-v15-turbo-shift1": "2B · 8 步 · shift=1",
+      "acestep-v15-turbo-shift3": "2B · 8 步 · shift=3",
+      "acestep-v15-turbo-continuous": "2B · 8 步 · 连续 shift",
       "acestep-v15-xl-turbo": "4B · 8 步 · 音质更高",
       "acestep-v15-xl-sft": "4B · 50 步 · 最高质量，慢",
       "acestep-v15-xl-base": "4B · 50 步 · 全能编辑",
@@ -4176,80 +4066,150 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           ] })
         ] })
       ] }) }) : null,
-      /* @__PURE__ */ jsxs(Col, { style: { gap: 18 }, children: [
-        /* @__PURE__ */ jsxs("div", { style: { padding: "22px 24px", borderRadius: 22, background: "linear-gradient(135deg,#fff7fb 0%,#f6f2ff 100%)", border: "1px solid " + LINE, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 14, flexWrap: "wrap" }, children: [
-          /* @__PURE__ */ jsxs("div", { children: [
-            /* @__PURE__ */ jsx("div", { style: { fontSize: 22, fontWeight: 750, color: INK, letterSpacing: 0.3 }, children: "写一首歌，让她唱" }),
-            /* @__PURE__ */ jsx("div", { style: { marginTop: 6, fontSize: 13, color: INK_2 }, children: "描述风格、填好歌词；生成后自动分离、变声、混音。" })
-          ] }),
-          /* @__PURE__ */ jsx(Pill, { tone: ready ? "success" : "warning", children: ready ? "环境就绪" : "环境未就绪" })
-        ] }),
-        /* @__PURE__ */ jsxs(Grid, { cols: 2, min: 300, gap: 18, children: [
-          /* @__PURE__ */ jsxs(Panel, { title: "歌曲内容", extra: /* @__PURE__ */ jsx(Muted, { children: "歌词支持 [verse] / [chorus]" }), children: [
-            /* @__PURE__ */ jsxs(Grid, { cols: 2, min: 180, gap: 14, children: [
-              /* @__PURE__ */ jsx(Field, { label: "歌名（留空自动命名）", children: /* @__PURE__ */ jsx(Input, { value: name, placeholder: "例如 夏夜的风", onChange: (e2) => setName(e2.target.value) }) }),
-              /* @__PURE__ */ jsx(Field, { label: "时长（秒；0 = 自动）", children: /* @__PURE__ */ jsx(Input, { type: "number", min: 10, max: 600, step: 5, value: duration, onChange: (e2) => setDuration(e2.target.value) }) })
+      /* @__PURE__ */ jsx(
+        Panel,
+        {
+          title: "原创歌曲（ACE-Step）",
+          extra: /* @__PURE__ */ jsx(Pill, { tone: ready ? "success" : "warning", children: ready ? "本地模型已就绪" : "环境未就绪" }),
+          children: /* @__PURE__ */ jsxs(Col, { style: { gap: 14 }, children: [
+            /* @__PURE__ */ jsxs("div", { style: { fontSize: 12.5, color: INK_2, lineHeight: 1.8 }, children: [
+              "用文字生成一首完整的歌（人声 + 伴奏），生成后可以：",
+              /* @__PURE__ */ jsx("b", { children: "只生成" }),
+              "（先试听原曲），或 ",
+              /* @__PURE__ */ jsx("b", { children: "生成并让她唱" }),
+              "（直接走分离 → 变声 → 混音，用当前音色）。"
             ] }),
-            /* @__PURE__ */ jsx(Field, { label: "风格 / 编曲", children: /* @__PURE__ */ jsx("textarea", { style: TA_STYLE, rows: 3, value: prompt, placeholder: "例如：温暖的女声流行，钢琴 + 弦乐，中速", onChange: (e2) => setPrompt(e2.target.value) }) }),
-            /* @__PURE__ */ jsx(Field, { label: "歌词", children: /* @__PURE__ */ jsx("textarea", { style: TA_STYLE, rows: 10, value: lyrics, placeholder: "[verse]\n第一句…\n\n[chorus]\n副歌…", onChange: (e2) => setLyrics(e2.target.value) }) }),
-            /* @__PURE__ */ jsxs(Grid, { cols: 3, min: 150, gap: 14, children: [
-              /* @__PURE__ */ jsx(Field, { label: "BPM（0 = 自动）", children: /* @__PURE__ */ jsx(Input, { type: "number", min: 0, max: 300, step: 1, value: bpm, onChange: (e2) => setBpm(e2.target.value) }) }),
-              /* @__PURE__ */ jsx(Field, { label: "演唱语言", children: /* @__PURE__ */ jsx(Select, { value: language, onChange: (e2) => setLanguage(e2.target.value), children: LANGS2.map(([v, t2]) => /* @__PURE__ */ jsx("option", { value: v, children: t2 }, v)) }) }),
-              /* @__PURE__ */ jsx(Field, { label: "纯音乐", children: /* @__PURE__ */ jsx(Row, { style: { paddingTop: 6 }, children: /* @__PURE__ */ jsx(Toggle, { on: instrumental, onChange: setInstrumental, label: "不唱" }) }) })
-            ] })
-          ] }),
-          /* @__PURE__ */ jsxs(Col, { style: { gap: 18 }, children: [
-            /* @__PURE__ */ jsxs(Panel, { title: "生成模型", extra: /* @__PURE__ */ jsx(Pill, { tone: modelReady ? "success" : "warning", children: modelReady ? "已安装" : "未安装" }), children: [
-              /* @__PURE__ */ jsx(Col, { style: { gap: 8 }, children: modelChoices.map((m) => {
-                const meta2 = modelMeta(m) || {};
-                const active = m === model;
-                return /* @__PURE__ */ jsxs("div", { onClick: () => chooseModel(m), style: { display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 14, border: "1px solid " + (active ? BRAND_DEEP : LINE), background: active ? "#fff5fa" : "#fff", cursor: "pointer" }, children: [
-                  /* @__PURE__ */ jsxs("div", { style: { flex: "1 1 auto", minWidth: 0 }, children: [
-                    /* @__PURE__ */ jsx("div", { style: { fontSize: 13, fontWeight: 600, color: INK, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }, children: m }),
-                    /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_2, marginTop: 2 }, children: [meta2.family || "", meta2.steps ? " · " + meta2.steps + " 步" : "", meta2.quality ? " · 音质 " + meta2.quality : "", meta2.vram_min_gb ? " · ≥" + meta2.vram_min_gb + "GB" : ""].join("") })
-                  ] }),
-                  /* @__PURE__ */ jsx(Pill, { tone: meta2.downloaded ? "success" : "warning", children: meta2.downloaded ? "已下载" : "未下载" }),
-                  meta2.downloaded ? /* @__PURE__ */ jsx(Btn, { style: { padding: "4px 9px", fontSize: 12 }, onClick: (e2) => { e2.stopPropagation(); deleteModelOf(m); }, children: "删除" }) : null,
-                  active ? /* @__PURE__ */ jsx(Pill, { tone: "neutral", children: "当前" }) : null
-                ] }, m);
-              }) }),
-              isDownloadJob && job ? /* @__PURE__ */ jsxs(Col, { style: { gap: 6 }, children: [
-                /* @__PURE__ */ jsx(Bar, { pct: Number(job.progress) || 0 }),
-                /* @__PURE__ */ jsx(Muted, { children: job.detail || "正在下载模型…" })
-              ] }) : null,
-              !modelReady ? /* @__PURE__ */ jsxs(Row, { style: { flexWrap: "wrap", gap: 8, alignItems: "center" }, children: [
-                /* @__PURE__ */ jsxs(Muted, { children: ["这个模型还没下载", modelMeta(model) && modelMeta(model).download_gb ? "（约 " + modelMeta(model).download_gb + "GB）" : ""] }),
-                /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: downloadModel, children: busy === "download" ? "启动下载…" : "下载这个模型" })
-              ] }) : null,
-              status && status.model_recommended ? /* @__PURE__ */ jsxs(Muted, { style: { fontSize: 12 }, children: ["这台电脑推荐：", status.model_recommended] }) : null
+            /* @__PURE__ */ jsxs(Grid, { cols: 2, min: 240, gap: 14, children: [
+              /* @__PURE__ */ jsx(Field, { label: "歌名（留空自动命名）", children: /* @__PURE__ */ jsx(Input, { value: name, placeholder: "例如 夏夜的风", onChange: (e) => setName(e.target.value) }) }),
+              /* @__PURE__ */ jsx(Field, { label: "时长（秒；0 = 按歌词估算）", children: /* @__PURE__ */ jsx(Input, { type: "number", min: 10, max: 600, step: 5, value: duration, onChange: (e) => setDuration(e.target.value) }) })
             ] }),
-            /* @__PURE__ */ jsxs(Panel, { title: "声音与后处理", children: [
-              /* @__PURE__ */ jsx(Field, { label: "ACE 音色", children: /* @__PURE__ */ jsxs(Select, { value: lora, onChange: (e2) => pickLora(e2.target.value), children: [
-                /* @__PURE__ */ jsx("option", { value: "", children: "默认音色（不加载 LoRA）" }),
-                loras.map((l) => /* @__PURE__ */ jsxs("option", { value: l.name, children: [l.name, loraBasesOf(l.name).length ? " · " + loraBasesOf(l.name).join(" / ") : ""] }, l.name))
-              ] }) }),
-              /* @__PURE__ */ jsx(Muted, { style: { fontSize: 12 }, children: lora ? "已选「" + lora + "」；生成时自动挑当前模型对应的版本。" : "不选则用 ACE 默认音色。" }),
-              /* @__PURE__ */ jsx(Field, { label: "唱完后再处理干声", children: /* @__PURE__ */ jsxs(Select, { value: postEngine, onChange: (e2) => setPostEngine(e2.target.value), children: [
-                /* @__PURE__ */ jsx("option", { value: "ddsp", children: "用翻唱声音（DDSP）" }),
-                /* @__PURE__ */ jsx("option", { value: "soulx_ddsp", children: "SoulX → DDSP（保气音）" })
-              ] }) }),
-              /* @__PURE__ */ jsx(Muted, { style: { fontSize: 12, lineHeight: 1.7 }, children: postEngine === "soulx_ddsp" ? "SoulX 唱法 + DDSP 音色；比纯 DDSP 多一次变声。" : "分离 → 变声 → 混音，用当前翻唱声音。" }),
-              postEngine === "soulx_ddsp" && soulxStatus && !soulxStatus.ready ? /* @__PURE__ */ jsxs(Row, { style: { flexWrap: "wrap", gap: 8, alignItems: "center" }, children: [
-                /* @__PURE__ */ jsxs(Muted, { children: ["SoulX 还没就绪：", (soulxStatus.problems || []).join("、")] }),
-                /* @__PURE__ */ jsx(Btn, { onClick: () => callEntry(api, "ms_soulx_status", {}, 3e4).then(setSoulxStatus).catch(() => {}), children: "重新检查" })
-              ] }) : null
+            /* @__PURE__ */ jsx(Field, { label: "风格 / 编曲描述", children: /* @__PURE__ */ jsx(
+              "textarea",
+              {
+                style: TA_STYLE,
+                rows: 3,
+                value: prompt,
+                placeholder: "例如：温暖的女声流行，钢琴 + 弦乐，中速，情绪逐渐上扬",
+                onChange: (e) => setPrompt(e.target.value)
+              }
+            ) }),
+            /* @__PURE__ */ jsx(Field, { label: "歌词（留空或勾选纯音乐则生成纯伴奏）", children: /* @__PURE__ */ jsx(
+              "textarea",
+              {
+                style: TA_STYLE,
+                rows: 7,
+                value: lyrics,
+                placeholder: "支持 [verse] / [chorus] 结构标签\n第一句歌词…\n第二句歌词…",
+                onChange: (e) => setLyrics(e.target.value)
+              }
+            ) }),
+            /* @__PURE__ */ jsxs(Grid, { cols: 3, min: 180, gap: 14, children: [
+              /* @__PURE__ */ jsx(Field, { label: "BPM（0 = 自动）", children: /* @__PURE__ */ jsx(Input, { type: "number", min: 0, max: 300, step: 1, value: bpm, onChange: (e) => setBpm(e.target.value) }) }),
+              /* @__PURE__ */ jsx(Field, { label: "演唱语言", children: /* @__PURE__ */ jsx(Select, { value: language, onChange: (e) => setLanguage(e.target.value), children: LANGS2.map(([v, t]) => /* @__PURE__ */ jsx("option", { value: v, children: t }, v)) }) }),
+              /* @__PURE__ */ jsx(Field, { label: "生成方式", children: /* @__PURE__ */ jsx(Row, { style: { paddingTop: 6 }, children: /* @__PURE__ */ jsx(Toggle, { on: instrumental, onChange: setInstrumental, label: "纯音乐（不唱）" }) }) })
             ] }),
-            /* @__PURE__ */ jsxs(Panel, { title: "开始", children: [
-              /* @__PURE__ */ jsxs(Row, { style: { flexWrap: "wrap", gap: 8 }, children: [
-                /* @__PURE__ */ jsx(Btn, { disabled: !!busy || !ready, onClick: () => start(false), children: "只生成" }),
-                /* @__PURE__ */ jsx(Btn, { style: PRIMARY_BTN, disabled: !!busy || !ready, onClick: () => start(true), children: busy ? "正在生成…" : lora ? "用这个 ACE 音色生成" : "生成并让她唱" }),
-                /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: check, children: "检查环境" })
+            /* @__PURE__ */ jsx(Field, { label: "生成模型（质量 / 速度）", children: /* @__PURE__ */ jsx(Select, { value: model, onChange: (e) => {
+              const v = e.target.value;
+              modelTouched.current = true;
+              setModel(v);
+              const variants = loraVariantsOf(lora);
+              if (lora && variants.length && !variants.some((x) => x.base === v)) {
+                setLora("");
+                setNotice({
+                  tone: "info",
+                  text: `已取消音色「${lora}」（它没有 ${v} 版本，可用于 ${variants.map((x) => x.base).join("、")}）`
+                });
+              }
+              if (Array.isArray(status == null ? void 0 : status.models) && status.models.includes(v)) {
+                callEntry(api, "ms_set_config", { ace_model: v }, 3e4).catch(() => {
+                });
+              }
+            }, children: modelChoices.map((m) => {
+              const meta = modelMeta(m);
+              return /* @__PURE__ */ jsxs("option", { value: m, children: [
+                m,
+                meta ? " · " + meta.family + " · " + meta.steps + "步 · 音质" + meta.quality + " · 需≥" + meta.vram_min_gb + "GB" + (meta.downloaded ? " · 已下载" : " · 未下载") : MODEL_HINT[m] ? " · " + MODEL_HINT[m] : ""
+              ] }, m);
+            }) }) }),
+            (() => {
+              const meta = modelMeta(model);
+              if (!meta) return null;
+              return /* @__PURE__ */ jsxs(Muted, { style: { lineHeight: 1.8 }, children: [
+                "能提升：",
+                (meta.gains || []).join("；"),
+                "。适合：",
+                meta.best_for,
+                "。",
+                " ",
+                meta.downloaded ? "已下载。" : "还没下载，约 " + meta.download_gb + "GB，需要至少 " + meta.vram_min_gb + "GB 显存。"
+              ] });
+            })(),
+            status && status.model_recommended ? /* @__PURE__ */ jsxs(Muted, { children: [
+              "这台电脑推荐：",
+              status.model_recommended,
+              "（按显存自动判断）"
+            ] }) : null,
+            status && status.gpu && status.gpu.cuda_ok === false ? /* @__PURE__ */ jsxs(Alert, { tone: "warning", children: [
+              "显卡不兼容：",
+              (status.gpu.notes || []).join("；"),
+              "。原创生成会退回 CPU（很慢）。"
+            ] }) : null,
+            status && status.gpu && status.gpu.cuda_ok ? /* @__PURE__ */ jsxs(Muted, { style: { lineHeight: 1.7 }, children: [
+              status.gpu.name || "GPU",
+              " · ",
+              status.gpu.vram_total_gib,
+              "GB · sm_",
+              status.gpu.compute_cap,
+              " · ",
+              status.gpu.dtype,
+              " 精度",
+              Array.isArray(status.gpu.quantization) && status.gpu.quantization.length ? " · 可用量化：" + status.gpu.quantization.join(" / ") : " · 不支持量化",
+              Number(status.gpu.vram_total_gib || 0) <= 6 ? " · 小显存：自动 int8 量化 + VAE 放内存解码" : ""
+            ] }) : null,
+            !modelReady ? /* @__PURE__ */ jsxs(Row, { style: { flexWrap: "wrap", gap: 10, alignItems: "center" }, children: [
+              /* @__PURE__ */ jsx(Muted, { children: "这个模型还没下载（XL 仓库约 18.6GB，需要 ≥12GB 显存；可断点续传）。" }),
+              /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: downloadModel, children: busy === "download" ? "启动下载…" : "下载这个模型" })
+            ] }) : null,
+            /* @__PURE__ */ jsx(Field, { label: "ACE 音色（LoRA；按模型自动选版本）", children: /* @__PURE__ */ jsxs(Select, { value: lora, onChange: (e) => pickLora(e.target.value), children: [
+              /* @__PURE__ */ jsx("option", { value: "", children: "默认音色（不加载 LoRA）" }),
+              loras.map((l) => /* @__PURE__ */ jsxs("option", { value: l.name, children: [
+                l.name,
+                loraBasesOf(l.name).length ? " · " + loraBasesOf(l.name).join(" / ") : ""
+              ] }, l.name))
+            ] }) }),
+            lora ? /* @__PURE__ */ jsxs(Muted, { children: [
+              "已选 ACE 音色「",
+              lora,
+              "」",
+              loraBasesOf(lora).length ? "（可用于 " + loraBasesOf(lora).join("、") + "）" : "",
+              "：生成时会自动挑当前模型对应的版本；默认直接用 ACE 唱这个音色。"
+            ] }) : null,
+            /* @__PURE__ */ jsx(Field, { label: "唱完后再处理干声", children: /* @__PURE__ */ jsxs(Select, { value: postEngine, onChange: (e) => setPostEngine(e.target.value), children: [
+              /* @__PURE__ */ jsx("option", { value: "", children: "不用（ACE 直接出成品）" }),
+              /* @__PURE__ */ jsx("option", { value: "ddsp", children: "用翻唱声音（DDSP）" }),
+              /* @__PURE__ */ jsx("option", { value: "soulx", children: "SoulX-Singer SVC（实验）" })
+            ] }) }),
+            postEngine ? /* @__PURE__ */ jsxs(Muted, { style: { lineHeight: 1.75 }, children: [
+              postEngine === "soulx" ? "ACE 先生成整首，再取干声走 SoulX-Singer SVC，最后和伴奏混回去。" : "ACE 先生成整首，再取干声用当前翻唱声音变声，最后和伴奏混回去。",
+              "点「只生成」时不会后处理。"
+            ] }) : null,
+            postEngine === "soulx" && soulxStatus && !soulxStatus.ready ? /* @__PURE__ */ jsxs(Row, { style: { flexWrap: "wrap", gap: 8, alignItems: "center" }, children: [
+              /* @__PURE__ */ jsxs(Muted, { children: [
+                "SoulX 还没就绪：",
+                (soulxStatus.problems || []).join("、")
               ] }),
-              /* @__PURE__ */ jsx(Muted, { style: { fontSize: 12 }, children: "首次加载模型较慢；同一时间只跑一个任务。高级选项里可以调候选数。" })
+              /* @__PURE__ */ jsx(Btn, { onClick: () => callEntry(api, "ms_soulx_status", {}, 3e4).then(setSoulxStatus).catch(() => {
+              }), children: "重新检查" })
+            ] }) : null,
+            /* @__PURE__ */ jsx(Row, { style: { flexWrap: "wrap", alignItems: "center", gap: 14 }, children: /* @__PURE__ */ jsx(Muted, { children: "首次加载 ACE 模型会慢一些；同一时间只跑一个生成/唱的任务。" }) }),
+            /* @__PURE__ */ jsxs(Row, { style: { flexWrap: "wrap", gap: 8 }, children: [
+              /* @__PURE__ */ jsx(Btn, { disabled: !!busy || !ready, onClick: () => start(false), children: "只生成" }),
+              /* @__PURE__ */ jsx(Btn, { style: PRIMARY_BTN, disabled: !!busy || !ready, onClick: () => start(true), children: busy ? "正在生成…" : lora ? "用这个 ACE 音色生成" : "生成并让她唱" }),
+              /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: check, children: "重新检查环境" })
             ] })
           ] })
-        ] })
-      ] }),
+        }
+      ),
       job ? /* @__PURE__ */ jsx(Section, { title: isDownloadJob ? "模型下载" : "生成进度", extra: /* @__PURE__ */ jsx(Muted, { children: stateText }), children: /* @__PURE__ */ jsx(Panel, { children: /* @__PURE__ */ jsxs(Col, { style: { gap: 10 }, children: [
         /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between", flexWrap: "wrap", gap: 8 }, children: [
           /* @__PURE__ */ jsx("div", { style: { fontSize: 14, fontWeight: 700, color: INK }, children: job.state === "done" ? isDownloadJob ? "模型下载完成" : "生成完成" : job.state === "failed" ? isDownloadJob ? "模型下载失败" : "生成失败" : isDownloadJob ? "正在下载模型" : "ACE-Step 正在生成" }),
@@ -4304,20 +4264,9 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
                   value: advSeed,
                   onChange: (e) => setAdvSeed(e.target.value)
                 }
-              ) }),
-              /* @__PURE__ */ jsx(Field, { label: "候选数（1-6，越多越慢）", children: /* @__PURE__ */ jsx(
-                Input,
-                {
-                  type: "number",
-                  min: 1,
-                  max: 6,
-                  step: 1,
-                  value: candidates,
-                  onChange: (e) => setCandidates(e.target.value)
-                }
               ) })
             ] }),
-            /* @__PURE__ */ jsx(Muted, { children: "默认建议 4 个候选：ACE 每次编曲差异很大，多抽几条后会自动按频谱平衡选一条，其余会留在「让她唱歌」里给你试听。固定种子后，同样的描述和歌词会得到完全一样的结果。" })
+            /* @__PURE__ */ jsx(Muted, { children: "默认即可：turbo 模型固定 8 步且不使用 CFG；sft/base 默认 50 步。固定种子后，同样的描述和歌词会得到更接近的结果。" })
           ] })
         }
       ),
@@ -4393,6 +4342,17 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const plan = s.plan || {};
     const eng = s.engine || {};
     const paths = s.paths || {};
+    const link = s.link || {};
+    const linkOn = Boolean(link.running && link.source_control);
+    const linkColor = linkOn ? "#16a34a" : link.running ? "#d97706" : "#94a3b8";
+    const linkHalo = linkOn ? "rgba(22,163,74,0.16)" : link.running ? "rgba(217,119,6,0.16)" : "rgba(148,163,184,0.16)";
+    const linkText = linkOn ? "已连接" : link.running ? "运行中 · 音源中控不可用" : "未连接";
+    const linkSource = link.selected && link.selected.name ? link.selected.name : "未选择";
+    const linkStateText = !link.listener_running ? link.running ? "已让位" : "未启动" : link.listener_state === "recording" ? "正在录制" : link.listener_state === "waiting_for_source" ? "等待音乐应用" : link.listener_mode === "linked" ? "联动待命" : "独立待命";
+    const linkFeature = (text) => /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 8, alignItems: "flex-start" }, children: [
+      /* @__PURE__ */ jsx("span", { style: { width: 6, height: 6, borderRadius: 6, background: linkColor, marginTop: 7, flex: "0 0 auto" } }),
+      /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK_2, lineHeight: 1.7 }, children: text })
+    ] });
     const [hw, setHw] = useState(s.hardware || null);
     const [busy, setBusy] = useState("");
     const [notice, setNotice] = useState(null);
@@ -4788,6 +4748,41 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const soulxReady = Boolean(soulx && soulx.ready);
     return /* @__PURE__ */ jsxs(Col, { style: { gap: 24 }, children: [
       notice ? /* @__PURE__ */ jsx(Alert, { tone: notice.tone === "error" ? "warning" : "info", children: notice.text }) : null,
+      /* @__PURE__ */ jsx(Section, { title: "和她所听联动", extra: /* @__PURE__ */ jsxs(Row, { style: { gap: 8 }, children: [
+        /* @__PURE__ */ jsx("span", { style: { width: 9, height: 9, borderRadius: 9, background: linkColor, boxShadow: "0 0 0 4px " + linkHalo, display: "inline-block" } }),
+        /* @__PURE__ */ jsx(Muted, { children: linkText })
+      ] }), children: /* @__PURE__ */ jsxs(Col, { style: { gap: 14 }, children: [
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 13, color: INK_2, lineHeight: 1.8 }, children: "联动后，本插件直接用「为她所听」选中的那个应用当录制音源，歌名/歌手也优先采用它的识别结果；她没开时自动退回独立模式（本插件自己扫进程 + Windows 媒体会话）。" }),
+        /* @__PURE__ */ jsxs(Grid, { cols: 3, min: 200, gap: 12, children: [
+          /* @__PURE__ */ jsxs("div", { style: { padding: 14, borderRadius: 14, background: "rgba(248,250,252,0.95)", border: "1px solid " + LINE }, children: [
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_2 }, children: "当前音源" }),
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 13.5, fontWeight: 700, color: INK, marginTop: 4 }, children: linkSource }),
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_2, marginTop: 3 }, children: link.capture_mode === "application" ? "逐进程应用声道" : link.capture_mode || "未连接" })
+          ] }),
+          /* @__PURE__ */ jsxs("div", { style: { padding: 14, borderRadius: 14, background: "rgba(248,250,252,0.95)", border: "1px solid " + LINE }, children: [
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_2 }, children: "本插件监听" }),
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 13.5, fontWeight: 700, color: INK, marginTop: 4 }, children: linkStateText }),
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_2, marginTop: 3 }, children: "她监听时自动让位；点停止后不再自动开" })
+          ] }),
+          /* @__PURE__ */ jsxs("div", { style: { padding: 14, borderRadius: 14, background: "rgba(248,250,252,0.95)", border: "1px solid " + LINE }, children: [
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_2 }, children: "AI 读取音乐信息" }),
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 13.5, fontWeight: 700, color: INK, marginTop: 4 }, children: link.ai_delivery ? "已授权" : "未授权" }),
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_2, marginTop: 3 }, children: link.ai_delivery ? "歌名/歌手可由她所听校准" : "在为她所听里开启「AI 读取」" })
+          ] })
+        ] }),
+        /* @__PURE__ */ jsxs(Col, { style: { gap: 6 }, children: [
+          linkFeature("音源跟着她走：不用在本插件重复选应用，她在为她所听里切到哪个，这边就采哪个"),
+          linkFeature("识歌更准：歌名/歌手优先采用她所听的识别结果，再回退到 Windows 媒体会话"),
+          linkFeature("隔离不变：就算联动，也只录那一个应用的进程树，AI 自己的声音和其他应用不会混进来"),
+          linkFeature("互斥保护：她正在监听时本插件自动让位，两边不会同时采集回环"),
+          linkFeature("自动退回：她没运行或没授权时，自动用本插件自己的进程扫描，录制照常")
+        ] }),
+        link.reason ? /* @__PURE__ */ jsxs("div", { style: { fontSize: 11.5, color: "#b45309" }, children: [
+          "提示：",
+          link.reason
+        ] }) : null,
+        /* @__PURE__ */ jsx(Row, { style: { gap: 10 }, children: /* @__PURE__ */ jsx(Btn, { onClick: onRefresh, children: "刷新联动状态" }) })
+      ] }) }),
       /* @__PURE__ */ jsxs(Section, { title: "电脑状态", extra: /* @__PURE__ */ jsx(Pill, { tone: tw.tone, children: tw.text }), children: [
         snap ? /* @__PURE__ */ jsxs(Col, { style: { gap: 14 }, children: [
           /* @__PURE__ */ jsxs(Grid, { cols: 3, min: 220, gap: 14, children: [
@@ -5042,8 +5037,9 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
   }
 
-  // ../../.neko-plugin-installations/plugins/music_synth/ui/setupWizard.tsx
-  var STEPS = ["欢迎", "安装位置", "安装", "完成"];
+  // ../../.neko-plugin-installations/plugins/music_synth/ui/onboarding.tsx
+  var STEPS = ["体验", "功能", "用法", "环境", "开始"];
+  var STEP_TITLES = ["先听听效果", "她能做什么", "怎么用", "准备运行环境", "准备完成"];
   function previewMode() {
     try {
       const q = String(window.location && window.location.search || "");
@@ -5102,19 +5098,133 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
   var STATE_TEXT = {
     ready: { text: "已就绪", tone: "success" },
     wait: { text: "等待", tone: "neutral" },
+    missing: { text: "待安装", tone: "warning" },
+    missing_required: { text: "缺少", tone: "error" },
     active: { text: "安装中", tone: "warning" },
     done: { text: "完成", tone: "success" },
     failed: { text: "失败", tone: "error" }
   };
   function StateIcon(props) {
     const st = props.state || "wait";
-    const color = st === "ready" || st === "done" ? "#1c8a58" : st === "failed" ? "#c93c3c" : st === "active" ? BRAND : "#b9b3c1";
-    const bg = st === "ready" || st === "done" ? "#e8f7ef" : st === "failed" ? "#fdecec" : st === "active" ? "#ffe5ef" : "rgba(40,37,50,0.06)";
-    return /* @__PURE__ */ jsx("span", { "aria-hidden": true, style: { width: 22, height: 22, borderRadius: 999, background: bg, color, display: "inline-grid", placeItems: "center", flex: "0 0 auto" }, children: st === "ready" || st === "done" ? /* @__PURE__ */ jsx("svg", { width: "12", height: "12", viewBox: "0 0 12 12", children: /* @__PURE__ */ jsx("path", { d: "M2 6.4 4.8 9 10 3.2", fill: "none", stroke: color, strokeWidth: "2", strokeLinecap: "round", strokeLinejoin: "round" }) }) : st === "failed" ? /* @__PURE__ */ jsx("b", { style: { fontSize: 12, lineHeight: 1 }, children: "!" }) : st === "active" ? /* @__PURE__ */ jsx("i", { style: { width: 8, height: 8, borderRadius: 999, background: color, display: "block" } }) : /* @__PURE__ */ jsx("i", { style: { width: 6, height: 6, borderRadius: 999, background: color, display: "block" } }) });
+    const color = st === "ready" || st === "done" ? "#1c8a58" : st === "failed" || st === "missing_required" ? "#c93c3c" : st === "active" ? BRAND : st === "missing" ? "#b9750f" : "#b9b3c1";
+    const bg = st === "ready" || st === "done" ? "#e8f7ef" : st === "failed" || st === "missing_required" ? "#fdecec" : st === "active" ? "#ffe5ef" : st === "missing" ? "#fff3e0" : "rgba(40,37,50,0.06)";
+    return /* @__PURE__ */ jsx("span", { "aria-hidden": true, style: { width: 24, height: 24, borderRadius: 999, background: bg, color, display: "inline-grid", placeItems: "center", flex: "0 0 auto" }, children: st === "ready" || st === "done" ? /* @__PURE__ */ jsx("svg", { width: "13", height: "13", viewBox: "0 0 12 12", children: /* @__PURE__ */ jsx("path", { d: "M2 6.4 4.8 9 10 3.2", fill: "none", stroke: color, strokeWidth: "2", strokeLinecap: "round", strokeLinejoin: "round" }) }) : st === "failed" || st === "missing_required" ? /* @__PURE__ */ jsx("b", { style: { fontSize: 13, lineHeight: 1 }, children: "!" }) : st === "active" ? /* @__PURE__ */ jsx("i", { style: { width: 9, height: 9, borderRadius: 999, background: color, display: "block" } }) : /* @__PURE__ */ jsx("i", { style: { width: 6, height: 6, borderRadius: 999, background: color, display: "block" } }) });
   }
-  var primaryBtn = { border: 0, background: BRAND, color: "#fff", borderRadius: 12, boxShadow: "0 6px 16px rgba(224,45,118,0.22)" };
-  function SetupWizard(props) {
-    const [step, setStep] = useState(props.startAt || 1);
+  var primaryBtn = { border: 0, background: BRAND, color: "#fff", borderRadius: 12, boxShadow: "0 6px 16px rgba(224,45,118,0.22)", padding: "11px 22px", fontSize: 13.5 };
+  var ghostBtn = { border: "1px solid rgba(224,45,118,0.16)", background: "#fff", color: "#9c204e", borderRadius: 12, padding: "10px 18px", fontSize: 13 };
+  function mmss(sec) {
+    const n = Math.max(0, Math.floor(Number(sec) || 0));
+    return Math.floor(n / 60) + ":" + (n % 60 < 10 ? "0" : "") + n % 60;
+  }
+  var FEATURES = [
+    { key: "listen", title: "听歌识曲", text: "电脑上正在放的歌，她也能“听”到，直接录下来。", tag: "无需下载歌曲" },
+    { key: "separate", title: "人声分离", text: "自动拆出伴奏和干声，方便重新演唱。", tag: "保留伴奏" },
+    { key: "cover", title: "翻唱变声", text: "用她的音色重唱你喜欢的歌。", tag: "换音色" },
+    { key: "train", title: "训练自己的音色", text: "放几首歌或录音，就能练出属于你的声音。", tag: "越用越像" },
+    { key: "create", title: "原创歌曲", text: "让她的声音唱一首全新的歌。", tag: "AI 作曲" },
+    { key: "mix", title: "混音出曲", text: "人声与伴奏自动对齐，混成完整成品。", tag: "一键出歌" },
+    { key: "ai", title: "AI 可调用演唱", text: "接入 AI 对话，随时让她为你唱一句。", tag: "联动演奏" }
+  ];
+  function FeatureIcon(props) {
+    const c = { width: 30, height: 30, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 1.7, strokeLinecap: "round", strokeLinejoin: "round" };
+    if (props.name === "listen") return /* @__PURE__ */ jsxs("svg", { ...c, children: [
+      /* @__PURE__ */ jsx("path", { d: "M4 14v-2a8 8 0 0 1 16 0v2" }),
+      /* @__PURE__ */ jsx("rect", { x: "3", y: "14", width: "4.2", height: "6.4", rx: "2.1" }),
+      /* @__PURE__ */ jsx("rect", { x: "16.8", y: "14", width: "4.2", height: "6.4", rx: "2.1" })
+    ] });
+    if (props.name === "separate") return /* @__PURE__ */ jsxs("svg", { ...c, children: [
+      /* @__PURE__ */ jsx("circle", { cx: "7", cy: "7", r: "2.4" }),
+      /* @__PURE__ */ jsx("circle", { cx: "17", cy: "17", r: "2.4" }),
+      /* @__PURE__ */ jsx("path", { d: "M8.8 8.8 15.2 15.2" }),
+      /* @__PURE__ */ jsx("path", { d: "M4 17h4M16 4h4" })
+    ] });
+    if (props.name === "cover") return /* @__PURE__ */ jsxs("svg", { ...c, children: [
+      /* @__PURE__ */ jsx("rect", { x: "8", y: "2.6", width: "5.2", height: "10", rx: "2.6" }),
+      /* @__PURE__ */ jsx("path", { d: "M5 10.4a5.6 5.6 0 0 0 11.2 0" }),
+      /* @__PURE__ */ jsx("path", { d: "M10.6 16v3" })
+    ] });
+    if (props.name === "train") return /* @__PURE__ */ jsx("svg", { ...c, children: /* @__PURE__ */ jsx("path", { d: "M4 19V9M9.3 19V4.6M14.6 19v-6.8M20 19V7.4" }) });
+    if (props.name === "create") return /* @__PURE__ */ jsxs("svg", { ...c, children: [
+      /* @__PURE__ */ jsx("path", { d: "M12 3.4l1.9 5.1 5.1 1.9-5.1 1.9L12 17.4l-1.9-5.1L5 10.4l5.1-1.9z" }),
+      /* @__PURE__ */ jsx("path", { d: "M18.4 16.4l.8 2.1 2.1.8-2.1.8-.8 2.1-.8-2.1-2.1-.8 2.1-.8z" })
+    ] });
+    if (props.name === "mix") return /* @__PURE__ */ jsxs("svg", { ...c, children: [
+      /* @__PURE__ */ jsx("path", { d: "M4 7h16M4 12h16M4 17h16" }),
+      /* @__PURE__ */ jsx("circle", { cx: "9", cy: "7", r: "1.8", fill: "currentColor", stroke: "none" }),
+      /* @__PURE__ */ jsx("circle", { cx: "15", cy: "12", r: "1.8", fill: "currentColor", stroke: "none" }),
+      /* @__PURE__ */ jsx("circle", { cx: "8", cy: "17", r: "1.8", fill: "currentColor", stroke: "none" })
+    ] });
+    return /* @__PURE__ */ jsxs("svg", { ...c, children: [
+      /* @__PURE__ */ jsx("path", { d: "M20 12a8 8 0 1 0-3.1 6.3L20 19l-.6-3.1A7.9 7.9 0 0 0 20 12z" }),
+      /* @__PURE__ */ jsx("path", { d: "M8.4 12h.01M12 12h.01M15.6 12h.01", strokeWidth: "2.2" })
+    ] });
+  }
+  function Onboarding(props) {
+    const [step, setStep] = useState(() => {
+      const n = Number(props.startAt || 1);
+      return n >= 1 && n <= 5 ? n : 1;
+    });
+    const [src, setSrc] = useState("");
+    const [playing, setPlaying] = useState(false);
+    const [pos, setPos] = useState(0);
+    const [dur, setDur] = useState(0);
+    const [loading, setLoading] = useState(true);
+    const [audioErr, setAudioErr] = useState("");
+    const audioRef = useRef(null);
+    const loadDemo = async () => {
+      setLoading(true);
+      setAudioErr("");
+      try {
+        const r = await callEntry(props.api, "ms_ace_preview", { name: "沫沫" }, 12e4);
+        const s = audioSrcOf(r, "audio/mpeg");
+        if (!s) throw Error("没有拿到试听音频");
+        setSrc(s);
+        setLoading(false);
+        return;
+      } catch (e) {
+        try {
+          const r2 = await callEntry(props.api, "ms_train_preview", { run_id: "沫沫" }, 12e4);
+          const s2 = audioSrcOf(r2, "audio/mpeg");
+          if (!s2) throw Error("没有拿到试听音频");
+          setSrc(s2);
+        } catch (e2) {
+          setAudioErr("试听加载失败：" + String(e2 && e2.message || e2));
+        }
+      }
+      setLoading(false);
+    };
+    useEffect(() => {
+      loadDemo();
+    }, []);
+    useEffect(() => {
+      if (step === 1) return;
+      try {
+        if (audioRef.current) audioRef.current.pause();
+      } catch (e) {
+      }
+      setPlaying(false);
+    }, [step]);
+    const toggle = async () => {
+      const a = audioRef.current;
+      if (!a) return;
+      try {
+        if (a.paused) await a.play();
+        else a.pause();
+      } catch (e) {
+        setAudioErr("播放失败：" + String(e && e.message || e));
+      }
+    };
+    const seek = (e) => {
+      const a = audioRef.current;
+      if (!a || !dur) return;
+      const rect = e.currentTarget.getBoundingClientRect();
+      const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+      a.currentTime = ratio * dur;
+      setPos(a.currentTime);
+    };
+    const [feat, setFeat] = useState(0);
+    const featPrev = () => setFeat((i) => Math.max(0, i - 1));
+    const featNext = () => setFeat((i) => Math.min(FEATURES.length - 1, i + 1));
     const [report, setReport] = useState(null);
     const [mockMode, setMockMode] = useState(false);
     const [path, setPath] = useState("");
@@ -5123,34 +5233,41 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const [err, setErr] = useState("");
     const [job, setJob] = useState(null);
     const [prog, setProg] = useState(null);
+    const [installing, setInstalling] = useState(false);
     const [mockT, setMockT] = useState(0);
+    const [mockDone, setMockDone] = useState(false);
+    const [mustInstall, setMustInstall] = useState(false);
     const jobId = useRef("");
     const check = async () => {
       setBusy("check");
       setErr("");
       try {
-        const r = await callEntry(props.api, "ms_setup_check", {}, 18e4);
+        const r = await callEntryLoose(props.api, "ms_setup_check", {}, 18e4);
         if (!r || !Array.isArray(r.items)) throw Error("没有拿到清单");
         setReport(r);
         setMockMode(false);
-        setPath(String(r.suggested_root || ""));
+        setPath((p) => p || String(r.suggested_root || ""));
+        return r;
       } catch (e) {
         if (previewMode()) {
-          setReport(mockReport("", false));
+          const m = mockReport("", false);
+          setReport(m);
           setMockMode(true);
-          setPath("");
-        } else {
-          setReport(null);
-          setErr("检测失败：" + String(e && e.message || e));
+          setPath((p) => p || "D:\\NEKOMusicSynth");
+          return m;
         }
+        setReport(null);
+        setErr("检测失败：" + String(e && e.message || e));
+        return null;
+      } finally {
+        setBusy("");
       }
-      setBusy("");
     };
     useEffect(() => {
       check();
     }, []);
     useEffect(() => {
-      if (step !== 2 || !path) return;
+      if (!path) return;
       const drive = (path.match(/^[A-Za-z]:/) || [""])[0].toUpperCase();
       if (!drive) {
         setFreeGb(null);
@@ -5166,9 +5283,9 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       if (typeof s === "function") {
         Promise.resolve(s(drive)).then((g) => setFreeGb(Number(g))).catch(() => setFreeGb(null));
       } else setFreeGb(null);
-    }, [step, path, report]);
+    }, [path, report]);
     useEffect(() => {
-      if (step !== 3) return;
+      if (!installing) return;
       let stop = false;
       let tick = 0;
       const loop = async () => {
@@ -5181,7 +5298,9 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
             const p = mockProgress(report || mockReport(path, false), tick);
             setProg(p);
             if (p.job_state === "done") {
-              setStep(4);
+              setInstalling(false);
+              setMockDone(true);
+              setStep(5);
               return;
             }
             continue;
@@ -5192,8 +5311,15 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
             setProg(st.progress || null);
             if (st.setup && st.setup.report) setReport(st.setup.report);
             const s = String((st.job || {}).state || "");
-            if (s === "done" || s === "failed") {
-              setStep(4);
+            if (s === "done") {
+              setInstalling(false);
+              const fresh = await check();
+              if (fresh && fresh.ready) setStep(5);
+              else setProg(null);
+              return;
+            }
+            if (s === "failed") {
+              setInstalling(false);
               return;
             }
           } catch (e) {
@@ -5204,87 +5330,267 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       return () => {
         stop = true;
       };
-    }, [step, mockMode]);
+    }, [installing, mockMode]);
     const startInstall = async (only) => {
-      setBusy("install");
+      setBusy(only || "all");
       setErr("");
+      setMustInstall(false);
       try {
         const r = await callEntry(props.api, "ms_setup_install", only ? { path: path.trim(), items: [only] } : { path: path.trim() }, 6e4);
         if (r && r.already_ready) {
           setProg({ job_state: "done", items: {}, detail: "环境已就绪" });
-          setStep(4);
+          setMockDone(true);
+          setStep(5);
           return;
         }
         if (r && r.job_id) {
           jobId.current = String(r.job_id);
           setJob({ state: "running", progress: 0, detail: "正在准备…" });
           setMockT(0);
+          setInstalling(true);
         } else throw Error(String(r && r.error || "没能启动安装"));
-        setStep(3);
       } catch (e) {
         if (mockMode) {
           setMockT(0);
-          setStep(3);
-          return;
-        }
-        setErr(String(e && e.message || e));
+          setInstalling(true);
+        } else setErr(String(e && e.message || e));
       }
       setBusy("");
     };
     const items = report && report.items || [];
-    const todo = items.filter((i) => i.installable && i.status !== "ready");
     const needGb = report ? Number(report.total_missing_gb || 0) : 0;
     const lack = freeGb !== null && needGb > 0 && freeGb < Math.max(0.5, needGb * 1.15);
-    const welcome = /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 16 }, children: [
-      /* @__PURE__ */ jsx("div", { style: { fontSize: 13.5, lineHeight: 1.85, color: INK }, children: "欢迎使用「为她而唱」。第一次打开需要先准备好她会用到的程序、模型和音频处理工具，之后就不用再装了。" }),
-      /* @__PURE__ */ jsx("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 12 }, children: [
-        ["要下载什么", "运行程序 + 声音模型 + 去伴奏模型"],
-        ["大约多大", report && needGb ? needGb + " GB" : "约 2 GB（以检测结果为准）"],
-        ["大概多久", report && needGb ? fmtEta(needGb * 900) : "看网速，一般 10～40 分钟"]
-      ].map((row, i) => /* @__PURE__ */ jsxs("div", { style: { padding: 14, borderRadius: 16, background: "rgba(255,229,239,0.5)", border: "1px solid rgba(224,45,118,0.10)" }, children: [
-        /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_2 }, children: row[0] }),
-        /* @__PURE__ */ jsx("div", { style: { fontSize: 14, fontWeight: 700, color: "#9c204e", marginTop: 4 }, children: row[1] })
+    const allReady = !!report && report.ready === true;
+    const canNext = allReady || mockDone;
+    const knownMissing = !!report && !allReady && !mockDone && items.some((i) => i.required && !i.ok && i.installable);
+    const requestSkip = () => {
+      if (!report && !err) {
+        setMustInstall(true);
+        setStep(4);
+        return;
+      }
+      if (knownMissing) {
+        setMustInstall(true);
+        setStep(4);
+        return;
+      }
+      if (props.onSkip) props.onSkip();
+      else props.onDone();
+    };
+    const page1 = /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 20, alignItems: "center", textAlign: "center", padding: "8px 0 4px" }, children: [
+      /* @__PURE__ */ jsxs("div", { children: [
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 21, fontWeight: 800, color: INK, letterSpacing: 0.2 }, children: "先听听我们做出来的效果" }),
+        /* @__PURE__ */ jsxs("div", { style: { fontSize: 13, color: INK_2, marginTop: 8, lineHeight: 1.8 }, children: [
+          "这首歌就是用插件自带的声音「沫沫」唱出来的。",
+          /* @__PURE__ */ jsx("br", {}),
+          "现在就可以听，不用先装任何东西。"
+        ] })
+      ] }),
+      /* @__PURE__ */ jsxs("div", { style: { width: "100%", maxWidth: 520, padding: "22px 24px 20px", borderRadius: 24, backgroundImage: "linear-gradient(150deg,#ffffff 0%,#fff8fb 58%,#ffeef6 100%)", border: "1px solid rgba(255,255,255,0.96)", boxShadow: "0 16px 40px rgba(224,45,118,0.10), 0 2px 8px rgba(142,159,187,0.10)" }, children: [
+        /* @__PURE__ */ jsxs(Row, { style: { gap: 14, justifyContent: "flex-start", textAlign: "left" }, children: [
+          /* @__PURE__ */ jsx("span", { style: { width: 52, height: 52, borderRadius: 999, display: "grid", placeItems: "center", background: "linear-gradient(150deg,#ffe5ef,#f6cfe4)", color: BRAND, fontSize: 23, boxShadow: "0 6px 16px rgba(224,45,118,0.15)" }, children: "♪" }),
+          /* @__PURE__ */ jsxs("div", { style: { minWidth: 0 }, children: [
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 16, fontWeight: 700, color: INK }, children: "沫沫" }),
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 12, color: INK_2, marginTop: 2 }, children: "内置 · 体验音色" })
+          ] }),
+          /* @__PURE__ */ jsx(Pill, { tone: "neutral", children: "试听样曲" })
+        ] }),
+        /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: 18, marginTop: 20 }, children: [
+          /* @__PURE__ */ jsx(
+            "button",
+            {
+              type: "button",
+              "aria-label": playing ? "暂停" : "播放",
+              onClick: toggle,
+              disabled: loading || !src,
+              style: {
+                width: 74,
+                height: 74,
+                flex: "0 0 auto",
+                borderRadius: 999,
+                border: 0,
+                cursor: loading || !src ? "default" : "pointer",
+                background: loading || !src ? "rgba(224,45,118,0.18)" : "linear-gradient(150deg,#ff7fb0,#e02d76)",
+                color: "#fff",
+                fontSize: 24,
+                display: "grid",
+                placeItems: "center",
+                boxShadow: "0 10px 24px rgba(224,45,118,0.26)",
+                transition: "transform .18s ease"
+              },
+              children: loading ? "…" : !src ? "!" : playing ? "❚❚" : "▶"
+            }
+          ),
+          /* @__PURE__ */ jsxs("div", { style: { flex: 1, minWidth: 0 }, children: [
+            /* @__PURE__ */ jsx("div", { onClick: seek, style: { height: 10, borderRadius: 999, background: "rgba(224,45,118,0.12)", cursor: src ? "pointer" : "default", position: "relative", overflow: "hidden" }, children: /* @__PURE__ */ jsx("i", { style: { display: "block", height: "100%", width: (dur ? Math.min(100, pos / dur * 100) : 0) + "%", background: "linear-gradient(90deg,#ff7fb0,#e02d76)", borderRadius: 999 } }) }),
+            /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between", marginTop: 8 }, children: [
+              /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11.5 }, children: mmss(pos) }),
+              /* @__PURE__ */ jsx("div", { style: { display: "flex", gap: 3, alignItems: "flex-end", height: 18 }, "aria-hidden": true, children: [0.62, 0.94, 0.45, 0.8, 0.55].map((h2, i) => /* @__PURE__ */ jsx("i", { style: {
+                width: 3,
+                height: 18 * h2,
+                borderRadius: 3,
+                background: BRAND,
+                opacity: playing ? 0.85 : 0.28,
+                animation: "ms-ob-wave 1.05s ease-in-out infinite",
+                animationDelay: i * 0.12 + "s",
+                animationPlayState: playing ? "running" : "paused",
+                transformOrigin: "bottom"
+              } }, i)) }),
+              /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11.5 }, children: dur ? mmss(dur) : "—:—" })
+            ] })
+          ] })
+        ] }),
+        src ? /* @__PURE__ */ jsx(
+          "audio",
+          {
+            ref: audioRef,
+            src,
+            preload: "metadata",
+            style: { display: "none" },
+            onLoadedMetadata: () => {
+              try {
+                setDur(Number(audioRef.current.duration) || 0);
+              } catch (e) {
+              }
+            },
+            onTimeUpdate: () => {
+              try {
+                setPos(Number(audioRef.current.currentTime) || 0);
+              } catch (e) {
+              }
+            },
+            onPlay: () => setPlaying(true),
+            onPause: () => setPlaying(false),
+            onEnded: () => {
+              setPlaying(false);
+              setPos(0);
+            }
+          }
+        ) : null,
+        audioErr ? /* @__PURE__ */ jsxs("div", { style: { marginTop: 14 }, children: [
+          /* @__PURE__ */ jsx(Alert, { tone: "warning", children: audioErr }),
+          /* @__PURE__ */ jsx(Row, { style: { marginTop: 10, justifyContent: "flex-end" }, children: /* @__PURE__ */ jsx(Btn, { style: { ...ghostBtn, padding: "7px 14px", fontSize: 12 }, onClick: loadDemo, children: "重新加载试听" }) })
+        ] }) : null,
+        loading ? /* @__PURE__ */ jsx(Muted, { style: { display: "block", marginTop: 12, fontSize: 11.5 }, children: "正在准备试听…" }) : null
+      ] }),
+      /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11.5 }, children: "所有处理都在你自己的电脑上完成，不会把音频上传到网上。" }),
+      /* @__PURE__ */ jsx(Row, { style: { justifyContent: "center", marginTop: 2 }, children: /* @__PURE__ */ jsx(Btn, { style: primaryBtn, onClick: () => setStep(2), children: "下一步：看看她能做什么 →" }) })
+    ] });
+    const page2 = /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 16 }, children: [
+      /* @__PURE__ */ jsxs("div", { style: { textAlign: "center" }, children: [
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 19, fontWeight: 800, color: INK }, children: "她能做什么" }),
+        /* @__PURE__ */ jsxs("div", { style: { fontSize: 12.5, color: INK_2, marginTop: 6 }, children: [
+          "左右翻一翻，一共 ",
+          FEATURES.length,
+          " 项能力"
+        ] })
+      ] }),
+      /* @__PURE__ */ jsx("div", { style: { position: "relative", borderRadius: 22, overflow: "hidden", border: "1px solid rgba(224,45,118,0.10)", background: "rgba(255,255,255,0.72)" }, children: /* @__PURE__ */ jsx("div", { style: { display: "flex", transition: "transform .32s cubic-bezier(.22,.61,.36,1)", transform: "translateX(" + -feat * 100 + "%)" }, children: FEATURES.map((f, i) => /* @__PURE__ */ jsxs("div", { style: { flex: "0 0 100%", minWidth: 0, padding: "26px 28px", display: "flex", flexDirection: "column", gap: 12, minHeight: 236 }, children: [
+        /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between" }, children: [
+          /* @__PURE__ */ jsx("span", { style: { width: 58, height: 58, borderRadius: 20, display: "grid", placeItems: "center", background: "linear-gradient(150deg,#ffeef6,#ffe0ee)", color: BRAND, boxShadow: "0 6px 16px rgba(224,45,118,0.10)" }, children: /* @__PURE__ */ jsx(FeatureIcon, { name: f.key }) }),
+          /* @__PURE__ */ jsxs("span", { style: { fontSize: 12, color: INK_3, fontWeight: 700 }, children: [
+            String(i + 1).padStart(2, "0"),
+            " / ",
+            String(FEATURES.length).padStart(2, "0")
+          ] })
+        ] }),
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 20, fontWeight: 800, color: INK }, children: f.title }),
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 13.5, color: INK_2, lineHeight: 1.85 }, children: f.text }),
+        /* @__PURE__ */ jsx("div", { style: { marginTop: "auto" }, children: /* @__PURE__ */ jsx(Pill, { tone: "neutral", children: f.tag }) })
+      ] }, f.key)) }) }),
+      /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "center", alignItems: "center", gap: 14 }, children: [
+        /* @__PURE__ */ jsx(
+          "button",
+          {
+            type: "button",
+            "aria-label": "上一项",
+            onClick: featPrev,
+            disabled: feat === 0,
+            style: {
+              width: 32,
+              height: 32,
+              borderRadius: 999,
+              border: "1px solid " + (feat === 0 ? "rgba(40,37,50,0.06)" : "rgba(224,45,118,0.16)"),
+              background: feat === 0 ? "rgba(40,37,50,0.03)" : "#fff",
+              color: feat === 0 ? "#c9c4cf" : BRAND_DEEP,
+              cursor: feat === 0 ? "default" : "pointer",
+              fontSize: 15,
+              lineHeight: 1
+            },
+            children: "‹"
+          }
+        ),
+        /* @__PURE__ */ jsx(Row, { style: { gap: 7 }, children: FEATURES.map((f, i) => /* @__PURE__ */ jsx(
+          "button",
+          {
+            type: "button",
+            "aria-label": f.title,
+            onClick: () => setFeat(i),
+            style: {
+              width: i === feat ? 22 : 7,
+              height: 7,
+              borderRadius: 999,
+              border: 0,
+              padding: 0,
+              cursor: "pointer",
+              background: i === feat ? BRAND : "rgba(224,45,118,0.20)",
+              transition: "width .2s ease, background-color .2s ease"
+            }
+          },
+          f.key
+        )) }),
+        /* @__PURE__ */ jsx(
+          "button",
+          {
+            type: "button",
+            "aria-label": "下一项",
+            onClick: featNext,
+            disabled: feat === FEATURES.length - 1,
+            style: {
+              width: 32,
+              height: 32,
+              borderRadius: 999,
+              border: "1px solid " + (feat === FEATURES.length - 1 ? "rgba(40,37,50,0.06)" : "rgba(224,45,118,0.16)"),
+              background: feat === FEATURES.length - 1 ? "rgba(40,37,50,0.03)" : "#fff",
+              color: feat === FEATURES.length - 1 ? "#c9c4cf" : BRAND_DEEP,
+              cursor: feat === FEATURES.length - 1 ? "default" : "pointer",
+              fontSize: 15,
+              lineHeight: 1
+            },
+            children: "›"
+          }
+        )
+      ] }),
+      /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between", marginTop: 2 }, children: [
+        /* @__PURE__ */ jsx(Btn, { style: ghostBtn, onClick: () => setStep(1), children: "上一步" }),
+        /* @__PURE__ */ jsx(Btn, { style: primaryBtn, onClick: () => setStep(3), children: "下一步：怎么用 →" })
+      ] })
+    ] });
+    const USAGE = [
+      ["导入歌曲", "导入一个音频文件，或者直接录下电脑上正在播放的歌。"],
+      ["选择音色", "挑内置的「沫沫」，或者用你训练好的声音。"],
+      ["生成", "一键分离、变声、混音，全部在本机完成。"],
+      ["试听导出", "满意就导出成品；不满意可以再唱一遍。"]
+    ];
+    const page3 = /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 18 }, children: [
+      /* @__PURE__ */ jsxs("div", { style: { textAlign: "center" }, children: [
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 19, fontWeight: 800, color: INK }, children: "四步就能听到她用另一种声音唱歌" }),
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK_2, marginTop: 6 }, children: "先熟悉流程，装好环境后照着做就行" })
+      ] }),
+      /* @__PURE__ */ jsx("div", { style: { display: "flex", flexDirection: "column", gap: 10 }, children: USAGE.map((u, i) => /* @__PURE__ */ jsxs("div", { style: { display: "grid", gridTemplateColumns: "40px minmax(0,1fr)", gap: 14, alignItems: "center", padding: "15px 18px", borderRadius: 18, background: "rgba(255,255,255,0.82)", border: "1px solid rgba(255,255,255,0.96)", boxShadow: "0 4px 16px rgba(142,159,187,0.06)" }, children: [
+        /* @__PURE__ */ jsx("span", { style: { width: 40, height: 40, borderRadius: 14, display: "grid", placeItems: "center", background: i === 0 ? BRAND : "rgba(255,229,239,0.85)", color: i === 0 ? "#fff" : BRAND_DEEP, fontWeight: 800, fontSize: 14 }, children: i + 1 }),
+        /* @__PURE__ */ jsxs("div", { style: { minWidth: 0 }, children: [
+          /* @__PURE__ */ jsx("div", { style: { fontSize: 14.5, fontWeight: 700, color: INK }, children: u[0] }),
+          /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK_2, marginTop: 3, lineHeight: 1.7 }, children: u[1] })
+        ] })
       ] }, i)) }),
-      /* @__PURE__ */ jsx(Muted, { children: "安装过程中可以继续用电脑；关掉这个窗口不会中断下载，下次打开会接着装。" }),
-      /* @__PURE__ */ jsx(Row, { style: { justifyContent: "flex-end" }, children: /* @__PURE__ */ jsx(Btn, { style: primaryBtn, disabled: busy === "check", onClick: () => setStep(2), children: busy === "check" ? "检测中…" : "下一步：选安装位置" }) })
-    ] });
-    const place = /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 14 }, children: [
-      /* @__PURE__ */ jsx("div", { style: { fontSize: 13.5, color: INK, lineHeight: 1.8 }, children: "程序、模型和临时文件都会放在这里。选一个空间充足的盘就行，装在 D 盘、E 盘都可以。" }),
-      /* @__PURE__ */ jsxs("label", { style: { display: "flex", flexDirection: "column", gap: 6, fontSize: 12, color: INK_2 }, children: [
-        /* @__PURE__ */ jsx("span", { children: "安装到哪里" }),
-        /* @__PURE__ */ jsx("input", { value: path, placeholder: "例如 D:\\\\NEKOMusicSynth", onChange: (e) => setPath(e.target.value), style: {
-          border: "1px solid " + (lack ? "#e8a3a3" : "transparent"),
-          borderRadius: 12,
-          padding: "10px 14px",
-          fontSize: 13,
-          background: lack ? "#fff6f6" : "rgba(248,250,252,0.95)",
-          color: INK,
-          outline: "none"
-        } })
-      ] }),
-      /* @__PURE__ */ jsx(Muted, { children: "必须自己填一个绝对路径（例如 D:\\NEKOMusicSynth）。插件不会自动挑盘，也不会把模型下到别的盘。" }),
-      /* @__PURE__ */ jsx("div", { style: { display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }, children: !path.trim() ? /* @__PURE__ */ jsx(StatusBadge, { tone: "warning", children: "请先填写安装目录，否则不会开始下载" }) : freeGb !== null ? lack ? /* @__PURE__ */ jsxs(StatusBadge, { tone: "error", children: [
-        "这个盘只剩 ",
-        freeGb.toFixed(1),
-        " GB，还要约 ",
-        needGb,
-        " GB，换一个盘吧"
-      ] }) : /* @__PURE__ */ jsxs(StatusBadge, { tone: "success", children: [
-        "这个盘还剩 ",
-        freeGb.toFixed(1),
-        " GB · 需要约 ",
-        needGb,
-        " GB"
-      ] }) : /* @__PURE__ */ jsx(Muted, { children: "（无法读取剩余空间，也可以继续）" }) }),
-      mockMode ? /* @__PURE__ */ jsx(Muted, { children: "安装向导暂时读不到检测结果。" }) : null,
+      /* @__PURE__ */ jsx(Muted, { style: { textAlign: "center", fontSize: 11.5 }, children: "想换回原来的声音？随时在「我的声音」里切换。" }),
       /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between" }, children: [
-        /* @__PURE__ */ jsx(Btn, { onClick: () => setStep(1), children: "上一步" }),
-        /* @__PURE__ */ jsx(Btn, { style: primaryBtn, disabled: lack || !path.trim() || busy === "install", onClick: () => startInstall(), children: busy === "install" ? "正在启动…" : "开始安装" })
-      ] }),
-      err ? /* @__PURE__ */ jsx(Alert, { tone: "warning", children: err }) : null
+        /* @__PURE__ */ jsx(Btn, { style: ghostBtn, onClick: () => setStep(2), children: "上一步" }),
+        /* @__PURE__ */ jsx(Btn, { style: primaryBtn, onClick: () => setStep(4), children: "下一步：准备运行环境 →" })
+      ] })
     ] });
-    const rows = items.filter((i) => i.status !== "ready" || prog && prog.items && prog.items[i.key]);
-    const showing = rows.length ? rows : items;
+    const showing = [...items].sort((a, b) => Number(a.status === "ready") - Number(b.status === "ready"));
     const overall = (() => {
       if (!prog) return 0;
       const list = items.filter((i) => i.status !== "ready");
@@ -5296,8 +5602,67 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       }
       return Math.round(sum / list.length);
     })();
-    const installing = /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 14 }, children: [
-      /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 6 }, children: [
+    const failed = !!(prog && prog.job_state === "failed");
+    const failLabels = items.filter((i) => {
+      const st = prog && prog.items && prog.items[i.key];
+      return st && st.state === "failed";
+    });
+    const page4 = /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 14 }, children: [
+      /* @__PURE__ */ jsxs("div", { style: { textAlign: "center" }, children: [
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 19, fontWeight: 800, color: INK }, children: "准备运行环境" }),
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK_2, marginTop: 6, lineHeight: 1.8 }, children: "欢迎使用「为她而唱」。第一次打开需要先准备好她会用到的程序、模型和音频处理工具，之后就不用再装了。" })
+      ] }),
+      mustInstall ? /* @__PURE__ */ jsx(Alert, { tone: "warning", children: "必需的程序还没装好，先点「一键安装全部」把它装好才能开始使用。" }) : null,
+      mockMode ? /* @__PURE__ */ jsx(Alert, { tone: "info", children: "当前是模拟演示：没有连上安装接口，进度为示例数据，只用于查看界面流程。" }) : null,
+      err ? /* @__PURE__ */ jsx(Alert, { tone: "warning", children: err }) : null,
+      /* @__PURE__ */ jsx("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 12 }, children: [
+        ["要下载什么", "运行程序 + 声音模型 + 去伴奏模型"],
+        ["大约多大", report && needGb ? needGb + " GB" : "约 2 GB（以检测结果为准）"],
+        ["大概多久", report && needGb ? fmtEta(needGb * 900) : "看网速，一般 10～40 分钟"]
+      ].map((row, i) => /* @__PURE__ */ jsxs("div", { style: { padding: 14, borderRadius: 16, background: "rgba(255,229,239,0.5)", border: "1px solid rgba(224,45,118,0.10)" }, children: [
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_2 }, children: row[0] }),
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 14, fontWeight: 700, color: "#9c204e", marginTop: 4 }, children: row[1] })
+      ] }, i)) }),
+      /* @__PURE__ */ jsxs("div", { style: { padding: 16, borderRadius: 18, background: "rgba(255,255,255,0.72)", border: "1px solid " + LINE, display: "flex", flexDirection: "column", gap: 10 }, children: [
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK, lineHeight: 1.8 }, children: "程序、模型和临时文件都会放在这里。选一个空间充足的盘就行，装在 D 盘、E 盘都可以。" }),
+        /* @__PURE__ */ jsxs("label", { style: { display: "flex", flexDirection: "column", gap: 6, fontSize: 12, color: INK_2 }, children: [
+          /* @__PURE__ */ jsx("span", { children: "安装到哪里" }),
+          /* @__PURE__ */ jsx(
+            "input",
+            {
+              value: path,
+              placeholder: "例如 D:\\\\NEKOMusicSynth",
+              disabled: installing,
+              onChange: (e) => setPath(e.target.value),
+              style: {
+                border: "1px solid " + (lack ? "#e8a3a3" : "transparent"),
+                borderRadius: 12,
+                padding: "10px 14px",
+                fontSize: 13,
+                background: lack ? "#fff6f6" : "rgba(248,250,252,0.95)",
+                color: INK,
+                outline: "none"
+              }
+            }
+          )
+        ] }),
+        /* @__PURE__ */ jsx(Muted, { children: "必须自己填一个绝对路径（例如 D:\\NEKOMusicSynth）。插件不会自动挑盘，也不会把模型下到别的盘。" }),
+        /* @__PURE__ */ jsx("div", { style: { display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }, children: !path.trim() ? /* @__PURE__ */ jsx(StatusBadge, { tone: "warning", children: "请先填写安装目录，否则不会开始下载" }) : freeGb !== null ? lack ? /* @__PURE__ */ jsxs(StatusBadge, { tone: "error", children: [
+          "这个盘只剩 ",
+          freeGb.toFixed(1),
+          " GB，还要约 ",
+          needGb,
+          " GB，换一个盘吧"
+        ] }) : /* @__PURE__ */ jsxs(StatusBadge, { tone: "success", children: [
+          "这个盘还剩 ",
+          freeGb.toFixed(1),
+          " GB · 需要约 ",
+          needGb,
+          " GB"
+        ] }) : /* @__PURE__ */ jsx(Muted, { children: "（无法读取剩余空间，也可以继续）" }) }),
+        mockMode ? /* @__PURE__ */ jsx(Muted, { children: "安装向导暂时读不到检测结果。" }) : null
+      ] }),
+      installing || prog && prog.items ? /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 6 }, children: [
         /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between" }, children: [
           /* @__PURE__ */ jsx("div", { style: { fontSize: 13.5, fontWeight: 700, color: INK }, children: prog && prog.job_state === "done" ? "快好了…" : "正在下载并安装" }),
           /* @__PURE__ */ jsxs(Muted, { children: [
@@ -5307,71 +5672,117 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         ] }),
         /* @__PURE__ */ jsx(Bar, { pct: overall }),
         /* @__PURE__ */ jsx("div", { style: { fontSize: 12, color: INK_2, minHeight: 18 }, children: prog && prog.detail || job && job.detail || "正在准备…" })
-      ] }),
+      ] }) : null,
+      failed ? /* @__PURE__ */ jsx(Alert, { tone: "warning", children: prog && prog.detail || "安装没能全部完成，看看下面哪一项出了问题。" }) : null,
       /* @__PURE__ */ jsx("div", { style: { display: "flex", flexDirection: "column", gap: 8 }, children: showing.map((i) => {
-        const st = prog && prog.items && prog.items[i.key] || { state: i.status === "ready" ? "ready" : "wait", pct: null };
+        const st = prog && prog.items && prog.items[i.key] || { state: i.ok ? "ready" : i.installable ? "missing" : "missing_required", pct: null };
         const tx = STATE_TEXT[st.state] || STATE_TEXT.wait;
         const isActive = st.state === "active";
         const isDownload = st.total_mb && st.done_mb !== void 0 && st.done_mb !== null;
-        return /* @__PURE__ */ jsxs("div", { style: { display: "grid", gridTemplateColumns: "22px minmax(0,1fr) auto", gap: "4px 10px", alignItems: "center", padding: "9px 12px", borderRadius: 14, background: isActive ? "rgba(255,229,239,0.55)" : "rgba(248,250,252,0.9)", border: "1px solid " + (isActive ? "rgba(224,45,118,0.18)" : LINE) }, children: [
+        const canInstall = i.installable && i.status !== "ready" && !installing;
+        return /* @__PURE__ */ jsxs("div", { style: { display: "grid", gridTemplateColumns: "24px minmax(0,1fr) auto", gap: "4px 10px", alignItems: "center", padding: "10px 13px", borderRadius: 15, background: isActive ? "rgba(255,229,239,0.55)" : "rgba(248,250,252,0.9)", border: "1px solid " + (isActive ? "rgba(224,45,118,0.18)" : LINE) }, children: [
           /* @__PURE__ */ jsx(StateIcon, { state: st.state }),
           /* @__PURE__ */ jsxs("div", { style: { minWidth: 0 }, children: [
-            /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: i.label }),
-            /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_3 }, children: isDownload ? st.done_mb + " / " + st.total_mb + " MB" : i.size_gb ? "约 " + i.size_gb + " GB" : "" })
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: i.label }),
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_3, lineHeight: 1.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: isDownload ? st.done_mb + " / " + st.total_mb + " MB" : i.ok ? i.detail || "已就绪" : i.fix || i.detail || (i.size_gb ? "约 " + i.size_gb + " GB" : "") })
           ] }),
-          /* @__PURE__ */ jsx(Pill, { tone: tx.tone, children: tx.text }),
+          /* @__PURE__ */ jsxs(Row, { style: { gap: 8 }, children: [
+            /* @__PURE__ */ jsx(Pill, { tone: tx.tone, children: tx.text }),
+            canInstall ? /* @__PURE__ */ jsx(
+              Btn,
+              {
+                style: { ...ghostBtn, padding: "5px 11px", fontSize: 11.5, borderRadius: 9 },
+                disabled: !!busy,
+                onClick: () => startInstall(i.key),
+                children: "安装"
+              }
+            ) : null,
+            failed && st.state === "failed" ? /* @__PURE__ */ jsx(
+              Btn,
+              {
+                style: { ...ghostBtn, padding: "5px 11px", fontSize: 11.5, borderRadius: 9 },
+                disabled: !!busy,
+                onClick: () => startInstall(i.key),
+                children: "重试这一项"
+              }
+            ) : null
+          ] }),
           /* @__PURE__ */ jsx("div", { style: { gridColumn: "2 / 4" }, children: /* @__PURE__ */ jsx(Bar, { pct: st.state === "done" || st.state === "ready" ? 100 : Number(st.pct || 0), tone: st.state === "failed" ? "#e06666" : st.state === "active" ? void 0 : "rgba(224,45,118,0.35)" }) })
         ] }, i.key);
       }) }),
-      /* @__PURE__ */ jsx(Muted, { children: "可以先去忙别的：关掉窗口不会中断，回来还能接着看。" })
+      failed && !failLabels.length ? /* @__PURE__ */ jsx(Row, { style: { justifyContent: "flex-end" }, children: /* @__PURE__ */ jsx(Btn, { style: ghostBtn, disabled: !!busy, onClick: () => startInstall(), children: "重新安装缺失项" }) }) : null,
+      /* @__PURE__ */ jsxs(Muted, { style: { fontSize: 11.5, lineHeight: 1.7 }, children: [
+        "安装过程中可以继续用电脑；关掉这个窗口不会中断下载，下次打开会接着装。",
+        /* @__PURE__ */ jsx("br", {}),
+        "可以先去忙别的：关掉窗口不会中断，回来还能接着看。"
+      ] })
     ] });
-    const failed = prog && prog.job_state === "failed";
-    const failLabels = items.filter((i) => {
-      const st = prog && prog.items && prog.items[i.key];
-      return st && st.state === "failed";
-    });
-    const finish = /* @__PURE__ */ jsx("div", { style: { display: "flex", flexDirection: "column", gap: 16 }, children: failed ? /* @__PURE__ */ jsxs(Fragment, { children: [
-      /* @__PURE__ */ jsx(Alert, { tone: "warning", children: prog && prog.detail || "安装没能全部完成，看看下面哪一项出了问题。" }),
-      failLabels.length ? failLabels.map((i) => /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", padding: "10px 12px", borderRadius: 14, background: "#fdecec" }, children: [
-        /* @__PURE__ */ jsxs("div", { style: { minWidth: 0 }, children: [
-          /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK }, children: i.label }),
-          /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: "#c93c3c", wordBreak: "break-all" }, children: (prog.items[i.key] || {}).error || i.fix })
+    const page5 = /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 18, alignItems: "center", textAlign: "center", padding: "14px 0 6px" }, children: [
+      /* @__PURE__ */ jsx("span", { style: { width: 58, height: 58, borderRadius: 999, background: "#e8f7ef", color: "#1c8a58", display: "grid", placeItems: "center", boxShadow: "0 8px 20px rgba(28,138,88,0.12)" }, children: /* @__PURE__ */ jsx("svg", { width: "30", height: "30", viewBox: "0 0 24 24", children: /* @__PURE__ */ jsx("path", { d: "M5 12.5 9.6 17 19 7.2", fill: "none", stroke: "currentColor", strokeWidth: "2.4", strokeLinecap: "round", strokeLinejoin: "round" }) }) }),
+      /* @__PURE__ */ jsx("div", { style: { fontSize: 22, fontWeight: 800, color: INK }, children: "都准备好了" }),
+      /* @__PURE__ */ jsx("div", { style: { fontSize: 13.5, color: INK_2, lineHeight: 1.9, maxWidth: 480 }, children: "全部就绪。以后打开插件不用再装东西了。先把几首歌放进「准备素材」，就能开始训练她的声音。" }),
+      /* @__PURE__ */ jsx("div", { style: { padding: "12px 18px", borderRadius: 16, background: "rgba(255,229,239,0.5)", border: "1px solid rgba(224,45,118,0.10)", fontSize: 12.5, color: "#9c204e", lineHeight: 1.7 }, children: "小提示：第一次可以先在「让她唱歌」里挑一首歌，用内置的「沫沫」试一遍。" }),
+      /* @__PURE__ */ jsx(Row, { style: { justifyContent: "center", marginTop: 4 }, children: /* @__PURE__ */ jsx(Btn, { style: primaryBtn, onClick: props.onDone, children: "开始使用" }) }),
+      /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11 }, children: "安装文件只来自官方发布地址，放在你选定的目录里；不会改动系统设置。" })
+    ] });
+    const body = step === 1 ? page1 : step === 2 ? page2 : step === 3 ? page3 : step === 4 ? page4 : page5;
+    return /* @__PURE__ */ jsxs("div", { style: { position: "fixed", inset: 0, zIndex: 1100, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(248,250,252,0.94)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", overflow: "auto" }, children: [
+      /* @__PURE__ */ jsx("style", { children: `
+        @keyframes ms-ob-wave { 0%,100% { transform: scaleY(.35); } 50% { transform: scaleY(1); } }
+        .ms-ob-scroll::-webkit-scrollbar { width: 6px; }
+        .ms-ob-scroll::-webkit-scrollbar-thumb { background: rgba(224,45,118,0.18); border-radius: 999px; }
+      ` }),
+      /* @__PURE__ */ jsx("div", { style: { width: "100%", maxWidth: 720, margin: "auto" }, children: /* @__PURE__ */ jsxs(Panel, { style: { display: "flex", flexDirection: "column", gap: 16, padding: "22px 26px 24px", borderRadius: 28 }, children: [
+        /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }, children: [
+          /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: 10 }, children: [
+            /* @__PURE__ */ jsx("span", { style: { width: 34, height: 34, borderRadius: 999, display: "grid", placeItems: "center", background: "linear-gradient(150deg,#ffe5ef,#f6cfe4)", color: BRAND, fontSize: 17, boxShadow: "0 4px 12px rgba(224,45,118,0.14)" }, children: "♪" }),
+            /* @__PURE__ */ jsxs("div", { children: [
+              /* @__PURE__ */ jsx("div", { style: { fontSize: 14.5, fontWeight: 700, color: INK }, children: "为她而唱 · 新手引导" }),
+              /* @__PURE__ */ jsxs("div", { style: { fontSize: 11.5, color: INK_2, marginTop: 1 }, children: [
+                "第 ",
+                step,
+                " 步 / 共 5 步 · ",
+                STEP_TITLES[step - 1]
+              ] })
+            ] })
+          ] }),
+          step === 5 ? null : /* @__PURE__ */ jsx(
+            "button",
+            {
+              type: "button",
+              onClick: requestSkip,
+              style: { border: 0, background: "transparent", color: INK_3, fontSize: 12, cursor: "pointer", padding: "6px 4px", fontFamily: "inherit" },
+              children: "跳过引导"
+            }
+          )
         ] }),
-        /* @__PURE__ */ jsx(Btn, { onClick: () => startInstall(i.key), children: "重试这一项" })
-      ] }, i.key)) : /* @__PURE__ */ jsx(Btn, { onClick: () => startInstall(), children: "重新安装缺失项" })
-    ] }) : /* @__PURE__ */ jsxs(Fragment, { children: [
-      /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: 12 }, children: [
-        /* @__PURE__ */ jsx(StateIcon, { state: "done" }),
-        /* @__PURE__ */ jsx("div", { style: { fontSize: 17, fontWeight: 700, color: INK }, children: "全部就绪" })
-      ] }),
-      /* @__PURE__ */ jsx("div", { style: { fontSize: 13, color: INK_2, lineHeight: 1.8 }, children: "以后打开插件不用再装东西了。先把几首歌放进「准备素材」，就能开始训练她的声音。" }),
-      /* @__PURE__ */ jsx(Row, { style: { justifyContent: "flex-end" }, children: /* @__PURE__ */ jsx(Btn, { style: primaryBtn, onClick: props.onDone, children: "开始使用" }) })
-    ] }) });
-    const body = step === 1 ? welcome : step === 2 ? place : step === 3 ? installing : finish;
-    return /* @__PURE__ */ jsx("div", { style: { position: "fixed", inset: 0, zIndex: 1100, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(248,250,252,0.92)", backdropFilter: "blur(10px)", WebkitBackdropFilter: "blur(10px)", overflow: "auto" }, children: /* @__PURE__ */ jsxs("div", { style: { width: "100%", maxWidth: 620 }, children: [
-      /* @__PURE__ */ jsxs(Panel, { style: { display: "flex", flexDirection: "column", gap: 18 }, children: [
-        /* @__PURE__ */ jsxs("div", { children: [
-          /* @__PURE__ */ jsx("div", { style: { fontSize: 18, fontWeight: 700, color: INK }, children: "首次使用 · 安装向导" }),
-          /* @__PURE__ */ jsxs("div", { style: { fontSize: 12, color: INK_2, marginTop: 3 }, children: [
-            "第 ",
-            step,
-            " 步 / 共 4 步 · ",
-            STEPS[step - 1]
-          ] })
-        ] }),
-        /* @__PURE__ */ jsx("div", { style: { display: "flex", gap: 6, flexWrap: "wrap" }, children: STEPS.map((t, i) => {
+        /* @__PURE__ */ jsx("div", { style: { display: "flex", gap: 6 }, children: STEPS.map((t, i) => {
           const no = i + 1;
-          const on = step === no;
           const done2 = step > no;
-          return /* @__PURE__ */ jsxs("span", { style: { display: "inline-flex", alignItems: "center", gap: 6, padding: "5px 11px", borderRadius: 999, fontSize: 12.5, background: on ? BRAND : "transparent", color: on ? "#fff" : done2 ? "#9c204e" : INK_2, fontWeight: on ? 700 : 400 }, children: [
-            /* @__PURE__ */ jsx("i", { style: { fontStyle: "normal", width: 17, height: 17, lineHeight: "17px", textAlign: "center", borderRadius: 999, fontSize: 10.5, background: on ? "#fff" : done2 ? "rgba(224,45,118,0.14)" : "rgba(40,37,50,0.06)", color: on ? BRAND : "inherit" }, children: done2 ? "✓" : no }),
-            t
-          ] }, no);
+          const on = step === no;
+          return /* @__PURE__ */ jsx("div", { title: t, style: { flex: 1, height: 4, borderRadius: 999, background: on ? BRAND : done2 ? "rgba(224,45,118,0.40)" : "rgba(40,37,50,0.08)", transition: "background-color .2s ease" } }, t);
         }) }),
-        /* @__PURE__ */ jsx("div", { children: body })
-      ] }),
-      /* @__PURE__ */ jsx("div", { style: { fontSize: 11, color: INK_3, textAlign: "center", marginTop: 10 }, children: "安装文件只来自官方发布地址，放在你选定的目录里；不会改动系统设置。" })
-    ] }) });
+        /* @__PURE__ */ jsx("div", { className: "ms-ob-scroll", style: { maxHeight: step === 4 ? "calc(100vh - 300px)" : "calc(100vh - 240px)", overflowY: "auto", overflowX: "hidden", paddingRight: 2 }, children: body }),
+        step === 4 ? /* @__PURE__ */ jsxs("div", { style: { borderTop: "1px solid " + LINE, paddingTop: 12, display: "flex", flexDirection: "column", gap: 6 }, children: [
+          /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between", alignItems: "center" }, children: [
+            /* @__PURE__ */ jsx(Btn, { style: ghostBtn, onClick: () => setStep(3), disabled: installing, children: "上一步" }),
+            /* @__PURE__ */ jsxs(Row, { style: { gap: 10 }, children: [
+              allReady || mockDone ? null : /* @__PURE__ */ jsx(
+                Btn,
+                {
+                  style: primaryBtn,
+                  disabled: !!busy || installing || !path.trim() || lack || !items.some((i) => i.installable && i.status !== "ready"),
+                  onClick: () => startInstall(),
+                  children: installing ? "正在安装…" : busy === "all" ? "正在启动…" : "一键安装全部"
+                }
+              ),
+              /* @__PURE__ */ jsx(Btn, { style: canNext ? primaryBtn : ghostBtn, disabled: !canNext || installing, onClick: () => setStep(5), children: canNext ? "下一步：开始使用 →" : "装好后继续" })
+            ] })
+          ] }),
+          !canNext && !installing ? /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11.5, textAlign: "right" }, children: "必需项装好之前，其它页面先不能使用。" }) : null
+        ] }) : null
+      ] }) })
+    ] });
   }
 
   // ../../.neko-plugin-installations/plugins/music_synth/ui/panel.tsx
@@ -5381,12 +5792,25 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       const m = q.match(/[?&]wizard=([a-z0-9]+)/);
       if (!m) return 0;
       const v = m[1];
-      if (v === "2") return 2;
-      if (v === "3") return 3;
-      if (v === "1" || v === "fail" || v === "install") return 1;
+      if (v === "1" || v === "2" || v === "3" || v === "4" || v === "5") return Number(v);
+      if (v === "fail" || v === "install") return 4;
       return 0;
     } catch (e) {
       return 0;
+    }
+  }
+  var ONBOARDING_KEY = "ms_onboarding_v2_done";
+  function onboarded() {
+    try {
+      return window.localStorage.getItem(ONBOARDING_KEY) === "1";
+    } catch (e) {
+      return true;
+    }
+  }
+  function markOnboarded() {
+    try {
+      window.localStorage.setItem(ONBOARDING_KEY, "1");
+    } catch (e) {
     }
   }
   var NAV = [
@@ -5464,9 +5888,19 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const view = snap || (hostState && typeof hostState === "object" ? hostState : null);
     const setupReady = !view || !view.setup || view.setup.completed === true;
     useEffect(() => {
-      if (!setupReady) setWizard(true);
-      else if (wizardStartAt()) setWizard(true);
+      if (wizardStartAt() || !setupReady || !onboarded()) setWizard(true);
     }, [setupReady]);
+    const wizardStart = (() => {
+      const forced = wizardStartAt();
+      if (forced) return forced;
+      if (!setupReady && onboarded()) return 4;
+      return void 0;
+    })();
+    const closeWizard = () => {
+      markOnboarded();
+      setWizard(false);
+      refresh();
+    };
     const go = (k) => {
       if (k === "wizard") {
         setWizard(true);
@@ -5542,10 +5976,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           ] })
         ] })
       ] }),
-      wizard ? /* @__PURE__ */ jsx(SetupWizard, { api, startAt: wizardStartAt() || void 0, onDone: () => {
-        setWizard(false);
-        refresh();
-      } }) : null
+      wizard ? /* @__PURE__ */ jsx(Onboarding, { api, startAt: wizardStart, onDone: closeWizard, onSkip: closeWizard }) : null
     ] });
   }
 
