@@ -3490,11 +3490,9 @@ class MusicSynthPlugin(NekoPluginBase):
                    "sample": cues[:6]})
 
     # 2026-11-03 面板「设为当前模型」：只做用户显式点击的切换，复用 ms_set_active_model。
+    # 入口本体在文件末尾的 ms_set_active_model 上声明；这里再挂一个 @plugin_entry 会与它
+    # 抢同一个 id（后注册的覆盖前面的），所以只保留 @ui.action 作为按钮绑定。
     @ui.action(id="ms_set_active_model", label="设为当前模型", refresh_context=True)
-    @plugin_entry(id="ms_set_active_model", name="为她而唱 · 设为当前模型",
-                  description="把某个 .pt 设为当前变声模型（用户点按钮时才切换）",
-                  input_schema={"type": "object", "properties": {
-                      "ckpt": {"type": "string", "description": "model_*.pt 路径"}}})
     async def ms_set_active_model_action(self, ckpt: str = "", **_):
         return await self.ms_set_active_model(ckpt=ckpt)
 

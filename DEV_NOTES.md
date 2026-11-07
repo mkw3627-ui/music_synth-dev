@@ -335,3 +335,28 @@ v0.2.29 的发布检查已经不再报二进制，但换成两条新问题：
   处理：`vendor/proc-tap-1.1.1-4a0fbb7d05/` 与 `vendor/smtc_vendor/` 整个从仓库移除，
   原生组件统一走安装时 pip（`CAPTURE_NATIVE_PACKAGES`）。备份留在
   `D:\ruanjian\N.E.K.O\_vendor_backup_20261107\`（也在 git 历史里）。
+
+## 0.2.31：入口重复注册 + plugin.toml 字段合规
+
+发布检查里还剩两条警告，这次清掉：
+
+- `duplicate @plugin_entry id 'ms_set_active_model' in __init__.py:4960; first seen at __init__.py:3498`
+  —— 同一个 id 声明了两次：3494 行的包装方法 `ms_set_active_model_action`
+  和 4957 行的真正实现 `ms_set_active_model`。后注册覆盖前者，等于白写一个入口。
+  处理：删掉 3494 行的 `@plugin_entry`，**保留 `@ui.action`**（面板「设为当前模型」
+  按钮还绑着它，方法体也只是转调真正的实现）。两个方法都留在类里，功能没有任何删减。
+- `[plugin].entries is not a recognized plugin.toml field`
+  —— 当前官方校验器的 `[plugin]` 允许字段里已经没有 `entries`；入口由
+  `@plugin_entry` 装饰器在加载时注册，打包 CLI 会把它们写进 `plugin.meta.json`。
+  处理：删掉 plugin.toml 里 `# >>> STATIC ENTRIES` 之后的全部 `[[plugin.entries]]`
+  块（64 个）。宿主 `plugin/core/registry.py` 是从装饰器收集入口的，
+  `plugin.meta.json` 负责给面板提供参数 schema，所以功能不受影响。
+
+验证（在本机用 stub 的 `plugin.sdk` 真实 import 一次插件包）：
+- 修复前：75 处 `@plugin_entry` 声明、74 个唯一 id，`ms_set_active_model` 重复 2 次（3498 / 4960）。
+- 修复后：74 个唯一 id、0 重复，`ms_set_active_model` 只出现 1 次且绑定到实现方法；
+  3 个 `@llm_tool` 正常注册；所有 `@ui.action` 指向的入口 id 都存在。
+
+未动：`[music_synth]` 段里的旧运行配置（`sep_backend` / `precision` / `max_parallel` /
+`download_source` / `auto_setup`）。校验器对它的提示是「仍兼容，建议移到
+config.example.toml」，但移动会改变默认值来源，这次只记录不动。
