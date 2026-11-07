@@ -15,10 +15,12 @@ keeps only the newest three auto-recorded songs, and honours a pending anchor.
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -31,7 +33,16 @@ def _load_app_channels(workers: Path):
         spec = importlib.util.spec_from_file_location(
             "ms_app_channels", str(Path(workers) / "app_channels.py"))
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
+        # module_from_spec() does not register the module. CPython 3.11's
+        # dataclasses resolves deferred annotations through
+        # sys.modules[cls.__module__], so @dataclass in app_channels raises
+        # AttributeError when loaded this way in the frozen host.
+        sys.modules[spec.name] = module  # type: ignore[union-attr]
+        try:
+            spec.loader.exec_module(module)  # type: ignore[union-attr]
+        except Exception:
+            sys.modules.pop(spec.name, None)  # type: ignore[union-attr]
+            raise
         return module
     except Exception:  # noqa: BLE001
         return None
@@ -48,7 +59,10 @@ class SongListener:
         self._events = self._data / "events.jsonl"
         self._status_path = self._data / "status.json"
         self._stop_flag = self._data / "stop.flag"
+        self._manual_off = self._data / "manual_off.flag"
         self._worker_pid_path = self._data / "worker.pid"
+        self._perception_song = self._data / "perception_song.json"
+        self._perception_song_at = 0.0
         self._thread: threading.Thread | None = None
         self._running = False
         self._pid_created = ("", "")
@@ -129,7 +143,8 @@ class SongListener:
         return {**rows[0], "source": "self"}
 
     # ------------------------------------------------------------- lifecycle
-    def start(self, pid: int = 0, exe_name: str = "", target: dict | None = None) -> dict:
+    def start(self, pid: int = 0, exe_name: str = "", target: dict | None = None,
+              *, autostart: bool = False) -> dict:
         with self._lock:
             if self._running:
                 return {"ok": True, "already": True, **self.status()}
@@ -166,31 +181,64 @@ class SongListener:
                 runtime.safe_stop_pid(old, log=lambda *_: None)
             self._worker_pid_path.unlink(missing_ok=True)
             if not target or not target.get("created"):
-                return {"ok": False, "error": "没有可采集的音乐应用（先打开网易云/QQ音乐/Spotify）"}
+                if not autostart:
+                    return {"ok": False, "error": "没有可采集的音乐应用（先打开网易云/QQ音乐/Spotify）"}
+                # 插件启动时先进入等待；播放器晚点打开也能自动接上。
+                target = {}
             if target.get("tag") == "video":
                 return {"ok": False, "error": "当前选中的是视频应用；规则不允许录视频"}
             try:
                 self._stop_flag.unlink(missing_ok=True)
+                # A song id left over from a previous run would name the first
+                # recording of this run after an old track.
+                self._perception_song.unlink(missing_ok=True)
                 self._events.parent.mkdir(parents=True, exist_ok=True)
                 self._events.touch(exist_ok=True)
                 (self._data / "autostart.flag").write_text("1", encoding="utf-8")
             except OSError:
                 pass
             self._target = target
-            self._pid_created = (str(target["pid"]), str(target["created"]))
+            self._pid_created = (str(target.get("pid") or ""),
+                                 str(target.get("created") or ""))
             self._mode = "linked" if target.get("source") == "music_perception" else "standalone"
-            try:
-                (self._data / "last_target.json").write_text(
-                    json.dumps(target, ensure_ascii=False), encoding="utf-8")
-            except OSError:
-                pass
+            if target:
+                try:
+                    (self._data / "last_target.json").write_text(
+                        json.dumps(target, ensure_ascii=False), encoding="utf-8")
+                except OSError:
+                    pass
+            if not autostart:
+                # 用户主动开始：清除「手动关闭」记忆，下次启动继续自动听。
+                try:
+                    self._manual_off.unlink(missing_ok=True)
+                except OSError:
+                    pass
             self._last_error = ""
             self._running = True
             self._thread = threading.Thread(target=self._run, name="ms-song-listener", daemon=True)
             self._thread.start()
             return {"ok": True, "mode": self._mode, "target": target}
 
-    def stop(self) -> dict:
+    def cleanup_stale_worker(self) -> None:
+        """Kill a capture worker left over from a previous plugin process.
+
+        A plugin reload does not take child processes with it. When auto-start
+        is skipped (for example 为她所听 is listening), start() is never called,
+        so without this the old worker would keep capturing alongside it.
+        """
+        try:
+            old = int(self._worker_pid_path.read_text(encoding="utf-8").strip() or 0)
+        except (OSError, ValueError):
+            old = 0
+        if old > 0 and old != os.getpid():
+            runtime.safe_stop_pid(old, log=lambda *_: None)
+        self._worker_pid_path.unlink(missing_ok=True)
+        try:
+            (self._data / "worker_status.json").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def stop(self, manual: bool = True) -> dict:
         with self._lock:
             if not self._running:
                 return {"ok": True, "already": True}
@@ -198,6 +246,9 @@ class SongListener:
             try:
                 self._stop_flag.write_text("stop", encoding="utf-8")
                 (self._data / "autostart.flag").unlink(missing_ok=True)
+                # 只有用户主动关掉才记「不再自动开」；联动切换/让位不算。
+                if manual:
+                    self._manual_off.write_text("off", encoding="utf-8")
             except OSError:
                 pass
             thread = self._thread
@@ -246,6 +297,7 @@ class SongListener:
             "smtc_python": smtc.get("python", ""),
             "smtc_vendor": smtc.get("vendor", ""),
             "smtc_worker": str(workers / "media_session_worker.py"),
+            "perception_song_path": str(self._perception_song),
             "assume_music": str(target.get("tag") or "") == "music",
             "min_song_s": float(raw.get("song_min_s") or 20.0),
             "max_song_s": float(raw.get("song_max_s") or 900.0),
@@ -253,6 +305,35 @@ class SongListener:
             "silence_end_frames": 4,
             "smtc_every_frames": 2,
         }
+
+    def _write_perception_song(self) -> None:
+        """Publish her current song id so the worker cuts exactly where she did.
+
+        Linked mode must not guess boundaries a second time: 为她所听 already
+        owns the source and the boundary decision, so the worker only follows
+        its ``current_song_id`` and reuses its title/artist.
+        """
+        if self._mode != "linked":
+            return
+        now = time.monotonic()
+        if now - self._perception_song_at < 2.0:
+            return
+        self._perception_song_at = now
+        try:
+            status = asyncio.run(
+                self.plugin._perception_status(timeout=3.0, max_age=2.0))
+        except Exception:  # noqa: BLE001 - 她暂时不可达就沿用上一份
+            return
+        payload = {"song_id": str(status.get("song_id") or ""),
+                   "title": str(status.get("song_title") or ""),
+                   "artist": str(status.get("song_artist") or ""),
+                   "at": time.time()}
+        tmp = self._perception_song.with_suffix(".tmp.json")
+        try:
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self._perception_song)
+        except OSError:
+            pass
 
     def _run(self) -> None:
         seen = self._event_offset()
@@ -277,7 +358,7 @@ class SongListener:
                         int(target["pid"]), str(target.get("created") or "")))
                 except Exception:  # noqa: BLE001
                     alive = True
-            if not alive:
+            if not target or not alive:
                 target = self._resolve_target()
                 if not target:
                     self._write_status(state="waiting_for_source", error="")
@@ -313,10 +394,21 @@ class SongListener:
 
             self._write_status(state="recording", target=target, error="")
             while self._running and proc.poll() is None:
+                self._write_perception_song()
                 events, seen = self._consume_events(seen)
                 for event in events:
                     self.plugin._on_song_recorded(event)
                 time.sleep(1.0)
+            # The worker finalizes the in-progress song (WAV + event) only
+            # after it sees stop.flag. Wait for it instead of terminating it
+            # straight away, otherwise clicking 停止 silently discards a song.
+            if not self._running:
+                deadline = time.monotonic() + 15.0
+                while proc.poll() is None and time.monotonic() < deadline:
+                    events, seen = self._consume_events(seen)
+                    for event in events:
+                        self.plugin._on_song_recorded(event)
+                    time.sleep(0.5)
             # Drain whatever the worker finished while stopping.
             events, seen = self._consume_events(seen)
             for event in events:

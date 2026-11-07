@@ -19,7 +19,13 @@ class AceStepRuntimeConfig:
     compile_model: bool = False
     offload_to_cpu: bool = False
     offload_dit_to_cpu: bool = False
+    # 低显存兼容：DiT 每一层按需搬到 GPU，模型可以大于显存（很慢但能跑）。
+    layer_offload: bool = False
     quantization: Optional[str] = None
+    # 权重加载完成后再设的默认 dtype（"float16"）。老卡（Turing/Volta）需要
+    # 但它不能在加载前设：torch.set_default_dtype(float16) + 自定义模型加载
+    # 会在 safetensors 物化阶段原生崩溃（access violation，可复现）。
+    default_dtype: str = ""
     prefer_source: Optional[str] = None
     use_mlx_dit: bool = True
     output_dir: str = DEFAULT_OUTPUT_DIR
@@ -126,6 +132,16 @@ class AceStepLocalRuntime:
 
             if self.config.lora_path:
                 dit_handler.load_lora(self.config.lora_path)
+            if self.config.layer_offload:
+                # 必须放在 LoRA 之后：LoRA 会重建/替换部分层参数。
+                enable_layer_offload(dit_handler, self.config.device)
+            if self.config.default_dtype:
+                try:
+                    import torch
+                    torch.set_default_dtype(
+                        getattr(torch, str(self.config.default_dtype)))
+                except Exception:  # noqa: BLE001 - 设不上就按框架默认走
+                    pass
             self._dit_handler = dit_handler
             self._active_model = target_model
 
@@ -328,6 +344,80 @@ class AceStepLocalRuntime:
             return [float(item) for item in values]
         values = [float(item) for item in timesteps]
         return values or None
+
+
+def enable_layer_offload(handler, device: str = "cuda") -> None:
+    """Stream DiT transformer blocks instead of keeping the whole model on GPU.
+
+    ACE-Step's own offload still moves the entire DiT to the GPU for the
+    diffusion stage, so a model larger than VRAM cannot run there.  Holding
+    each transformer block in system RAM and moving one block at a time is
+    what makes such a model run at all — slower, because every block crosses
+    PCIe on every step, but it does not need the whole model in VRAM.
+
+    Everything that is not a DiT block (patch projection, rotary embedding,
+    condition encoder, tokenizer) stays resident, so it must still fit.
+    """
+    import contextlib
+
+    import torch
+
+    model = getattr(handler, "model", None)
+    if model is None:
+        raise RuntimeError("layer_offload：模型尚未加载")
+    decoder = getattr(model, "decoder", None)
+    blocks = list(getattr(decoder, "layers", []) or [])
+    if not blocks:
+        raise RuntimeError("layer_offload：找不到 DiT 的 transformer 层")
+    device = str(device or "")
+    if device in ("", "auto"):
+        device = str(getattr(handler, "device", "cuda") or "cuda")
+    if device.startswith("cpu") or not torch.cuda.is_available():
+        raise RuntimeError("layer_offload 需要可用的 CUDA 设备")
+
+    # 先整体回内存，再只把“非逐层”的部分搬上去，峰值不会超过整模型。
+    model.to("cpu")
+    prefix = "decoder.layers."
+    for name, param in model.named_parameters():
+        if not name.startswith(prefix):
+            param.data = param.data.to(device)
+    for name, buf in model.named_buffers():
+        if not name.startswith(prefix):
+            try:
+                buf.data = buf.data.to(device)
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+    latent = getattr(handler, "silence_latent", None)
+    if latent is not None:
+        handler.silence_latent = latent.to(device)
+
+    wrapped = 0
+    for block in blocks:
+        original = block.forward
+
+        def forward(*args, __orig=original, __block=block, **kwargs):
+            __block.to(device)
+            try:
+                return __orig(*args, **kwargs)
+            finally:
+                __block.to("cpu")
+
+        block.forward = forward
+        wrapped += 1
+
+    original_context = handler._load_model_context
+
+    @contextlib.contextmanager
+    def _model_context(name):
+        if name == "model":
+            # 不再整体搬运：每一层进出显存由上面的 forward 负责。
+            yield
+            return
+        with original_context(name):
+            yield
+
+    handler._load_model_context = _model_context
+    handler.layer_offload_blocks = wrapped
 
 
 def generate_with_acestep_local(

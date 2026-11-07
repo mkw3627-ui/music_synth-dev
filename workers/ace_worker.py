@@ -14,9 +14,30 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import traceback
 from pathlib import Path
+
+
+def _default_dtype(torch):
+    """Match the dtype ACE-Step will load the weights in.
+
+    临时张量（transformers 里的位置编码、mask 等）不写 dtype，用的是
+    ``torch.set_default_dtype``。默认 dtype 和权重 dtype 不一致，第一层
+    matmul 就会报 "expected scalar type" —— 这在 Turing（GTX 16/RTX 20）
+    上必然发生，因为那些卡没有 bf16 内核，ACE 会把权重装成 fp16。
+    """
+    try:
+        if torch.cuda.is_available():
+            major = int(torch.cuda.get_device_capability()[0])
+            if major >= 8:      # Ampere 及以后：bf16
+                return torch.bfloat16
+            if major >= 6:      # Turing/Pascal：只有 fp16
+                return torch.float16
+    except Exception:  # noqa: BLE001 - 探测失败就按 fp32 走（CPU 场景）
+        pass
+    return torch.float32
 
 
 def main() -> int:
@@ -31,13 +52,27 @@ def main() -> int:
         pylibs = Path(str(job.get("pylibs") or ""))
         if str(pylibs) and pylibs.is_dir():
             sys.path.insert(0, str(pylibs))
+
+        # 小显存卡：VAE 解码挪到内存，显存留给 DiT；分配器换可扩展段，
+        # 减少 4GB 卡上反复申请/释放造成的碎片（Windows 不支持该选项）。
+        if job.get("vae_on_cpu"):
+            os.environ.setdefault("ACESTEP_VAE_ON_CPU", "1")
+        if not sys.platform.startswith("win"):
+            os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
         import ace_runtime  # noqa: E402
 
-        # 新版 transformers 下部分模块会用默认 float32 建临时张量，和 bf16
-        # 权重相乘会报 dtype mismatch；统一默认 dtype 为 bf16。
+        post_dtype = ""
         try:
             import torch
-            torch.set_default_dtype(torch.bfloat16)
+            wanted = _default_dtype(torch)
+            if wanted is torch.float16:
+                # 老卡（Turing/Volta）权重是 fp16，默认 dtype 也得是 fp16，
+                # 但只能在权重加载完之后设——加载前设会让 safetensors 物化
+                # 阶段原生崩溃（access violation，实测必现）。
+                post_dtype = "float16"
+            else:
+                torch.set_default_dtype(wanted)
         except Exception:
             pass
 
@@ -84,6 +119,9 @@ def main() -> int:
             device=str(job.get("device") or "auto"),
             offload_to_cpu=bool(job.get("offload_to_cpu", True)),
             offload_dit_to_cpu=bool(job.get("offload_dit_to_cpu", True)),
+            layer_offload=bool(job.get("layer_offload", False)),
+            quantization=str(job.get("quantization") or "") or None,
+            default_dtype=post_dtype,
             output_dir=str(job["output_dir"]),
             lora_path=str(job.get("lora_path") or "") or None,
         )

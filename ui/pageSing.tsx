@@ -127,6 +127,9 @@ export function PageSing(props: { api: any; snap: any; onRefresh: () => void; on
   const live = listener.live || {}
   const captureRuntime = (s.capture && s.capture.runtime) || {}
   const listening = !!listener.running
+  const link: any = s.link || {}
+  const linkedMode = listener.mode === "linked" || Boolean(
+    link.running && link.monitor && link.source_control && link.selected && link.selected.name)
   const autoTracks = (s.tracks || []).filter((t: any) => t.auto_recorded)
 
   const startListen = () => run("listen", async () => {
@@ -237,20 +240,20 @@ export function PageSing(props: { api: any; snap: any; onRefresh: () => void; on
               只采集一个播放器的声道，通知声、视频和 AI 自己的声音不会混进来。整首录完先存着不翻唱，等你说「唱一下这首」或「上一首」。
             </div>
           </div>
-          <Pill tone={listener.mode === "linked" ? "success" : "neutral"}>
-            {listener.mode === "linked" ? "已联动为她所听" : "独立模式"}
+          <Pill tone={linkedMode ? "success" : "neutral"}>
+            {linkedMode ? "已联动为她所听" : "独立模式"}
           </Pill>
         </Row>
         <Row style={{ gap: 8, flexWrap: "wrap", marginTop: 12 }}>
-          <Btn style={listening ? undefined : PRIMARY_BTN} disabled={!!busy || listening} onClick={startListen}>
+          <Btn style={listening ? undefined : PRIMARY_BTN} disabled={!!busy || listening || linkedMode} onClick={startListen}>
             {busy === "listen" ? "正在开始…" : "开始听歌录制"}
           </Btn>
-          <Btn disabled={!!busy || !listening} onClick={stopListen}>
+          <Btn disabled={!!busy || !listening || linkedMode} onClick={stopListen}>
             {busy === "unlisten" ? "正在停止…" : "停止"}
           </Btn>
-          <Btn disabled={!!busy} onClick={checkNow}>{busy === "now" ? "读取中…" : "识别当前播放"}</Btn>
+          <Btn disabled={!!busy || linkedMode} onClick={checkNow}>{busy === "now" ? "读取中…" : "识别当前播放"}</Btn>
           {targets.length ? (
-            <Select value={targetPid} onChange={(e: any) => setTargetPid(e.target.value)} style={{ minWidth: 180 }}>
+            <Select value={targetPid} onChange={(e: any) => setTargetPid(e.target.value)} disabled={linkedMode} style={{ minWidth: 180 }}>
               <option value="">自动选（第一个音乐应用）</option>
               {targets.map((t: any) => (
                 <option key={String(t.pid)} value={String(t.pid)}>{(t.name || "应用") + " · PID " + t.pid}</option>
@@ -258,6 +261,11 @@ export function PageSing(props: { api: any; snap: any; onRefresh: () => void; on
             </Select>
           ) : null}
         </Row>
+        {linkedMode ? (
+          <div style={{ marginTop: 10, fontSize: 12.5, color: INK_2, lineHeight: 1.8 }}>
+            已联动为她所听：音源、开始和停止都由她管理，这里不需要操作；她开始监听后会自动录制。
+          </div>
+        ) : null}
         <div style={{ marginTop: 10, fontSize: 12.5, color: INK_2, lineHeight: 1.8 }}>
           {listening
             ? (String(live.state || "") === "recording"

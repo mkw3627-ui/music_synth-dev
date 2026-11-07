@@ -24,7 +24,7 @@ const ENDED = ["finished", "failed", "stopped"]
 const ACTIVE_PHASES = ["training", "preparing", "preprocessing", "previewing"]
 
 /** 训练页的「上次看到哪」：模块级，跨页面切换不丢 */
-const TRAIN_UI = { step: 1, maxStep: 1, runId: "", name: "" }
+const TRAIN_UI = { step: 1, maxStep: 1, runId: "", name: "", autoJumped: "" }
 
 export function PageTrain(props: { api: any; snap: any; onRefresh: () => void; onGo: (page: string) => void }) {
   const { api, snap } = props
@@ -184,6 +184,23 @@ export function PageTrain(props: { api: any; snap: any; onRefresh: () => void; o
     const id = setInterval(() => loadStatus(runId), 4000)
     return () => clearInterval(id)
   }, [runId])
+
+  // 翻唱 + 原创都练完之后自动跳到「我的声音」：停在训练页的话，用户根本看不出已经练完了。
+  // 隔 2.5 秒再跳，留出时间看到最后一行状态；同一条 run 只跳一次，免得回来看一眼又被弹走。
+  const chainDone = !chain || chain.done === true || String(chain.state || "") === "done"
+  const chainState = chain ? String(chain.state || "") : ""
+  const aceDone = String((aceJob && aceJob.state) || "") === "done"
+  const allTrained = (phase === "finished" && chainDone) || (!status && !chain && aceDone)
+  const jumpKey = (runId || aceJid || "") + "|" + phase + "|" + chainState + "|" + (aceDone ? "ace" : "")
+  useEffect(() => {
+    if (step !== 3 || !allTrained) return
+    if (TRAIN_UI.autoJumped === jumpKey) return
+    const t = setTimeout(() => {
+      TRAIN_UI.autoJumped = jumpKey
+      if (props.onGo) props.onGo("models")
+    }, 2500)
+    return () => clearTimeout(t)
+  }, [step, allTrained, jumpKey])
 
   // 切页/刷新后从 ms_state 的 jobs 里找回正在跑的原创训练
   useEffect(() => {

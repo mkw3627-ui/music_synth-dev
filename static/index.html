@@ -2124,7 +2124,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
   var STEP_NAMES = ["放素材", "训练设置", "看着她唱", "保存声音"];
   var ENDED = ["finished", "failed", "stopped"];
   var ACTIVE_PHASES = ["training", "preparing", "preprocessing", "previewing"];
-  var TRAIN_UI = { step: 1, maxStep: 1, runId: "", name: "" };
+  var TRAIN_UI = { step: 1, maxStep: 1, runId: "", name: "", autoJumped: "" };
   function PageTrain(props) {
     const { api, snap } = props;
     const c = useCorpus(api);
@@ -2268,6 +2268,22 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       const id = setInterval(() => loadStatus(runId), 4e3);
       return () => clearInterval(id);
     }, [runId]);
+    const chainDone = !chain || chain.done === true || String(chain.state || "") === "done";
+    const chainState = chain ? String(chain.state || "") : "";
+    const aceDone = String(aceJob && aceJob.state || "") === "done";
+    const allTrained = phase === "finished" && chainDone || !status && !chain && aceDone;
+    const jumpKey = (runId || aceJid || "") + "|" + phase + "|" + chainState + "|" + (aceDone ? "ace" : "");
+    // 翻唱 + 原创都练完之后自动跳到「我的声音」：停在训练页的话，用户根本看不出已经练完了。
+    // 隔 2.5 秒再跳，留出时间看到最后一行状态；同一条 run 只跳一次，免得回来看一眼又被弹走。
+    useEffect(() => {
+      if (step !== 3 || !allTrained) return;
+      if (TRAIN_UI.autoJumped === jumpKey) return;
+      const t = setTimeout(() => {
+        TRAIN_UI.autoJumped = jumpKey;
+        if (props.onGo) props.onGo("models");
+      }, 2500);
+      return () => clearTimeout(t);
+    }, [step, allTrained, jumpKey]);
     useEffect(() => {
       if (aceJobId) return;
       const jobs = props.snap && props.snap.jobs || {};
@@ -3591,6 +3607,9 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const live = listener.live || {};
     const captureRuntime = s.capture && s.capture.runtime || {};
     const listening = !!listener.running;
+    const link = s.link || {};
+    const linkedMode = listener.mode === "linked" || Boolean(
+      link.running && link.monitor && link.source_control && link.selected && link.selected.name);
     const autoTracks = (s.tracks || []).filter((t) => t.auto_recorded);
     const startListen = () => run("listen", async () => {
       const args = targetPid ? { pid: Number(targetPid) } : {};
@@ -3679,17 +3698,18 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
             /* @__PURE__ */ jsx("div", { style: { fontSize: 15.5, fontWeight: 700, color: INK }, children: "听歌录制（只录选中的应用）" }),
             /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK_2, lineHeight: 1.8 }, children: "只采集一个播放器的声道，通知声、视频和 AI 自己的声音不会混进来。整首录完先存着不翻唱，等你说「唱一下这首」或「上一首」。" })
           ] }),
-          /* @__PURE__ */ jsx(Pill, { tone: listener.mode === "linked" ? "success" : "neutral", children: listener.mode === "linked" ? "已联动为她所听" : "独立模式" })
+          /* @__PURE__ */ jsx(Pill, { tone: linkedMode ? "success" : "neutral", children: linkedMode ? "已联动为她所听" : "独立模式" })
         ] }),
         /* @__PURE__ */ jsxs(Row, { style: { gap: 8, flexWrap: "wrap", marginTop: 12 }, children: [
-          /* @__PURE__ */ jsx(Btn, { style: listening ? void 0 : PRIMARY_BTN, disabled: !!busy || listening, onClick: startListen, children: busy === "listen" ? "正在开始…" : "开始听歌录制" }),
-          /* @__PURE__ */ jsx(Btn, { disabled: !!busy || !listening, onClick: stopListen, children: busy === "unlisten" ? "正在停止…" : "停止" }),
-          /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: checkNow, children: busy === "now" ? "读取中…" : "识别当前播放" }),
-          targets.length ? /* @__PURE__ */ jsxs(Select, { value: targetPid, onChange: (e) => setTargetPid(e.target.value), style: { minWidth: 180 }, children: [
+          /* @__PURE__ */ jsx(Btn, { style: listening ? void 0 : PRIMARY_BTN, disabled: !!busy || listening || linkedMode, onClick: startListen, children: busy === "listen" ? "正在开始…" : "开始听歌录制" }),
+          /* @__PURE__ */ jsx(Btn, { disabled: !!busy || !listening || linkedMode, onClick: stopListen, children: busy === "unlisten" ? "正在停止…" : "停止" }),
+          /* @__PURE__ */ jsx(Btn, { disabled: !!busy || linkedMode, onClick: checkNow, children: busy === "now" ? "读取中…" : "识别当前播放" }),
+          targets.length ? /* @__PURE__ */ jsxs(Select, { value: targetPid, onChange: (e) => setTargetPid(e.target.value), disabled: linkedMode, style: { minWidth: 180 }, children: [
             /* @__PURE__ */ jsx("option", { value: "", children: "自动选（第一个音乐应用）" }),
             targets.map((t) => /* @__PURE__ */ jsx("option", { value: String(t.pid), children: (t.name || "应用") + " · PID " + t.pid }, String(t.pid)))
           ] }) : null
         ] }),
+        linkedMode ? /* @__PURE__ */ jsx("div", { style: { marginTop: 10, fontSize: 12.5, color: INK_2, lineHeight: 1.8 }, children: "已联动为她所听：音源、开始和停止都由她管理，这里不需要操作；她开始监听后会自动录制。" }) : null,
         /* @__PURE__ */ jsx("div", { style: { marginTop: 10, fontSize: 12.5, color: INK_2, lineHeight: 1.8 }, children: listening ? String(live.state || "") === "recording" ? "正在录：" + (live.title || "（等识别歌名）") + (live.artist ? " · " + live.artist : "") + " · " + Math.round(Number(live.seconds || 0)) + " 秒" : String(live.state || "") === "waiting_for_source" ? "等待音乐应用开始播放…" : "已启动，正在等待第一首…" : "没在听。开始后，只有正在播放的歌曲会被录下来。" }),
         listener.error ? /* @__PURE__ */ jsx("div", { style: { marginTop: 6, fontSize: 12, color: "#b9750f" }, children: listener.error }) : null,
         !captureRuntime.ok ? /* @__PURE__ */ jsxs(Row, { style: { marginTop: 10, gap: 8, flexWrap: "wrap" }, children: [
@@ -4121,6 +4141,9 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const modelChoices = catalog.length ? catalog.map((m) => m.name) : status && Array.isArray(status.model_choices) && status.model_choices.length ? status.model_choices : status && status.model ? [status.model] : ["acestep-v15-turbo"];
     const MODEL_HINT = {
       "acestep-v15-turbo": "2B · 8 步 · 快",
+      "acestep-v15-turbo-shift1": "2B · 8 步 · shift=1",
+      "acestep-v15-turbo-shift3": "2B · 8 步 · shift=3",
+      "acestep-v15-turbo-continuous": "2B · 8 步 · 连续 shift",
       "acestep-v15-xl-turbo": "4B · 8 步 · 音质更高",
       "acestep-v15-xl-sft": "4B · 50 步 · 最高质量，慢",
       "acestep-v15-xl-base": "4B · 50 步 · 全能编辑",
@@ -4217,7 +4240,13 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
                 /* @__PURE__ */ jsxs(Muted, { children: ["这个模型还没下载", modelMeta(model) && modelMeta(model).download_gb ? "（约 " + modelMeta(model).download_gb + "GB）" : ""] }),
                 /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: downloadModel, children: busy === "download" ? "启动下载…" : "下载这个模型" })
               ] }) : null,
-              status && status.model_recommended ? /* @__PURE__ */ jsxs(Muted, { style: { fontSize: 12 }, children: ["这台电脑推荐：", status.model_recommended] }) : null
+              status && status.model_recommended ? /* @__PURE__ */ jsxs(Muted, { style: { fontSize: 12 }, children: ["这台电脑推荐：", status.model_recommended] }) : null,
+              status && status.gpu && status.gpu.cuda_ok === false ? /* @__PURE__ */ jsx(Alert, { tone: "warning", children: ["显卡不兼容：", (status.gpu.notes || []).join("；"), "。原创生成会退回 CPU（很慢）。"] }) : null,
+              status && status.gpu && status.gpu.cuda_ok ? /* @__PURE__ */ jsxs(Muted, { style: { fontSize: 12, lineHeight: 1.7 }, children: [
+                status.gpu.name || "GPU", " · ", String(status.gpu.vram_total_gib || "?"), "GB · sm_", status.gpu.compute_cap || "?", " · ", status.gpu.dtype || "?", " 精度",
+                Array.isArray(status.gpu.quantization) && status.gpu.quantization.length ? " · 可用量化：" + status.gpu.quantization.join(" / ") : " · 不支持量化",
+                Number(status.gpu.vram_total_gib || 0) <= 6 ? " · 小显存：自动 int8 量化 + VAE 放内存解码" : ""
+              ] }) : null
             ] }),
             /* @__PURE__ */ jsxs(Panel, { title: "声音与后处理", children: [
               /* @__PURE__ */ jsx(Field, { label: "ACE 音色", children: /* @__PURE__ */ jsxs(Select, { value: lora, onChange: (e2) => pickLora(e2.target.value), children: [
@@ -4389,6 +4418,13 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const plan = s.plan || {};
     const eng = s.engine || {};
     const paths = s.paths || {};
+    const link = s.link || {};
+    const linkOn = Boolean(link.running && link.source_control);
+    const linkColor = linkOn ? "#16a34a" : link.running ? "#d97706" : "#94a3b8";
+    const linkHalo = linkOn ? "rgba(22,163,74,0.16)" : link.running ? "rgba(217,119,6,0.16)" : "rgba(148,163,184,0.16)";
+    const linkText = linkOn ? "已连接" : link.running ? "运行中 · 音源中控不可用" : "未连接";
+    const linkSource = link.selected && link.selected.name ? link.selected.name : "未选择";
+    const linkStateText = !link.listener_running ? (link.running ? "已让位" : "未启动") : link.listener_state === "recording" ? "正在录制" : link.listener_state === "waiting_for_source" ? "等待音乐应用" : link.listener_mode === "linked" ? "联动待命" : "独立待命";
     const [hw, setHw] = useState(s.hardware || null);
     const [busy, setBusy] = useState("");
     const [notice, setNotice] = useState(null);
@@ -4782,8 +4818,46 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const envItems = env && Array.isArray(env.items) ? env.items : [];
     const envMissing = envItems.filter((it) => !it.ok);
     const soulxReady = Boolean(soulx && soulx.ready);
+    const linkFeature = (text) => /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 8, alignItems: "flex-start" }, children: [
+      /* @__PURE__ */ jsx("span", { style: { width: 6, height: 6, borderRadius: 6, background: linkColor, marginTop: 7, flex: "0 0 auto" } }),
+      /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK_2, lineHeight: 1.7 }, children: text })
+    ] });
     return /* @__PURE__ */ jsxs(Col, { style: { gap: 24 }, children: [
       notice ? /* @__PURE__ */ jsx(Alert, { tone: notice.tone === "error" ? "warning" : "info", children: notice.text }) : null,
+      /* @__PURE__ */ jsxs(Section, { title: "和她所听联动", extra: /* @__PURE__ */ jsxs(Row, { style: { gap: 8 }, children: [
+        /* @__PURE__ */ jsx("span", { style: { width: 9, height: 9, borderRadius: 9, background: linkColor, boxShadow: "0 0 0 4px " + linkHalo, display: "inline-block" } }),
+        /* @__PURE__ */ jsx(Muted, { children: linkText })
+      ] }), children: [
+        /* @__PURE__ */ jsxs(Col, { style: { gap: 14 }, children: [
+          /* @__PURE__ */ jsx("div", { style: { fontSize: 13, color: INK_2, lineHeight: 1.8 }, children: "联动后，本插件直接用「为她所听」选中的那个应用当录制音源，歌名/歌手也优先采用它的识别结果；她没开时自动退回独立模式（本插件自己扫进程 + Windows 媒体会话）。" }),
+          /* @__PURE__ */ jsxs(Grid, { cols: 3, min: 200, gap: 12, children: [
+            /* @__PURE__ */ jsxs("div", { style: { padding: 14, borderRadius: 14, background: "rgba(248,250,252,0.95)", border: "1px solid " + LINE }, children: [
+              /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_2 }, children: "当前音源" }),
+              /* @__PURE__ */ jsx("div", { style: { fontSize: 13.5, fontWeight: 700, color: INK, marginTop: 4 }, children: linkSource }),
+              /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_2, marginTop: 3 }, children: link.capture_mode === "application" ? "逐进程应用声道" : (link.capture_mode || "未连接") })
+            ] }),
+            /* @__PURE__ */ jsxs("div", { style: { padding: 14, borderRadius: 14, background: "rgba(248,250,252,0.95)", border: "1px solid " + LINE }, children: [
+              /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_2 }, children: "本插件监听" }),
+              /* @__PURE__ */ jsx("div", { style: { fontSize: 13.5, fontWeight: 700, color: INK, marginTop: 4 }, children: linkStateText }),
+              /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_2, marginTop: 3 }, children: "她监听时自动让位；点停止后不再自动开" })
+            ] }),
+            /* @__PURE__ */ jsxs("div", { style: { padding: 14, borderRadius: 14, background: "rgba(248,250,252,0.95)", border: "1px solid " + LINE }, children: [
+              /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_2 }, children: "AI 读取音乐信息" }),
+              /* @__PURE__ */ jsx("div", { style: { fontSize: 13.5, fontWeight: 700, color: INK, marginTop: 4 }, children: link.ai_delivery ? "已授权" : "未授权" }),
+              /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_2, marginTop: 3 }, children: link.ai_delivery ? "歌名/歌手可由她所听校准" : "在为她所听里开启「AI 读取」" })
+            ] })
+          ] }),
+          /* @__PURE__ */ jsxs(Col, { style: { gap: 6 }, children: [
+            linkFeature("音源跟着她走：不用在本插件重复选应用，她在为她所听里切到哪个，这边就采哪个"),
+            linkFeature("识歌更准：歌名/歌手优先采用她所听的识别结果，再回退到 Windows 媒体会话"),
+            linkFeature("隔离不变：就算联动，也只录那一个应用的进程树，AI 自己的声音和其他应用不会混进来"),
+            linkFeature("互斥保护：她正在监听时本插件自动让位，两边不会同时采集回环"),
+            linkFeature("自动退回：她没运行或没授权时，自动用本插件自己的进程扫描，录制照常")
+          ] }),
+          link.reason ? /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: "#b45309" }, children: "提示：" + link.reason }) : null,
+          /* @__PURE__ */ jsx(Row, { style: { gap: 10 }, children: /* @__PURE__ */ jsx(Btn, { onClick: onRefresh, children: "刷新联动状态" }) })
+        ] })
+      ] }),
       /* @__PURE__ */ jsxs(Section, { title: "电脑状态", extra: /* @__PURE__ */ jsx(Pill, { tone: tw.tone, children: tw.text }), children: [
         snap ? /* @__PURE__ */ jsxs(Col, { style: { gap: 14 }, children: [
           /* @__PURE__ */ jsxs(Grid, { cols: 3, min: 220, gap: 14, children: [

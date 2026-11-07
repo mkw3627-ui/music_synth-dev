@@ -45,11 +45,13 @@ MIN_TOTAL_SEC = 60.0        # 总时长 <60s 拒绝
 WARN_TOTAL_SEC = 180.0      # 总时长 <180s 警告（不拒绝）
 CLIP_MIN_SEC = 2.0
 CLIP_MAX_SEC = 15.0
-# 经验值：素材时长上限对应的自动训练步数上限（<3 分钟 8000 步，<10 分钟 16000 步）
+# 经验值：素材时长上限对应的自动训练步数上限（<3 分钟 8000 步，<10 分钟 16000 步，
+# ≥10 分钟 32000 步）。每一档都必须给出上限：cap 留成 None 会让 while 去和 None 比大小。
 AUTO_STEP_CAP_SHORT_SEC = 180.0
 AUTO_STEP_CAP_SHORT = 8000
 AUTO_STEP_CAP_MID_SEC = 600.0
 AUTO_STEP_CAP_MID = 16000
+AUTO_STEP_CAP_LONG = 32000
 # 全自动防过拟合判定（经验值）：连续 2 个里程碑比最佳 val_loss 差 3% 以上 → 停；
 # 连续 2 个里程碑相对最佳改善都不足 2% → 停。
 AUTO_WORSE_RATIO = 0.03
@@ -465,7 +467,15 @@ def _auto_params(state: dict, job: dict, python: Path) -> dict:
 
     milestones = job.get("milestones")
     if isinstance(milestones, (list, tuple)):
-        milestones = sorted({int(m) for m in milestones if int(m) > 0})
+        clean: list[int] = []
+        for m in milestones:
+            try:
+                v = int(m)
+            except (TypeError, ValueError):
+                continue          # job 里可能带 null / 空串，跳过而不是让整次训练崩掉
+            if v > 0:
+                clean.append(v)
+        milestones = sorted(set(clean))
     else:
         milestones = list(MILESTONES_DEFAULT)
     if not milestones:
@@ -480,6 +490,10 @@ def _auto_params(state: dict, job: dict, python: Path) -> dict:
             cap, cap_rule = AUTO_STEP_CAP_SHORT, f"素材 <{AUTO_STEP_CAP_SHORT_SEC:.0f}s"
         elif total_sec < AUTO_STEP_CAP_MID_SEC:
             cap, cap_rule = AUTO_STEP_CAP_MID, f"素材 <{AUTO_STEP_CAP_MID_SEC:.0f}s"
+        else:
+            cap, cap_rule = AUTO_STEP_CAP_LONG, f"素材 ≥{AUTO_STEP_CAP_MID_SEC:.0f}s"
+        if not cap:               # 防御：分支漏配也不让训练以 TypeError 崩掉
+            cap, cap_rule = AUTO_STEP_CAP_MID, "默认上限"
         step = max(milestones[-1], milestones[0] or 1000)
         while step < cap:
             step = min(step * 2, cap)

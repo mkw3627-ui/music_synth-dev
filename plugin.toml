@@ -209,6 +209,18 @@ description = "停止当前正在播放的成品"
 input_schema = { type = "object", properties = {} }
 
 [[plugin.entries]]
+id = "ms_lips_status"
+name = "为她而唱 · 口型状态"
+description = "逐字口型服务状态；带 track_id 时检查/重建该曲目的口型轨（rebuild=true 强制重建）"
+input_schema = { type = "object", properties = { track_id = { type = "string" }, rebuild = { type = "boolean" } } }
+
+[[plugin.entries]]
+id = "ms_lips_preview"
+name = "为她而唱 · 口型试音"
+description = "不出声，只让角色按一段歌词对口型（text 留空用默认四句，seconds 为时长）"
+input_schema = { type = "object", properties = { text = { type = "string" }, seconds = { type = "number" } } }
+
+[[plugin.entries]]
 id = "ms_sing"
 name = "为她而唱 · 唱出来"
 description = "AI 调用：按歌名/id 找到成品并用系统播放器播放"
@@ -368,7 +380,7 @@ input_schema = { type = "object", properties = { model = { type = "string", desc
 id = "ms_ace_generate"
 name = "为她而唱 · 原创歌曲"
 description = "用 ACE-Step text2music 按风格描述+歌词生成整首歌；可选 auto_sing 直接走现有变声链路"
-input_schema = { type = "object", properties = { prompt = { type = "string" }, lyrics = { type = "string" }, name = { type = "string" }, duration = { type = "integer" }, bpm = { type = "integer" }, language = { type = "string", enum = ["auto", "zh", "ja", "en", "ko", "unknown"] }, instrumental = { type = "boolean" }, auto_sing = { type = "boolean" }, post_sing = { type = "boolean", description = "兼容旧面板：等于 post_engine=ddsp" }, post_engine = { type = "string", enum = ["", "ddsp", "soulx", "soulx_ddsp"], description = "干声后处理引擎：空=不处理，ddsp=翻唱声音，soulx=SoulX-Singer SVC，soulx_ddsp=SoulX 后接 DDSP（保气音）" }, model = { type = "string", description = "DiT 模型名；留空=用设置里的当前模型（turbo 8 步，XL/sft/base 50 步）" }, inference_steps = { type = "integer", minimum = 0, maximum = 60, description = "0=按模型自动（turbo 8，sft/base 50）" }, guidance_scale = { type = "number" }, seed = { type = "integer" }, lora = { type = "string" } } }
+input_schema = { type = "object", properties = { prompt = { type = "string" }, lyrics = { type = "string" }, name = { type = "string" }, duration = { type = "integer" }, bpm = { type = "integer" }, language = { type = "string", enum = ["auto", "zh", "ja", "en", "ko", "unknown"] }, instrumental = { type = "boolean" }, auto_sing = { type = "boolean" }, post_sing = { type = "boolean", description = "兼容旧面板：等于 post_engine=ddsp" }, post_engine = { type = "string", enum = ["", "ddsp", "soulx", "soulx_ddsp"], description = "干声后处理引擎：空=不处理，ddsp=翻唱声音，soulx=SoulX-Singer SVC，soulx_ddsp=SoulX 后接 DDSP（保气音）" }, model = { type = "string", description = "DiT 模型名；留空=用设置里的当前模型（turbo 8 步，XL/sft/base 50 步）" }, inference_steps = { type = "integer", minimum = 0, maximum = 60, description = "0=按模型自动（turbo 8，sft/base 50）" }, guidance_scale = { type = "number" }, seed = { type = "integer" }, candidates = { type = "integer", minimum = 1, maximum = 6, description = "一次生成几个候选；小显存自动降到 1" }, quantization = { type = "string", enum = ["auto", "off", "int8_weight_only", "fp8_weight_only"], description = "量化策略：auto=按显存自动，off=不量化，int8=权重量化（显存减半）" }, lora = { type = "string" } } }
 
 [[plugin.entries]]
 id = "ms_ace_job"

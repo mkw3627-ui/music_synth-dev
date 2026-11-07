@@ -212,6 +212,9 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
       : (status && status.model ? [status.model] : ["acestep-v15-turbo"])
   const MODEL_HINT: any = {
     "acestep-v15-turbo": "2B · 8 步 · 快",
+    "acestep-v15-turbo-shift1": "2B · 8 步 · shift=1",
+    "acestep-v15-turbo-shift3": "2B · 8 步 · shift=3",
+    "acestep-v15-turbo-continuous": "2B · 8 步 · 连续 shift",
     "acestep-v15-xl-turbo": "4B · 8 步 · 音质更高",
     "acestep-v15-xl-sft": "4B · 50 步 · 最高质量，慢",
     "acestep-v15-xl-base": "4B · 50 步 · 全能编辑",
@@ -352,6 +355,20 @@ export function PageCreate(props: { api: any; snap: any; onRefresh: () => void; 
           })()}
           {status && status.model_recommended ? (
             <Muted>这台电脑推荐：{status.model_recommended}（按显存自动判断）</Muted>
+          ) : null}
+          {status && status.gpu && status.gpu.cuda_ok === false ? (
+            <Alert tone="warning">
+              显卡不兼容：{(status.gpu.notes || []).join("；")}。原创生成会退回 CPU（很慢）。
+            </Alert>
+          ) : null}
+          {status && status.gpu && status.gpu.cuda_ok ? (
+            <Muted style={{ lineHeight: 1.7 }}>
+              {status.gpu.name || "GPU"} · {status.gpu.vram_total_gib}GB · sm_{status.gpu.compute_cap} · {status.gpu.dtype} 精度
+              {Array.isArray(status.gpu.quantization) && status.gpu.quantization.length
+                ? " · 可用量化：" + status.gpu.quantization.join(" / ")
+                : " · 不支持量化"}
+              {Number(status.gpu.vram_total_gib || 0) <= 6 ? " · 小显存：自动 int8 量化 + VAE 放内存解码" : ""}
+            </Muted>
           ) : null}
           {!modelReady ? (
             <Row style={{ flexWrap: "wrap", gap: 10, alignItems: "center" }}>

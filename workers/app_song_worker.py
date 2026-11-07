@@ -21,6 +21,8 @@ import time
 import traceback
 from pathlib import Path
 
+from song_titles import parse_player_window_title
+
 _HEADER = struct.Struct("!cI")
 _MAX_PACKET = 2_000_000
 _SOFT_CLIP_KNEE = 0.95
@@ -28,6 +30,70 @@ _SOFT_CLIP_KNEE = 0.95
 
 def _now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _read_json(path) -> dict:
+    if not path:
+        return {}
+    try:
+        data = json.loads(Path(str(path)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+_TITLE_CACHE = {"at": 0.0, "pid": 0, "title": ""}
+
+
+def _window_title(pid: int, *, ttl: float = 3.0) -> str:
+    """Title-bar text of the captured process; read-only, best effort.
+
+    Windows never maps a media session to a PID, so for a known player this
+    title is the only per-process song evidence. It is a hint, not proof.
+    """
+    if sys.platform != "win32" or pid <= 0:
+        return ""
+    now = time.monotonic()
+    if _TITLE_CACHE["pid"] == pid and now - _TITLE_CACHE["at"] < ttl:
+        return _TITLE_CACHE["title"]
+    title = ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        found = []
+
+        EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND,
+                                      wintypes.LPARAM)
+
+        def _collect(hwnd, _param):
+            if found:
+                return False
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length <= 0 or length > 1024:
+                    return True
+                buf = ctypes.create_unicode_buffer(260)
+                if not user32.GetWindowTextW(hwnd, buf, 260):
+                    return True
+                owner = wintypes.DWORD(0)
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+                if int(owner.value) == pid:
+                    found.append(buf.value.strip())
+                    return False
+            except (OSError, ValueError, AttributeError):
+                return True
+            return True
+
+        user32.EnumWindows(EnumProc(_collect), 0)
+        title = found[0] if found else ""
+    except (OSError, AttributeError, ValueError):
+        title = ""
+    _TITLE_CACHE.update({"at": now, "pid": pid, "title": title})
+    return title
+
 
 
 def _read_exact(pipe, size: int) -> bytes:
@@ -157,6 +223,34 @@ def _music_session(job: dict, smtc: dict) -> dict | None:
     return rows[0]
 
 
+BROWSER_EXES = {"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+                "opera.exe", "vivaldi.exe", "chromium.exe"}
+
+
+def _target_session(job: dict, smtc: dict) -> dict | None:
+    """SMTC session of the captured app, whether playing or paused.
+
+    Chromium reports ``playback_type=unknown`` for web media, and paused
+    sessions are absent from ``sessions`` (that list is playing-only). The
+    top-level result still carries the current paused session, so it is used
+    as a candidate here.
+    """
+    rows = [row for row in (smtc.get("sessions") or []) if isinstance(row, dict)]
+    if (smtc.get("available") and (smtc.get("app") or smtc.get("title"))
+            and not any(row.get("app") == smtc.get("app") for row in rows)):
+        rows.append({key: smtc.get(key) for key in
+                     ("app", "title", "artist", "album", "playing",
+                      "playback_type", "position_s", "duration_s")})
+    wants = str(job.get("exe_name") or "").strip().casefold()
+    stem = wants[:-4] if wants.endswith(".exe") else wants
+    if stem:
+        for row in rows:
+            if stem and stem in str(row.get("app") or "").casefold():
+                return row
+    return rows[0] if rows else None
+
+
+
 def main() -> int:
     job = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     out_path = Path(sys.argv[2])
@@ -179,7 +273,7 @@ def main() -> int:
 
     state = {"state": "waiting", "title": "", "artist": "", "started_at": "",
              "seconds": 0.0, "frames": 0, "songs": 0, "error": "",
-             "pid": int(job["pid"]), "mode": "app_channel"}
+             "paused": False, "pid": int(job["pid"]), "mode": "app_channel"}
     try:
         min_s = max(5.0, float(job.get("min_song_s") or 20.0))
         max_s = max(30.0, float(job.get("max_song_s") or 900.0))
@@ -187,6 +281,12 @@ def main() -> int:
         silence_end = max(1, int(job.get("silence_end_frames") or 4))
         smtc_every = max(1, int(job.get("smtc_every_frames") or 2))
         sample_rate = 48000
+        # 播放/暂停：逐进程采集在播放器暂停时会持续送全零帧，所以全零是最
+        # 可靠的暂停证据；正常歌曲的弱奏不会全零，不会误判。
+        audible_level = 5e-4
+        digital_zero = 1e-6
+        pause_frames = 4          # 4 帧 × 2 秒 = 8 秒全零 → 判定暂停
+        max_pause_s = 900.0       # 暂停超过 15 分钟就收尾，避免文件一直开着
         rolling = []
         current_sf = None
         current_tmp: Path | None = None
@@ -197,6 +297,11 @@ def main() -> int:
         frame_index = 0
         last_status = 0.0
         song_seq = 0
+        last_linked_id = ""
+        paused = False
+        silent_frames = 0
+        paused_since = 0.0
+        paused_meta = None
         stopped = False
 
         def write_status(force: bool = False) -> None:
@@ -206,15 +311,18 @@ def main() -> int:
                 return
             last_status = now
             if current_sf is not None:
-                state.update({"state": "recording",
+                state.update({"state": "paused" if paused else "recording",
+                              "paused": bool(paused),
                               "title": current_meta["title"], "artist": current_meta["artist"],
                               "started_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(current_started)),
                               "seconds": round(current_frames / sample_rate, 1)})
+            else:
+                state["paused"] = False
             tmp = status_path.with_suffix(".tmp")
             tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
             os.replace(tmp, status_path)
 
-        def open_song(meta: dict, with_preroll: bool) -> None:
+        def open_song(meta: dict, with_preroll: bool = True) -> None:
             nonlocal current_sf, current_tmp, current_meta, current_frames, current_started, song_seq
             song_seq += 1
             current_meta = dict(meta)
@@ -227,11 +335,25 @@ def main() -> int:
                 for frame in rolling:
                     current_sf.write(frame)
                     current_frames += len(frame)
+            # 预卷已经归属这一首；不清空会在下一帧被重复写入。
+            rolling.clear()
 
-        def finish_song(reason: str = "") -> None:
+        def flush_pending() -> None:
+            """把还没落盘的最近几帧写进当前歌（正常收尾时用）。"""
+            nonlocal current_frames
+            if current_sf is None:
+                return
+            while rolling:
+                frame = rolling.pop(0)
+                current_sf.write(frame)
+                current_frames += len(frame)
+
+        def finish_song(reason: str = "", *, keep_pending: bool = False) -> None:
             nonlocal current_sf, current_tmp, current_frames, song_seq
             if current_sf is None:
                 return
+            if not keep_pending:
+                flush_pending()
             try:
                 current_sf.close()
             except Exception:  # noqa: BLE001
@@ -309,34 +431,143 @@ def main() -> int:
                 continue
             frame = np.frombuffer(payload, dtype="<f4").reshape(-1, 2).copy()
             frame_index += 1
-            rolling.append(frame)
-            if len(rolling) > preroll_frames:
-                rolling.pop(0)
-            if current_sf is not None:
-                current_sf.write(frame)
-                current_frames += len(frame)
             level = float(np.sqrt(np.mean(frame.astype(np.float64) ** 2)))
+            audible = level > audible_level
+            rolling.append(frame)
+            if current_sf is None:
+                # 还没开始录音：只保留最近几帧做预卷。
+                if len(rolling) > preroll_frames:
+                    rolling.pop(0)
+            elif len(rolling) > preroll_frames:
+                # 录音中：最新几帧先不落盘，留给下一首的开头。
+                # SMTC/窗口标题是秒级轮询，直接写盘会把新歌开头切进上一首。
+                pending = rolling.pop(0)
+                if not paused:
+                    current_sf.write(pending)
+                    current_frames += len(pending)
+
+            # ---------------- 播放 / 暂停 ----------------
+            if current_sf is not None:
+                if level <= digital_zero:
+                    silent_frames += 1
+                else:
+                    silent_frames = 0
+                if not paused and silent_frames >= pause_frames:
+                    paused = True
+                    paused_since = time.time()
+                    paused_meta = None
+                    write_status(force=True)
+                elif paused and audible:
+                    paused = False
+                    silent_frames = 0
+                    if (paused_meta and paused_meta.get("title")
+                            and paused_meta["title"] != current_meta.get("title", "")):
+                        # 暂停期间换了歌：旧歌停在暂停点，新歌用预卷接上开头。
+                        finish_song("song_changed_while_paused", keep_pending=True)
+                        open_song(paused_meta)
+                    paused_meta = None
+                    paused_since = 0.0
+                    write_status(force=True)
+                elif (paused and paused_since
+                      and time.time() - paused_since > max_pause_s):
+                    finish_song("paused")
+                    paused = False
+                    silent_frames = 0
+                    paused_since = 0.0
+                    paused_meta = None
 
             if frame_index % smtc_every == 0:
                 smtc = _smtc(job)
                 music = _music_session(job, smtc)
-                if (music is None and bool(job.get("assume_music"))
+                assume_music = bool(job.get("assume_music"))
+                if (music is None and assume_music
                         and not (smtc.get("sessions") or [])):
-                    # SMTC 整体不可用（但目标应用已被判定为音乐播放器）：
-                    # 退化为「按静音/最长时长切歌」，标题留空由面板补。
+                    # SMTC 整体不可用，但目标应用已被判定为音乐播放器：
+                    # 仍然保持录音，靠静音/最长时长兜底。
                     music = {"playing": True, "playback_type": "music",
                              "title": "", "artist": "", "app": ""}
+                linked = _read_json(job.get("perception_song_path"))
+                linked_id = str(linked.get("song_id") or "")
+                linked_meta = {"title": str(linked.get("title") or "").strip()[:120],
+                               "artist": str(linked.get("artist") or "").strip()[:120]}
+                meta = None
                 if music:
                     title, artist = _split_title(str(music.get("title") or ""))
                     artist = artist or str(music.get("artist") or "").strip()[:120]
                     meta = {"title": title, "artist": artist}
+                if not (meta and meta["title"]) and (assume_music or linked_id):
+                    # 这个网易云版本没有系统媒体会话；窗口标题是唯一
+                    # 逐进程可用的歌名来源（"歌名 - 歌手"）。
+                    parsed = parse_player_window_title(
+                        _window_title(int(job["pid"])))
+                    if parsed:
+                        meta = {"title": parsed[0], "artist": parsed[1]}
+                browser_target = (str(job.get("exe_name") or "").casefold()
+                                  in BROWSER_EXES)
+                if browser_target:
+                    # 浏览器的媒体状态由 Windows 官方 SMTC 提供：网页播放器
+                    # 会上报标题/歌手/播放状态，且类型通常是 unknown。
+                    session = _target_session(job, smtc)
+                    if session:
+                        session_title = str(session.get("title") or "").strip()
+                        if session_title:
+                            meta = {"title": session_title[:120],
+                                    "artist": str(session.get("artist") or "")[:120]}
+                        if session.get("playing") is False:
+                            # 官方控件说已暂停：不等静音计数，直接进入暂停态。
+                            if current_sf is not None and not paused:
+                                paused = True
+                                paused_since = time.time()
+                                paused_meta = None
+                                write_status(force=True)
+                        elif session.get("playing") is True and music is None:
+                            # Chromium 的 playback_type 不是 music，也接受。
+                            music = dict(session)
+                if paused:
+                    # 暂停时不切歌：只记下新标题，恢复播放时再接上开头。
+                    candidate = linked_meta if linked_id else meta
+                    if candidate and candidate.get("title"):
+                        paused_meta = dict(candidate)
+                    silence_count = 0
+                elif linked_id and linked_id != last_linked_id:
+                    # 联动：边界完全跟随她的 song id，不再自己猜一遍。
+                    same_title = bool(
+                        current_sf is not None and linked_meta.get("title")
+                        and current_meta.get("title") == linked_meta["title"])
+                    last_linked_id = linked_id
+                    if same_title:
+                        # 她只是刚补上 song id，同一首歌不能切两段。
+                        current_meta.update(
+                            {k: v for k, v in linked_meta.items() if v})
+                    else:
+                        if current_sf is not None:
+                            finish_song("linked_song_change", keep_pending=True)
+                        open_song(linked_meta or meta or {"title": "", "artist": ""})
+                    silence_count = 0
+                elif linked_id:
+                    # 同一首：她的标题晚到时补上名字；切段后继续用她的歌名。
                     if current_sf is None:
-                        open_song(meta, with_preroll=True)
-                    elif meta["title"] and meta["title"] != current_meta["title"]:
-                        finish_song("title_change")
-                        open_song(meta, with_preroll=False)
+                        if audible:
+                            open_song(linked_meta or meta or {"title": "", "artist": ""})
+                    elif linked_meta["title"] and not current_meta.get("title"):
+                        current_meta.update(linked_meta)
+                    silence_count = 0
+                elif meta and meta["title"]:
+                    if current_sf is None:
+                        # 只有真的听到声音才开一首，避免“静音歌”。
+                        if audible:
+                            open_song(meta)
+                    elif meta["title"] != current_meta["title"]:
+                        # keep_pending: 最近几帧属于新歌开头，不能留在旧文件。
+                        finish_song("title_change", keep_pending=True)
+                        open_song(meta)
                     elif meta["artist"] and meta["artist"] != current_meta["artist"]:
                         current_meta.update(meta)
+                    silence_count = 0
+                elif music is not None and audible:
+                    # 真正有声音才开始一首；空闲时不再生成“静音歌”。
+                    if current_sf is None:
+                        open_song(meta or {"title": "", "artist": ""})
                     silence_count = 0
                 else:
                     if current_sf is not None:
@@ -345,7 +576,7 @@ def main() -> int:
                             finish_song("playback_stopped")
                             silence_count = 0
 
-            if current_sf is not None:
+            if current_sf is not None and not paused:
                 if level < 0.0015:
                     silence_count += 1
                     if silence_count >= max(silence_end * 2, 8):

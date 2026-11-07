@@ -48,6 +48,19 @@ export function PageSettings(props: { api: any; snap: any; onRefresh: () => void
   const plan = s.plan || {}
   const eng = s.engine || {}
   const paths = s.paths || {}
+  const link: any = s.link || {}
+  const linkOn = Boolean(link.running && link.source_control)
+  const linkColor = linkOn ? "#16a34a" : link.running ? "#d97706" : "#94a3b8"
+  const linkHalo = linkOn ? "rgba(22,163,74,0.16)" : link.running ? "rgba(217,119,6,0.16)" : "rgba(148,163,184,0.16)"
+  const linkText = linkOn ? "已连接" : link.running ? "运行中 · 音源中控不可用" : "未连接"
+  const linkSource = link.selected && link.selected.name ? link.selected.name : "未选择"
+  const linkStateText = !link.listener_running ? (link.running ? "已让位" : "未启动") : link.listener_state === "recording" ? "正在录制" : link.listener_state === "waiting_for_source" ? "等待音乐应用" : link.listener_mode === "linked" ? "联动待命" : "独立待命"
+  const linkFeature = (text: string) => (
+    <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+      <span style={{ width: 6, height: 6, borderRadius: 6, background: linkColor, marginTop: 7, flex: "0 0 auto" }} />
+      <div style={{ fontSize: 12.5, color: INK_2, lineHeight: 1.7 }}>{text}</div>
+    </div>
+  )
   const [hw, setHw] = useState<any>(s.hardware || null)
   const [busy, setBusy] = useState("")
   const [notice, setNotice] = useState<any>(null)
@@ -362,6 +375,44 @@ export function PageSettings(props: { api: any; snap: any; onRefresh: () => void
   return (
     <Col style={{ gap: 24 }}>
       {notice ? <Alert tone={notice.tone === "error" ? "warning" : "info"}>{notice.text}</Alert> : null}
+
+      {/* 和她所听联动 */}
+      <Section title="和她所听联动" extra={<Row style={{ gap: 8 }}>
+        <span style={{ width: 9, height: 9, borderRadius: 9, background: linkColor, boxShadow: "0 0 0 4px " + linkHalo, display: "inline-block" }} />
+        <Muted>{linkText}</Muted>
+      </Row>}>
+        <Col style={{ gap: 14 }}>
+          <div style={{ fontSize: 13, color: INK_2, lineHeight: 1.8 }}>
+            联动后，本插件直接用「为她所听」选中的那个应用当录制音源，歌名/歌手也优先采用它的识别结果；她没开时自动退回独立模式（本插件自己扫进程 + Windows 媒体会话）。
+          </div>
+          <Grid cols={3} min={200} gap={12}>
+            <div style={{ padding: 14, borderRadius: 14, background: "rgba(248,250,252,0.95)", border: "1px solid " + LINE }}>
+              <div style={{ fontSize: 11.5, color: INK_2 }}>当前音源</div>
+              <div style={{ fontSize: 13.5, fontWeight: 700, color: INK, marginTop: 4 }}>{linkSource}</div>
+              <div style={{ fontSize: 11.5, color: INK_2, marginTop: 3 }}>{link.capture_mode === "application" ? "逐进程应用声道" : (link.capture_mode || "未连接")}</div>
+            </div>
+            <div style={{ padding: 14, borderRadius: 14, background: "rgba(248,250,252,0.95)", border: "1px solid " + LINE }}>
+              <div style={{ fontSize: 11.5, color: INK_2 }}>本插件监听</div>
+              <div style={{ fontSize: 13.5, fontWeight: 700, color: INK, marginTop: 4 }}>{linkStateText}</div>
+              <div style={{ fontSize: 11.5, color: INK_2, marginTop: 3 }}>她监听时自动让位；点停止后不再自动开</div>
+            </div>
+            <div style={{ padding: 14, borderRadius: 14, background: "rgba(248,250,252,0.95)", border: "1px solid " + LINE }}>
+              <div style={{ fontSize: 11.5, color: INK_2 }}>AI 读取音乐信息</div>
+              <div style={{ fontSize: 13.5, fontWeight: 700, color: INK, marginTop: 4 }}>{link.ai_delivery ? "已授权" : "未授权"}</div>
+              <div style={{ fontSize: 11.5, color: INK_2, marginTop: 3 }}>{link.ai_delivery ? "歌名/歌手可由她所听校准" : "在为她所听里开启「AI 读取」"}</div>
+            </div>
+          </Grid>
+          <Col style={{ gap: 6 }}>
+            {linkFeature("音源跟着她走：不用在本插件重复选应用，她在为她所听里切到哪个，这边就采哪个")}
+            {linkFeature("识歌更准：歌名/歌手优先采用她所听的识别结果，再回退到 Windows 媒体会话")}
+            {linkFeature("隔离不变：就算联动，也只录那一个应用的进程树，AI 自己的声音和其他应用不会混进来")}
+            {linkFeature("互斥保护：她正在监听时本插件自动让位，两边不会同时采集回环")}
+            {linkFeature("自动退回：她没运行或没授权时，自动用本插件自己的进程扫描，录制照常")}
+          </Col>
+          {link.reason ? <div style={{ fontSize: 11.5, color: "#b45309" }}>提示：{link.reason}</div> : null}
+          <Row style={{ gap: 10 }}><Btn onClick={onRefresh}>刷新联动状态</Btn></Row>
+        </Col>
+      </Section>
 
       {/* 电脑状态 */}
       <Section title="电脑状态" extra={<Pill tone={tw.tone}>{tw.text}</Pill>}>
