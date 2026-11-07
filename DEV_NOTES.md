@@ -272,3 +272,22 @@ ACE 原曲是立体声（左右相关约 0.93），经过「让她唱」后成�
 | 对全静音 WAV | `ok=False` →「常量信号（唯一值 1，峰值 0.000）」 |
 | `pytest plugin/plugins/music_synth/tests/` | 1 passed |
 | 沙箱实测（N.E.K.O standalone 服务器） | `/health` 200，`music_synth` = running |
+
+## 口型 / 显存规划 / 联动（2026-11-07，v0.2.28）
+
+- 逐字口型：`lipsync.py` + `lips_server.py` + `lyrics_fetch.py`，`data/lips_pinyin.json`
+  提供离线「汉字 → 拼音 → 口型」表；新增入口 `ms_lips_status`（检查/重建某曲目的
+  口型轨，`rebuild=true` 强制重算）和 `ms_lips_preview`（不出声，只让角色按歌词对口型）。
+- 显存规划：`vram_policy.py` + `ms_vram_plan`；训练与唱歌互斥，唱歌前等训练空闲，
+  唱完复原「为她所听」的采集优先级。
+- 与她所听联动：`song_listener.py` 增加联动状态、优先采集与歌词抓取；面板显示
+  「已联动为她所听」，联动期间本页不提供手动开始/停止。
+- 训练：
+  - 修复全自动步数上限的 `TypeError`：素材 ≥10 分钟时三档上限都没覆盖到，
+    `cap` 为 `None`，`while step < cap` 直接崩；补 32000 档并加兜底，
+    里程碑里带 `null` 也不会再整次训练失败。
+  - 翻唱 + 原创全部练完后，训练页自动跳到「我的声音」，同一训练只跳一次；
+    避免用户停在训练页看不出已经练完。
+- ACE：`candidates`（1–6 个候选，按频谱/动态打分挑最佳）与 `quantization`
+  （auto / off / int8_weight_only / fp8_weight_only）参数透传。
+- 采集：新增 `workers/song_titles.py`，录制标题清洗与曲名处理增强。
