@@ -715,6 +715,26 @@ class MusicSynthPlugin(NekoPluginBase):
                                 bool(self._setup_state().get("completed"))})
         return Ok(report)
 
+    @plugin_entry(id="ms_setup_browse", name="为她而唱 · 选择安装目录",
+                  description=("第一次使用引导第 4 页：弹出系统目录选择框，返回用户选中的绝对路径。"
+                               "对话框在后台线程里打开；本次没选完会返回 state=open，再次调用继续等。"),
+                  input_schema={"type": "object", "properties": {
+                      "start_path": {"type": "string", "description": "对话框的起始目录"},
+                      "title": {"type": "string", "description": "对话框标题"},
+                      "wait": {"type": "number",
+                               "description": "本次最多等待秒数（默认 20，上限 30）"},
+                      "restart": {"type": "boolean",
+                                  "description": "true 表示开始一次新的选择（重复调用传 false 只等结果）"}}})
+    async def ms_setup_browse(self, start_path: str = "", title: str = "",
+                              wait: float = 20.0, restart: bool = False, **_):
+        try:
+            wait_s = max(0.0, min(float(wait or 20.0), 30.0))
+        except (TypeError, ValueError):
+            wait_s = 20.0
+        setup_mod.browse_start(str(start_path or ""), str(title or ""), bool(restart))
+        result = await asyncio.to_thread(setup_mod.browse_wait, wait_s)
+        return Ok(dict(result, ok=True))
+
     @plugin_entry(id="ms_setup_install", name="为她而唱 · 一键安装依赖",
                   description=("首次使用向导第 2 步：按用户选定路径安装缺失依赖与模型。"
                                "立即返回 job_id，安装可中断后重跑（pip 缓存 / HF 断点 / HTTP Range）"),

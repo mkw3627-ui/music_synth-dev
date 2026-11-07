@@ -5057,14 +5057,20 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       { key: "ddsp_contentvec", label: "声音特征模型（ContentVec）", status: ready ? "ready" : "missing", ok: ready, required: true, installable: !ready, size_gb: 0.2, detail: ready ? "已就绪" : "缺少 1/1 个文件", fix: "自动下载，约 0.2GB" },
       { key: "ddsp_vocoder", label: "音色合成模型（NSF-HiFiGAN）", status: ready ? "ready" : "missing", ok: ready, required: true, installable: !ready, size_gb: 0.05, detail: ready ? "已就绪" : "缺少 1/1 个文件", fix: "自动下载，约 0.05GB" },
       { key: "ddsp_rmvpe", label: "音高识别模型（RMVPE）", status: ready ? "ready" : "missing", ok: ready, required: true, installable: !ready, size_gb: 0.06, detail: ready ? "已就绪" : "缺少 1/1 个文件", fix: "自动下载，约 0.06GB" },
-      { key: "sep_karaoke", label: "去伴奏模型（Karaoke）", status: ready ? "ready" : "missing", ok: ready, required: true, installable: !ready, size_gb: 1.75, detail: ready ? "已就绪" : "缺少 1/1 个文件", fix: "自动下载，约 1.75GB" }
+      { key: "sep_karaoke", label: "去伴奏模型（Karaoke）", status: ready ? "ready" : "missing", ok: ready, required: true, installable: !ready, size_gb: 1.75, detail: ready ? "已就绪" : "缺少 1/1 个文件", fix: "自动下载，约 1.75GB" },
+      { key: "ddsp_base_low", label: "低质量训练底模（6x512）", status: "missing", ok: false, required: false, installable: true, size_gb: 0.09, detail: "缺少 1/1 个文件", fix: "自动下载，约 0.09GB" },
+      { key: "ddsp_base_high", label: "高质量训练底模（10x2048）", status: "missing", ok: false, required: false, installable: true, size_gb: 0.97, detail: "缺少 1/1 个文件", fix: "自动下载，约 0.97GB" }
     ];
-    const total = items.filter((i) => !i.ok).reduce((a, i) => a + i.size_gb, 0);
+    const sumGb = (list) => Math.round(list.reduce((a, i) => a + i.size_gb, 0) * 100) / 100;
+    const total = sumGb(items.filter((i) => !i.ok && i.required));
+    const opt = sumGb(items.filter((i) => !i.ok && !i.required));
     return {
       ready,
       items,
       suggested_root: root,
-      total_missing_gb: Math.round(total * 10) / 10,
+      total_missing_gb: total,
+      required_missing_gb: total,
+      optional_missing_gb: opt,
       mock: true,
       hardware_brief: "显卡：NVIDIA GeForce RTX 3060（模拟）"
     };
@@ -5231,6 +5237,9 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const [freeGb, setFreeGb] = useState(null);
     const [busy, setBusy] = useState("");
     const [err, setErr] = useState("");
+    const [picking, setPicking] = useState(false);
+    const [pickErr, setPickErr] = useState("");
+    const [pickNote, setPickNote] = useState("");
     const [job, setJob] = useState(null);
     const [prog, setProg] = useState(null);
     const [installing, setInstalling] = useState(false);
@@ -5357,8 +5366,55 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       }
       setBusy("");
     };
+    const pickFolder = async () => {
+      if (picking || installing) return;
+      setPicking(true);
+      setPickErr("");
+      setPickNote("");
+      try {
+        const host = window.nekoHost;
+        if (host && typeof host.pickDirectory === "function") {
+          const r = await host.pickDirectory({ startPath: path.trim(), title: "选择安装文件夹" });
+          if (r && r.cancelled !== true && r.selected_root) setPath(String(r.selected_root));
+          setPicking(false);
+          return;
+        }
+        const deadline = Date.now() + 10 * 60 * 1e3;
+        let first = true;
+        while (Date.now() < deadline) {
+          const r = await callEntry(
+            props.api,
+            "ms_setup_browse",
+            { start_path: path.trim(), title: "选择安装文件夹", wait: first ? 2 : 20, restart: first },
+            4e4
+          );
+          first = false;
+          const st = String(r && r.state || "");
+          if (st === "picked") {
+            if (r.path) setPath(String(r.path));
+            setPickNote("");
+            setPicking(false);
+            return;
+          }
+          if (st === "cancelled") {
+            setPickNote("");
+            setPicking(false);
+            return;
+          }
+          if (st === "error") throw Error(String(r.error || "系统目录选择框打不开"));
+          setPickNote("已弹出系统选择窗口，在里面选好目录后会自动填进来。");
+        }
+        setPicking(false);
+        setPickErr("等了 10 分钟还没选好；也可以直接在下面的输入框里填路径。");
+      } catch (e) {
+        setPickNote("");
+        setPicking(false);
+        setPickErr("打不开系统目录选择框（" + String(e && e.message || e) + "）；可以直接在下面的输入框里填路径。");
+      }
+    };
     const items = report && report.items || [];
-    const needGb = report ? Number(report.total_missing_gb || 0) : 0;
+    const needGb = report ? Number(report.required_missing_gb !== void 0 ? report.required_missing_gb : report.total_missing_gb || 0) || 0 : 0;
+    const optGb = report ? Number(report.optional_missing_gb || 0) || 0 : 0;
     const lack = freeGb !== null && needGb > 0 && freeGb < Math.max(0.5, needGb * 1.15);
     const allReady = !!report && report.ready === true;
     const canNext = allReady || mockDone;
@@ -5590,7 +5646,10 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         /* @__PURE__ */ jsx(Btn, { style: primaryBtn, onClick: () => setStep(4), children: "下一步：准备运行环境 →" })
       ] })
     ] });
-    const showing = [...items].sort((a, b) => Number(a.status === "ready") - Number(b.status === "ready"));
+    const rank = (i) => i.required ? i.status === "ready" ? 2 : 0 : i.status === "ready" ? 3 : 1;
+    const showing = [...items].sort((a, b) => rank(a) - rank(b));
+    const firstOptIdx = showing.findIndex((i) => i.required === false);
+    const driveTips = (report && report.hardware && report.hardware.drives || []).map((d) => String(d.drive || "")).filter((s) => /^[A-Za-z]:/.test(s)).slice(0, 4);
     const overall = (() => {
       if (!prog) return 0;
       const list = items.filter((i) => i.status !== "ready");
@@ -5603,6 +5662,8 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       return Math.round(sum / list.length);
     })();
     const failed = !!(prog && prog.job_state === "failed");
+    const sizeText = !report ? "约 2 GB（以检测结果为准）" : needGb > 0 ? "必需 " + needGb + " GB" + (optGb > 0 ? " · 可选 " + optGb + " GB" : "") : optGb > 0 ? "必需 0 GB（已齐） · 可选 " + optGb + " GB" : "不用下载（已齐）";
+    const timeText = !report ? "看网速，一般 10～40 分钟" : needGb > 0 ? fmtEta(needGb * 900) : optGb > 0 ? "必需项不用下；可选约 " + fmtEta(optGb * 900) : "不用下载";
     const failLabels = items.filter((i) => {
       const st = prog && prog.items && prog.items[i.key];
       return st && st.state === "failed";
@@ -5612,13 +5673,13 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         /* @__PURE__ */ jsx("div", { style: { fontSize: 19, fontWeight: 800, color: INK }, children: "准备运行环境" }),
         /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK_2, marginTop: 6, lineHeight: 1.8 }, children: "欢迎使用「为她而唱」。第一次打开需要先准备好她会用到的程序、模型和音频处理工具，之后就不用再装了。" })
       ] }),
-      mustInstall ? /* @__PURE__ */ jsx(Alert, { tone: "warning", children: "必需的程序还没装好，先点「一键安装全部」把它装好才能开始使用。" }) : null,
+      mustInstall ? /* @__PURE__ */ jsx(Alert, { tone: "warning", children: "必需的程序还没装好，先在下面把它装好才能开始使用。" }) : null,
       mockMode ? /* @__PURE__ */ jsx(Alert, { tone: "info", children: "当前是模拟演示：没有连上安装接口，进度为示例数据，只用于查看界面流程。" }) : null,
       err ? /* @__PURE__ */ jsx(Alert, { tone: "warning", children: err }) : null,
       /* @__PURE__ */ jsx("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 12 }, children: [
         ["要下载什么", "运行程序 + 声音模型 + 去伴奏模型"],
-        ["大约多大", report && needGb ? needGb + " GB" : "约 2 GB（以检测结果为准）"],
-        ["大概多久", report && needGb ? fmtEta(needGb * 900) : "看网速，一般 10～40 分钟"]
+        ["大约多大", sizeText],
+        ["大概多久", timeText]
       ].map((row, i) => /* @__PURE__ */ jsxs("div", { style: { padding: 14, borderRadius: 16, background: "rgba(255,229,239,0.5)", border: "1px solid rgba(224,45,118,0.10)" }, children: [
         /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_2 }, children: row[0] }),
         /* @__PURE__ */ jsx("div", { style: { fontSize: 14, fontWeight: 700, color: "#9c204e", marginTop: 4 }, children: row[1] })
@@ -5627,38 +5688,76 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK, lineHeight: 1.8 }, children: "程序、模型和临时文件都会放在这里。选一个空间充足的盘就行，装在 D 盘、E 盘都可以。" }),
         /* @__PURE__ */ jsxs("label", { style: { display: "flex", flexDirection: "column", gap: 6, fontSize: 12, color: INK_2 }, children: [
           /* @__PURE__ */ jsx("span", { children: "安装到哪里" }),
-          /* @__PURE__ */ jsx(
-            "input",
-            {
-              value: path,
-              placeholder: "例如 D:\\\\NEKOMusicSynth",
-              disabled: installing,
-              onChange: (e) => setPath(e.target.value),
-              style: {
-                border: "1px solid " + (lack ? "#e8a3a3" : "transparent"),
-                borderRadius: 12,
-                padding: "10px 14px",
-                fontSize: 13,
-                background: lack ? "#fff6f6" : "rgba(248,250,252,0.95)",
-                color: INK,
-                outline: "none"
+          /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 8, alignItems: "center" }, children: [
+            /* @__PURE__ */ jsx(
+              "input",
+              {
+                value: path,
+                placeholder: "例如 D:\\\\NEKOMusicSynth",
+                disabled: installing,
+                onChange: (e) => setPath(e.target.value),
+                style: {
+                  flex: 1,
+                  minWidth: 0,
+                  border: "1px solid " + (lack ? "#e8a3a3" : "transparent"),
+                  borderRadius: 12,
+                  padding: "10px 14px",
+                  fontSize: 13,
+                  background: lack ? "#fff6f6" : "rgba(248,250,252,0.95)",
+                  color: INK,
+                  outline: "none"
+                }
               }
-            }
-          )
+            ),
+            /* @__PURE__ */ jsx(
+              Btn,
+              {
+                style: { ...ghostBtn, padding: "9px 14px", fontSize: 12.5, whiteSpace: "nowrap", flex: "0 0 auto" },
+                disabled: installing || picking,
+                onClick: pickFolder,
+                children: picking ? "选择中…" : "选择文件夹"
+              }
+            )
+          ] })
         ] }),
-        /* @__PURE__ */ jsx(Muted, { children: "必须自己填一个绝对路径（例如 D:\\NEKOMusicSynth）。插件不会自动挑盘，也不会把模型下到别的盘。" }),
+        /* @__PURE__ */ jsx(Muted, { children: "点「选择文件夹」在系统窗口里挑一个位置；模型和程序只装到这个目录，不会改动系统设置。" }),
+        pickNote ? /* @__PURE__ */ jsx(Muted, { children: pickNote }) : null,
+        pickErr ? /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 8 }, children: [
+          /* @__PURE__ */ jsx(Alert, { tone: "warning", children: pickErr }),
+          driveTips.length ? /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }, children: [
+            /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11.5 }, children: "快捷填入：" }),
+            driveTips.map((d) => /* @__PURE__ */ jsxs(
+              "button",
+              {
+                type: "button",
+                disabled: installing,
+                onClick: () => setPath(d + "\\NEKOMusicSynth"),
+                style: { border: "1px solid rgba(224,45,118,0.16)", background: "#fff", color: BRAND_DEEP, borderRadius: 9, padding: "5px 10px", fontSize: 11.5, cursor: "pointer", fontFamily: "inherit" },
+                children: [
+                  d,
+                  "\\NEKOMusicSynth"
+                ]
+              },
+              d
+            ))
+          ] }) : null
+        ] }) : null,
         /* @__PURE__ */ jsx("div", { style: { display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }, children: !path.trim() ? /* @__PURE__ */ jsx(StatusBadge, { tone: "warning", children: "请先填写安装目录，否则不会开始下载" }) : freeGb !== null ? lack ? /* @__PURE__ */ jsxs(StatusBadge, { tone: "error", children: [
           "这个盘只剩 ",
           freeGb.toFixed(1),
           " GB，还要约 ",
           needGb,
           " GB，换一个盘吧"
-        ] }) : /* @__PURE__ */ jsxs(StatusBadge, { tone: "success", children: [
+        ] }) : needGb > 0 ? /* @__PURE__ */ jsxs(StatusBadge, { tone: "success", children: [
           "这个盘还剩 ",
           freeGb.toFixed(1),
           " GB · 需要约 ",
           needGb,
           " GB"
+        ] }) : /* @__PURE__ */ jsxs(StatusBadge, { tone: "success", children: [
+          "这个盘还剩 ",
+          freeGb.toFixed(1),
+          " GB · 必需项已齐"
         ] }) : /* @__PURE__ */ jsx(Muted, { children: "（无法读取剩余空间，也可以继续）" }) }),
         mockMode ? /* @__PURE__ */ jsx(Muted, { children: "安装向导暂时读不到检测结果。" }) : null
       ] }),
@@ -5674,40 +5773,46 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         /* @__PURE__ */ jsx("div", { style: { fontSize: 12, color: INK_2, minHeight: 18 }, children: prog && prog.detail || job && job.detail || "正在准备…" })
       ] }) : null,
       failed ? /* @__PURE__ */ jsx(Alert, { tone: "warning", children: prog && prog.detail || "安装没能全部完成，看看下面哪一项出了问题。" }) : null,
-      /* @__PURE__ */ jsx("div", { style: { display: "flex", flexDirection: "column", gap: 8 }, children: showing.map((i) => {
+      /* @__PURE__ */ jsx("div", { style: { display: "flex", flexDirection: "column", gap: 8 }, children: showing.map((i, idx) => {
         const st = prog && prog.items && prog.items[i.key] || { state: i.ok ? "ready" : i.installable ? "missing" : "missing_required", pct: null };
-        const tx = STATE_TEXT[st.state] || STATE_TEXT.wait;
+        const isOpt = i.required === false;
+        const quiet = isOpt && !i.ok && st.state !== "active" && st.state !== "failed" && st.state !== "done";
+        const tx = quiet ? { text: "可选", tone: "neutral" } : STATE_TEXT[st.state] || STATE_TEXT.wait;
         const isActive = st.state === "active";
         const isDownload = st.total_mb && st.done_mb !== void 0 && st.done_mb !== null;
         const canInstall = i.installable && i.status !== "ready" && !installing;
-        return /* @__PURE__ */ jsxs("div", { style: { display: "grid", gridTemplateColumns: "24px minmax(0,1fr) auto", gap: "4px 10px", alignItems: "center", padding: "10px 13px", borderRadius: 15, background: isActive ? "rgba(255,229,239,0.55)" : "rgba(248,250,252,0.9)", border: "1px solid " + (isActive ? "rgba(224,45,118,0.18)" : LINE) }, children: [
-          /* @__PURE__ */ jsx(StateIcon, { state: st.state }),
-          /* @__PURE__ */ jsxs("div", { style: { minWidth: 0 }, children: [
-            /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: i.label }),
-            /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_3, lineHeight: 1.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: isDownload ? st.done_mb + " / " + st.total_mb + " MB" : i.ok ? i.detail || "已就绪" : i.fix || i.detail || (i.size_gb ? "约 " + i.size_gb + " GB" : "") })
-          ] }),
-          /* @__PURE__ */ jsxs(Row, { style: { gap: 8 }, children: [
-            /* @__PURE__ */ jsx(Pill, { tone: tx.tone, children: tx.text }),
-            canInstall ? /* @__PURE__ */ jsx(
-              Btn,
-              {
-                style: { ...ghostBtn, padding: "5px 11px", fontSize: 11.5, borderRadius: 9 },
-                disabled: !!busy,
-                onClick: () => startInstall(i.key),
-                children: "安装"
-              }
-            ) : null,
-            failed && st.state === "failed" ? /* @__PURE__ */ jsx(
-              Btn,
-              {
-                style: { ...ghostBtn, padding: "5px 11px", fontSize: 11.5, borderRadius: 9 },
-                disabled: !!busy,
-                onClick: () => startInstall(i.key),
-                children: "重试这一项"
-              }
-            ) : null
-          ] }),
-          /* @__PURE__ */ jsx("div", { style: { gridColumn: "2 / 4" }, children: /* @__PURE__ */ jsx(Bar, { pct: st.state === "done" || st.state === "ready" ? 100 : Number(st.pct || 0), tone: st.state === "failed" ? "#e06666" : st.state === "active" ? void 0 : "rgba(224,45,118,0.35)" }) })
+        const optHeader = isOpt && idx === firstOptIdx;
+        return /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 6 }, children: [
+          optHeader ? /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11.5, padding: "2px 2px 0" }, children: "可选 · 只在训练音色时用；不装也能训练，会自动用中档底模" }) : null,
+          /* @__PURE__ */ jsxs("div", { style: { display: "grid", gridTemplateColumns: "24px minmax(0,1fr) auto", gap: "4px 10px", alignItems: "center", padding: "10px 13px", borderRadius: 15, background: isActive ? "rgba(255,229,239,0.55)" : "rgba(248,250,252,0.9)", border: "1px solid " + (isActive ? "rgba(224,45,118,0.18)" : LINE) }, children: [
+            /* @__PURE__ */ jsx(StateIcon, { state: quiet ? "wait" : st.state }),
+            /* @__PURE__ */ jsxs("div", { style: { minWidth: 0 }, children: [
+              /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: i.label }),
+              /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_3, lineHeight: 1.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: isDownload ? st.done_mb + " / " + st.total_mb + " MB" : i.ok ? i.detail || "已就绪" : i.fix || i.detail || (i.size_gb ? "约 " + i.size_gb + " GB" : "") })
+            ] }),
+            /* @__PURE__ */ jsxs(Row, { style: { gap: 8 }, children: [
+              /* @__PURE__ */ jsx(Pill, { tone: tx.tone, children: tx.text }),
+              canInstall ? /* @__PURE__ */ jsx(
+                Btn,
+                {
+                  style: { ...ghostBtn, padding: "5px 11px", fontSize: 11.5, borderRadius: 9 },
+                  disabled: !!busy,
+                  onClick: () => startInstall(i.key),
+                  children: "安装"
+                }
+              ) : null,
+              failed && st.state === "failed" ? /* @__PURE__ */ jsx(
+                Btn,
+                {
+                  style: { ...ghostBtn, padding: "5px 11px", fontSize: 11.5, borderRadius: 9 },
+                  disabled: !!busy,
+                  onClick: () => startInstall(i.key),
+                  children: "重试这一项"
+                }
+              ) : null
+            ] }),
+            /* @__PURE__ */ jsx("div", { style: { gridColumn: "2 / 4" }, children: /* @__PURE__ */ jsx(Bar, { pct: st.state === "done" || st.state === "ready" ? 100 : Number(st.pct || 0), tone: st.state === "failed" ? "#e06666" : st.state === "active" ? void 0 : "rgba(224,45,118,0.35)" }) })
+          ] })
         ] }, i.key);
       }) }),
       failed && !failLabels.length ? /* @__PURE__ */ jsx(Row, { style: { justifyContent: "flex-end" }, children: /* @__PURE__ */ jsx(Btn, { style: ghostBtn, disabled: !!busy, onClick: () => startInstall(), children: "重新安装缺失项" }) }) : null,
@@ -5720,7 +5825,8 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const page5 = /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 18, alignItems: "center", textAlign: "center", padding: "14px 0 6px" }, children: [
       /* @__PURE__ */ jsx("span", { style: { width: 58, height: 58, borderRadius: 999, background: "#e8f7ef", color: "#1c8a58", display: "grid", placeItems: "center", boxShadow: "0 8px 20px rgba(28,138,88,0.12)" }, children: /* @__PURE__ */ jsx("svg", { width: "30", height: "30", viewBox: "0 0 24 24", children: /* @__PURE__ */ jsx("path", { d: "M5 12.5 9.6 17 19 7.2", fill: "none", stroke: "currentColor", strokeWidth: "2.4", strokeLinecap: "round", strokeLinejoin: "round" }) }) }),
       /* @__PURE__ */ jsx("div", { style: { fontSize: 22, fontWeight: 800, color: INK }, children: "都准备好了" }),
-      /* @__PURE__ */ jsx("div", { style: { fontSize: 13.5, color: INK_2, lineHeight: 1.9, maxWidth: 480 }, children: "全部就绪。以后打开插件不用再装东西了。先把几首歌放进「准备素材」，就能开始训练她的声音。" }),
+      /* @__PURE__ */ jsx("div", { style: { fontSize: 13.5, color: INK_2, lineHeight: 1.9, maxWidth: 480 }, children: "必需项已就绪。以后打开插件不用再装东西了。先把几首歌放进「准备素材」，就能开始训练她的声音。" }),
+      optGb > 0 ? /* @__PURE__ */ jsx(Muted, { style: { fontSize: 12 }, children: "可选的两档训练底模还没下载，想训练音色时可以在训练页按需下载，不装也能练。" }) : null,
       /* @__PURE__ */ jsx("div", { style: { padding: "12px 18px", borderRadius: 16, background: "rgba(255,229,239,0.5)", border: "1px solid rgba(224,45,118,0.10)", fontSize: 12.5, color: "#9c204e", lineHeight: 1.7 }, children: "小提示：第一次可以先在「让她唱歌」里挑一首歌，用内置的「沫沫」试一遍。" }),
       /* @__PURE__ */ jsx(Row, { style: { justifyContent: "center", marginTop: 4 }, children: /* @__PURE__ */ jsx(Btn, { style: primaryBtn, onClick: props.onDone, children: "开始使用" }) }),
       /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11 }, children: "安装文件只来自官方发布地址，放在你选定的目录里；不会改动系统设置。" })
@@ -5767,13 +5873,13 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between", alignItems: "center" }, children: [
             /* @__PURE__ */ jsx(Btn, { style: ghostBtn, onClick: () => setStep(3), disabled: installing, children: "上一步" }),
             /* @__PURE__ */ jsxs(Row, { style: { gap: 10 }, children: [
-              allReady || mockDone ? null : /* @__PURE__ */ jsx(
+              !items.some((i) => i.installable && i.status !== "ready") ? null : /* @__PURE__ */ jsx(
                 Btn,
                 {
                   style: primaryBtn,
                   disabled: !!busy || installing || !path.trim() || lack || !items.some((i) => i.installable && i.status !== "ready"),
                   onClick: () => startInstall(),
-                  children: installing ? "正在安装…" : busy === "all" ? "正在启动…" : "一键安装全部"
+                  children: installing ? "正在安装…" : busy === "all" ? "正在启动…" : needGb > 0 ? "一键安装全部" : "安装可选项"
                 }
               ),
               /* @__PURE__ */ jsx(Btn, { style: canNext ? primaryBtn : ghostBtn, disabled: !canNext || installing, onClick: () => setStep(5), children: canNext ? "下一步：开始使用 →" : "装好后继续" })

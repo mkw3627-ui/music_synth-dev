@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -122,6 +123,8 @@ MODEL_ITEMS = {
         "target": "ddsp_base_low",
         "size_gb": 0.09,
         "files": ("low.pt",),
+        # 质量档位，不装也能训练（自动回退到中档），所以不是必需项。
+        "optional": True,
     },
     "ddsp_base_high": {
         "label": "高质量训练底模（10x2048）",
@@ -131,6 +134,8 @@ MODEL_ITEMS = {
         "target": "ddsp_base_high",
         "size_gb": 0.97,
         "files": ("high.pt",),
+        # 质量档位，不装也能训练（自动回退到中档），所以不是必需项。
+        "optional": True,
     },
     "sep_karaoke": {
         "label": "人声分离权重（Mel-Band RoFormer Karaoke）",
@@ -653,7 +658,8 @@ def check_dependencies(paths: dict, probe: dict | None = None) -> dict:
             "ok": False, "ready": False, "needs_path": True,
             "items": items, "missing": ["install_path"],
             "optional_missing": [], "installable_missing": [], "actions": [],
-            "total_missing_gb": 0, "suggested_root": "", "default_root": "",
+            "total_missing_gb": 0, "required_missing_gb": 0, "optional_missing_gb": 0,
+            "suggested_root": "", "default_root": "",
             "base_python": {"path": "", "version": "", "source": ""},
             "hardware": probe,
             "hardware_brief": runtime.probe_brief(probe),
@@ -769,11 +775,12 @@ def check_dependencies(paths: dict, probe: dict | None = None) -> dict:
         base = _model_base(spec, target)
         dest = str(_model_zip_dir(spec, target) if spec["kind"] == "zip" else base)
         missing = _missing_files(spec, base)
+        optional = bool(spec.get("optional"))
         items.append(_item(
             key, spec["label"], "ready" if not missing else "missing",
             (f"{dest}（已就绪）" if not missing
              else f"缺少 {len(missing)}/{len(spec['files'])} 个文件 · {dest}"),
-            required=True, installable=bool(missing),
+            required=not optional, installable=bool(missing),
             fix=("自动下载并支持断点续传" if not missing else
                  f"自动下载到 {dest}（约 {spec['size_gb']}GB，支持断点续传）"),
             size_gb=0.0 if not missing else float(spec["size_gb"]),
@@ -782,7 +789,9 @@ def check_dependencies(paths: dict, probe: dict | None = None) -> dict:
     # disk -----------------------------------------------------------------
     root = Path(paths["compute_root"])
     free = _free_gib(root)
-    missing_gb = sum(float(i["size_gb"]) for i in items if i["status"] == "missing" and i["installable"])
+    # 磁盘余量只需要覆盖「必需项」；可选的质量档位不装也能用，不算进必须空间。
+    missing_gb = sum(float(i["size_gb"]) for i in items
+                     if i["status"] == "missing" and i["installable"] and i["required"])
     need = max(20.0, missing_gb * 1.15)
     disk_ok = free >= need
     items.append(_item(
@@ -793,8 +802,12 @@ def check_dependencies(paths: dict, probe: dict | None = None) -> dict:
 
     missing_keys = [i["key"] for i in items if i["required"] and i["status"] != "ready"]
     optional_missing = [i["key"] for i in items if not i["required"] and not i["ok"]]
-    total_missing_gb = round(sum(float(i["size_gb"]) for i in items
-                                 if i["installable"] and i["status"] != "ready"), 1)
+    required_missing_gb = round(sum(float(i["size_gb"]) for i in items
+                                    if i["installable"] and i["status"] != "ready"
+                                    and i["required"]), 1)
+    optional_missing_gb = round(sum(float(i["size_gb"]) for i in items
+                                    if i["installable"] and i["status"] != "ready"
+                                    and not i["required"]), 1)
     return {
         "ok": not missing_keys,
         "ready": not missing_keys,
@@ -805,7 +818,10 @@ def check_dependencies(paths: dict, probe: dict | None = None) -> dict:
                                 if i["installable"] and i["status"] != "ready"],
         "actions": [i["action"] for i in items
                     if i["action"] and i["status"] != "ready"],
-        "total_missing_gb": total_missing_gb,
+        # total_missing_gb 保留旧字段名，但现在只统计必需项（可选档位单独给）。
+        "total_missing_gb": required_missing_gb,
+        "required_missing_gb": required_missing_gb,
+        "optional_missing_gb": optional_missing_gb,
         "suggested_root": str(root),
         "default_root": str(runtime.default_install_root()),
         "base_python": {"path": str(base or ""), "version": base_version, "source": base_source},
@@ -814,6 +830,184 @@ def check_dependencies(paths: dict, probe: dict | None = None) -> dict:
         "paths": {k: str(v) for k, v in paths.items()
                   if isinstance(v, (str, Path)) and k not in {"raw", "host_section"}},
     }
+
+
+# ---------------------------------------------------------------------------
+# Native folder picker (首次引导的「选择文件夹」)
+# ---------------------------------------------------------------------------
+# 面板跑在宿主的 iframe 里，拿不到 Electron 的 dialog；这里让插件进程自己弹
+# 系统目录框。对话框会阻塞线程，所以放在后台线程里，entry 只负责「打开 + 等一会
+# 儿」，没选完就返回 open，面板下次调用接着等——避开宿主的单次调用超时。
+_BROWSE_LOCK = threading.Lock()
+_BROWSE: dict = {"state": "idle", "path": "", "error": ""}
+_BROWSE_THREAD: list = [None]
+
+
+def _browse_dialog_win32(start_path: str, title: str) -> tuple[str, str]:
+    """Windows 原生文件夹选择框（shell32!SHBrowseForFolderW，纯 ctypes）。
+
+    宿主是 PyInstaller 打的 exe，tkinter 只带了 __init__，没有 filedialog 子模块，
+    所以 Windows 上直接调系统 API，不依赖任何额外组件。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class BROWSEINFOW(ctypes.Structure):
+        _fields_ = [
+            ("hwndOwner", wintypes.HWND),
+            ("pidlRoot", ctypes.c_void_p),
+            ("pszDisplayName", wintypes.LPWSTR),
+            ("lpszTitle", wintypes.LPCWSTR),
+            ("ulFlags", ctypes.c_uint),
+            ("lpfn", ctypes.c_void_p),
+            ("lParam", ctypes.c_void_p),
+            ("iImage", ctypes.c_int),
+        ]
+
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    ole32 = ctypes.WinDLL("ole32")
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+    shell32.SHBrowseForFolderW.argtypes = [ctypes.POINTER(BROWSEINFOW)]
+    shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
+    shell32.SHGetPathFromIDListW.argtypes = [ctypes.c_void_p, wintypes.LPWSTR]
+    shell32.SHGetPathFromIDListW.restype = wintypes.BOOL
+    user32.SendMessageW.argtypes = [wintypes.HWND, ctypes.c_uint,
+                                    ctypes.c_size_t, ctypes.c_void_p]
+    user32.SendMessageW.restype = ctypes.c_void_p
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+
+    BFFM_INITIALIZED = 1
+    BFFM_SETSELECTIONW = 0x400 + 103
+    initial = str(start_path or "")
+    if not (initial and Path(initial).is_dir()):
+        initial = ""
+
+    @ctypes.WINFUNCTYPE(ctypes.c_int, wintypes.HWND, ctypes.c_uint,
+                        ctypes.c_void_p, ctypes.c_void_p)
+    def on_msg(hwnd, msg, lparam, data):  # noqa: ANN001
+        if msg == BFFM_INITIALIZED:
+            try:
+                user32.SetForegroundWindow(hwnd)
+                if initial:
+                    ptr = ctypes.cast(ctypes.c_wchar_p(initial), ctypes.c_void_p)
+                    user32.SendMessageW(hwnd, BFFM_SETSELECTIONW, 1, ptr)
+            except Exception:  # noqa: BLE001
+                pass
+        return 0
+
+    display = ctypes.create_unicode_buffer(260)
+    bi = BROWSEINFOW()
+    bi.hwndOwner = None
+    bi.pszDisplayName = ctypes.cast(display, wintypes.LPWSTR)
+    bi.lpszTitle = title or "选择安装文件夹"
+    # BIF_RETURNONLYFSDIRS | BIF_EDITBOX | BIF_NEWDIALOGSTYLE
+    bi.ulFlags = 0x1 | 0x10 | 0x40
+    bi.lpfn = ctypes.cast(on_msg, ctypes.c_void_p)
+    bi.lParam = None
+    bi.iImage = 0
+
+    try:
+        ole32.CoInitialize(None)
+    except Exception:  # noqa: BLE001
+        pass
+    pidl = shell32.SHBrowseForFolderW(ctypes.byref(bi))
+    if not pidl:
+        return "", ""  # 用户取消
+    try:
+        buf = ctypes.create_unicode_buffer(32768)
+        if not shell32.SHGetPathFromIDListW(pidl, buf):
+            return "", "无法读取所选目录"
+        return os.path.normpath(buf.value), ""
+    finally:
+        try:
+            ole32.CoTaskMemFree(ctypes.c_void_p(pidl))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _browse_dialog_tk(start_path: str, title: str) -> tuple[str, str]:
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:  # noqa: BLE001
+        pass
+    root.update_idletasks()
+    initial = str(start_path or "")
+    if not (initial and Path(initial).is_dir()):
+        initial = ""
+    try:
+        picked = filedialog.askdirectory(
+            parent=root, title=title or "选择安装文件夹",
+            initialdir=initial or None, mustexist=False)
+        return (os.path.normpath(picked) if picked else ""), ""
+    finally:
+        try:
+            root.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _browse_dialog(start_path: str, title: str) -> tuple[str, str]:
+    """弹系统目录选择框。返回 (路径, 错误)；路径为空表示用户取消。"""
+    errors: list[str] = []
+    if sys.platform == "win32":
+        try:
+            return _browse_dialog_win32(start_path, title)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"win32: {type(exc).__name__}: {exc}")
+    try:
+        return _browse_dialog_tk(start_path, title)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"tkinter: {type(exc).__name__}: {exc}")
+    return "", "；".join(errors) or "当前环境没有可用的目录选择器"
+
+
+def browse_start(start_path: str = "", title: str = "", restart: bool = False) -> dict:
+    """确保系统目录框已经打开（已开着就复用），立即返回当前状态。
+
+    上一次已经选完/取消/失败时，只有 ``restart=True`` 才重新弹框；否则原样返回
+    上次结果，避免轮询把刚取消的窗口又弹出来。
+    """
+    with _BROWSE_LOCK:
+        th = _BROWSE_THREAD[0]
+        if th is not None and th.is_alive():
+            return dict(_BROWSE)
+        if not restart and _BROWSE["state"] in {"picked", "cancelled", "error"}:
+            return dict(_BROWSE)
+
+        def worker() -> None:
+            path, err = _browse_dialog(start_path, title)
+            with _BROWSE_LOCK:
+                if err:
+                    _BROWSE.update(state="error", path="", error=err)
+                elif path:
+                    _BROWSE.update(state="picked", path=path, error="")
+                else:
+                    _BROWSE.update(state="cancelled", path="", error="")
+
+        _BROWSE.update(state="open", path="", error="")
+        th = threading.Thread(target=worker, name="ms-setup-browse", daemon=True)
+        _BROWSE_THREAD[0] = th
+        th.start()
+        return dict(_BROWSE)
+
+
+def browse_wait(seconds: float = 20.0) -> dict:
+    """等用户选完（最多 seconds 秒）。没等到就返回 state=open，面板可以再调。"""
+    deadline = time.time() + max(0.0, float(seconds))
+    while time.time() < deadline:
+        with _BROWSE_LOCK:
+            if _BROWSE["state"] in {"picked", "cancelled", "error"}:
+                return dict(_BROWSE)
+        time.sleep(0.1)
+    with _BROWSE_LOCK:
+        return dict(_BROWSE)
 
 
 # ---------------------------------------------------------------------------

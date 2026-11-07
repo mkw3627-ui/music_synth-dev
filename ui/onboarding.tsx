@@ -35,9 +35,14 @@ function mockReport(root: string, ready: boolean): Report {
     { key: "ddsp_vocoder", label: "音色合成模型（NSF-HiFiGAN）", status: ready ? "ready" : "missing", ok: ready, required: true, installable: !ready, size_gb: 0.05, detail: ready ? "已就绪" : "缺少 1/1 个文件", fix: "自动下载，约 0.05GB" },
     { key: "ddsp_rmvpe", label: "音高识别模型（RMVPE）", status: ready ? "ready" : "missing", ok: ready, required: true, installable: !ready, size_gb: 0.06, detail: ready ? "已就绪" : "缺少 1/1 个文件", fix: "自动下载，约 0.06GB" },
     { key: "sep_karaoke", label: "去伴奏模型（Karaoke）", status: ready ? "ready" : "missing", ok: ready, required: true, installable: !ready, size_gb: 1.75, detail: ready ? "已就绪" : "缺少 1/1 个文件", fix: "自动下载，约 1.75GB" },
+    { key: "ddsp_base_low", label: "低质量训练底模（6x512）", status: "missing", ok: false, required: false, installable: true, size_gb: 0.09, detail: "缺少 1/1 个文件", fix: "自动下载，约 0.09GB" },
+    { key: "ddsp_base_high", label: "高质量训练底模（10x2048）", status: "missing", ok: false, required: false, installable: true, size_gb: 0.97, detail: "缺少 1/1 个文件", fix: "自动下载，约 0.97GB" },
   ]
-  const total = items.filter((i) => !i.ok).reduce((a, i) => a + i.size_gb, 0)
-  return { ready, items, suggested_root: root, total_missing_gb: Math.round(total * 10) / 10,
+  const sumGb = (list: Item[]) => Math.round(list.reduce((a, i) => a + i.size_gb, 0) * 100) / 100
+  const total = sumGb(items.filter((i) => !i.ok && i.required))
+  const opt = sumGb(items.filter((i) => !i.ok && !i.required))
+  return { ready, items, suggested_root: root, total_missing_gb: total,
+           required_missing_gb: total, optional_missing_gb: opt,
            mock: true, hardware_brief: "显卡：NVIDIA GeForce RTX 3060（模拟）" }
 }
 
@@ -196,6 +201,9 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
   const [freeGb, setFreeGb] = useState<number | null>(null)
   const [busy, setBusy] = useState("")
   const [err, setErr] = useState("")
+  const [picking, setPicking] = useState(false)
+  const [pickErr, setPickErr] = useState("")
+  const [pickNote, setPickNote] = useState("")
   const [job, setJob] = useState<any>(null)
   const [prog, setProg] = useState<any>(null)
   const [installing, setInstalling] = useState(false)
@@ -313,8 +321,52 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
     setBusy("")
   }
 
+  // 选择安装目录：优先用宿主注入的系统目录框（Electron 原生，父子窗口关系正常）；
+  // 没有这个桥时改由插件进程弹（后台线程 + 轮询），两种都拿不到才让用户手输。
+  const pickFolder = async () => {
+    if (picking || installing) return
+    setPicking(true)
+    setPickErr("")
+    setPickNote("")
+    try {
+      const host: any = (window as any).nekoHost
+      if (host && typeof host.pickDirectory === "function") {
+        const r: any = await host.pickDirectory({ startPath: path.trim(), title: "选择安装文件夹" })
+        if (r && r.cancelled !== true && r.selected_root) setPath(String(r.selected_root))
+        setPicking(false)
+        return
+      }
+      const deadline = Date.now() + 10 * 60 * 1000
+      let first = true
+      while (Date.now() < deadline) {
+        const r: any = await callEntry(props.api, "ms_setup_browse",
+          { start_path: path.trim(), title: "选择安装文件夹", wait: first ? 2 : 20, restart: first }, 40000)
+        first = false
+        const st = String((r && r.state) || "")
+        if (st === "picked") {
+          if (r.path) setPath(String(r.path))
+          setPickNote("")
+          setPicking(false)
+          return
+        }
+        if (st === "cancelled") { setPickNote(""); setPicking(false); return }
+        if (st === "error") throw Error(String(r.error || "系统目录选择框打不开"))
+        setPickNote("已弹出系统选择窗口，在里面选好目录后会自动填进来。")
+      }
+      setPicking(false)
+      setPickErr("等了 10 分钟还没选好；也可以直接在下面的输入框里填路径。")
+    } catch (e: any) {
+      setPickNote("")
+      setPicking(false)
+      setPickErr("打不开系统目录选择框（" + String((e && e.message) || e) + "）；可以直接在下面的输入框里填路径。")
+    }
+  }
+
   const items = (report && report.items) || []
-  const needGb = report ? Number(report.total_missing_gb || 0) : 0
+  const needGb = report
+    ? Number(report.required_missing_gb !== undefined ? report.required_missing_gb : (report.total_missing_gb || 0)) || 0
+    : 0
+  const optGb = report ? Number(report.optional_missing_gb || 0) || 0 : 0
   const lack = freeGb !== null && needGb > 0 && freeGb < Math.max(0.5, needGb * 1.15)
   const allReady = !!report && report.ready === true
   const canNext = allReady || mockDone
@@ -495,8 +547,15 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
   )
 
   // 第 4 页：依赖与环境（旧向导第 1～3 步内容全部在这里）
-  // 未就绪的排在前面，已就绪的跟在后面；每一项都露出来，状态一眼能扫完。
-  const showing = [...items].sort((a: Item, b: Item) => Number(a.status === "ready") - Number(b.status === "ready"))
+  // 必需缺失 → 可选缺失 → 已就绪；每一项都露出来，状态一眼能扫完。
+  // 必需缺失 → 可选缺失 → 必需已就绪 → 可选已就绪：可选项统一沉到列表底部，不打断「必需项」的阅读顺序。
+  const rank = (i: Item) => (i.required ? (i.status === "ready" ? 2 : 0) : (i.status === "ready" ? 3 : 1))
+  const showing = [...items].sort((a: Item, b: Item) => rank(a) - rank(b))
+  const firstOptIdx = showing.findIndex((i: Item) => i.required === false)
+  const driveTips = (((report && report.hardware && report.hardware.drives) || []) as any[])
+    .map((d: any) => String(d.drive || ""))
+    .filter((s: string) => /^[A-Za-z]:/.test(s))
+    .slice(0, 4)
   const overall = (() => {
     if (!prog) return 0
     const list = items.filter((i) => i.status !== "ready")
@@ -509,6 +568,15 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
     return Math.round(sum / list.length)
   })()
   const failed = !!(prog && prog.job_state === "failed")
+  // 摘要里的下载量与耗时只按必需项算；可选的训练底模单独标出来，避免让人以为「必须下 1.1GB」。
+  const sizeText = !report ? "约 2 GB（以检测结果为准）"
+    : needGb > 0 ? "必需 " + needGb + " GB" + (optGb > 0 ? " · 可选 " + optGb + " GB" : "")
+      : optGb > 0 ? "必需 0 GB（已齐） · 可选 " + optGb + " GB"
+        : "不用下载（已齐）"
+  const timeText = !report ? "看网速，一般 10～40 分钟"
+    : needGb > 0 ? fmtEta(needGb * 900)
+      : optGb > 0 ? "必需项不用下；可选约 " + fmtEta(optGb * 900)
+        : "不用下载"
   const failLabels = items.filter((i) => {
     const st = prog && prog.items && prog.items[i.key]
     return st && st.state === "failed"
@@ -523,15 +591,15 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
         </div>
       </div>
 
-      {mustInstall ? <Alert tone="warning">必需的程序还没装好，先点「一键安装全部」把它装好才能开始使用。</Alert> : null}
+      {mustInstall ? <Alert tone="warning">必需的程序还没装好，先在下面把它装好才能开始使用。</Alert> : null}
       {mockMode ? <Alert tone="info">当前是模拟演示：没有连上安装接口，进度为示例数据，只用于查看界面流程。</Alert> : null}
       {err ? <Alert tone="warning">{err}</Alert> : null}
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 12 }}>
         {[
           ["要下载什么", "运行程序 + 声音模型 + 去伴奏模型"],
-          ["大约多大", report && needGb ? needGb + " GB" : "约 2 GB（以检测结果为准）"],
-          ["大概多久", report && needGb ? fmtEta(needGb * 900) : "看网速，一般 10～40 分钟"],
+          ["大约多大", sizeText],
+          ["大概多久", timeText],
         ].map((row: string[], i: number) => (
           <div key={i} style={{ padding: 14, borderRadius: 16, background: "rgba(255,229,239,0.5)", border: "1px solid rgba(224,45,118,0.10)" }}>
             <div style={{ fontSize: 11.5, color: INK_2 }}>{row[0]}</div>
@@ -547,20 +615,47 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
         </div>
         <label style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12, color: INK_2 }}>
           <span>安装到哪里</span>
-          <input value={path} placeholder="例如 D:\\NEKOMusicSynth" disabled={installing}
-                 onChange={(e: any) => setPath(e.target.value)} style={{
-                   border: "1px solid " + (lack ? "#e8a3a3" : "transparent"), borderRadius: 12, padding: "10px 14px", fontSize: 13,
-                   background: lack ? "#fff6f6" : "rgba(248,250,252,0.95)", color: INK, outline: "none",
-                 }} />
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <input value={path} placeholder="例如 D:\\NEKOMusicSynth" disabled={installing}
+                   onChange={(e: any) => setPath(e.target.value)} style={{
+                     flex: 1, minWidth: 0,
+                     border: "1px solid " + (lack ? "#e8a3a3" : "transparent"), borderRadius: 12, padding: "10px 14px", fontSize: 13,
+                     background: lack ? "#fff6f6" : "rgba(248,250,252,0.95)", color: INK, outline: "none",
+                   }} />
+            <Btn style={{ ...ghostBtn, padding: "9px 14px", fontSize: 12.5, whiteSpace: "nowrap", flex: "0 0 auto" }}
+                 disabled={installing || picking} onClick={pickFolder}>
+              {picking ? "选择中…" : "选择文件夹"}
+            </Btn>
+          </div>
         </label>
-        <Muted>必须自己填一个绝对路径（例如 D:\NEKOMusicSynth）。插件不会自动挑盘，也不会把模型下到别的盘。</Muted>
+        <Muted>点「选择文件夹」在系统窗口里挑一个位置；模型和程序只装到这个目录，不会改动系统设置。</Muted>
+        {pickNote ? <Muted>{pickNote}</Muted> : null}
+        {pickErr ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <Alert tone="warning">{pickErr}</Alert>
+            {driveTips.length ? (
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                <Muted style={{ fontSize: 11.5 }}>快捷填入：</Muted>
+                {driveTips.map((d: string) => (
+                  <button key={d} type="button" disabled={installing}
+                          onClick={() => setPath(d + "\\NEKOMusicSynth")}
+                          style={{ border: "1px solid rgba(224,45,118,0.16)", background: "#fff", color: BRAND_DEEP, borderRadius: 9, padding: "5px 10px", fontSize: 11.5, cursor: "pointer", fontFamily: "inherit" }}>
+                    {d}\NEKOMusicSynth
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
           {!path.trim() ? (
             <StatusBadge tone="warning">请先填写安装目录，否则不会开始下载</StatusBadge>
           ) : freeGb !== null ? (
             lack
               ? <StatusBadge tone="error">这个盘只剩 {freeGb.toFixed(1)} GB，还要约 {needGb} GB，换一个盘吧</StatusBadge>
-              : <StatusBadge tone="success">这个盘还剩 {freeGb.toFixed(1)} GB · 需要约 {needGb} GB</StatusBadge>
+              : needGb > 0
+                ? <StatusBadge tone="success">这个盘还剩 {freeGb.toFixed(1)} GB · 需要约 {needGb} GB</StatusBadge>
+                : <StatusBadge tone="success">这个盘还剩 {freeGb.toFixed(1)} GB · 必需项已齐</StatusBadge>
           ) : <Muted>（无法读取剩余空间，也可以继续）</Muted>}
         </div>
         {mockMode ? <Muted>安装向导暂时读不到检测结果。</Muted> : null}
@@ -584,35 +679,47 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
 
       {/* 依赖项列表 */}
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {showing.map((i) => {
+        {showing.map((i, idx) => {
           const st = (prog && prog.items && prog.items[i.key]) || { state: i.ok ? "ready" : i.installable ? "missing" : "missing_required", pct: null }
-          const tx = STATE_TEXT[st.state] || STATE_TEXT.wait
+          const isOpt = i.required === false
+          // 可选项没下载不是「缺点」：别用红色的必备缺失样式吓人，平静地标「可选」。
+          const quiet = isOpt && !i.ok && st.state !== "active" && st.state !== "failed" && st.state !== "done"
+          const tx = quiet ? { text: "可选", tone: "neutral" } : (STATE_TEXT[st.state] || STATE_TEXT.wait)
           const isActive = st.state === "active"
           const isDownload = st.total_mb && st.done_mb !== undefined && st.done_mb !== null
           const canInstall = i.installable && i.status !== "ready" && !installing
+          const optHeader = isOpt && idx === firstOptIdx
           return (
-            <div key={i.key} style={{ display: "grid", gridTemplateColumns: "24px minmax(0,1fr) auto", gap: "4px 10px", alignItems: "center", padding: "10px 13px", borderRadius: 15, background: isActive ? "rgba(255,229,239,0.55)" : "rgba(248,250,252,0.9)", border: "1px solid " + (isActive ? "rgba(224,45,118,0.18)" : LINE) }}>
-              <StateIcon state={st.state} />
-              <div style={{ minWidth: 0 }}>
-                <div style={{ fontSize: 12.5, color: INK, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{i.label}</div>
-                <div style={{ fontSize: 11.5, color: INK_3, lineHeight: 1.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {isDownload ? st.done_mb + " / " + st.total_mb + " MB"
-                    : (i.ok ? (i.detail || "已就绪") : (i.fix || i.detail || (i.size_gb ? "约 " + i.size_gb + " GB" : "")))}
+            <div key={i.key} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {optHeader ? (
+                <Muted style={{ fontSize: 11.5, padding: "2px 2px 0" }}>
+                  可选 · 只在训练音色时用；不装也能训练，会自动用中档底模
+                </Muted>
+              ) : null}
+              <div style={{ display: "grid", gridTemplateColumns: "24px minmax(0,1fr) auto", gap: "4px 10px", alignItems: "center", padding: "10px 13px", borderRadius: 15, background: isActive ? "rgba(255,229,239,0.55)" : "rgba(248,250,252,0.9)", border: "1px solid " + (isActive ? "rgba(224,45,118,0.18)" : LINE) }}>
+                <StateIcon state={quiet ? "wait" : st.state} />
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 12.5, color: INK, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{i.label}</div>
+                  <div style={{ fontSize: 11.5, color: INK_3, lineHeight: 1.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {isDownload ? st.done_mb + " / " + st.total_mb + " MB"
+                      : (i.ok ? (i.detail || "已就绪")
+                        : (i.fix || i.detail || (i.size_gb ? "约 " + i.size_gb + " GB" : "")))}
+                  </div>
                 </div>
-              </div>
-              <Row style={{ gap: 8 }}>
-                <Pill tone={tx.tone}>{tx.text}</Pill>
-                {canInstall ? (
-                  <Btn style={{ ...ghostBtn, padding: "5px 11px", fontSize: 11.5, borderRadius: 9 }} disabled={!!busy}
-                       onClick={() => startInstall(i.key)}>安装</Btn>
-                ) : null}
-                {failed && st.state === "failed" ? (
-                  <Btn style={{ ...ghostBtn, padding: "5px 11px", fontSize: 11.5, borderRadius: 9 }} disabled={!!busy}
-                       onClick={() => startInstall(i.key)}>重试这一项</Btn>
-                ) : null}
-              </Row>
-              <div style={{ gridColumn: "2 / 4" }}>
-                <Bar pct={st.state === "done" || st.state === "ready" ? 100 : Number(st.pct || 0)} tone={st.state === "failed" ? "#e06666" : st.state === "active" ? undefined : "rgba(224,45,118,0.35)"} />
+                <Row style={{ gap: 8 }}>
+                  <Pill tone={tx.tone}>{tx.text}</Pill>
+                  {canInstall ? (
+                    <Btn style={{ ...ghostBtn, padding: "5px 11px", fontSize: 11.5, borderRadius: 9 }} disabled={!!busy}
+                         onClick={() => startInstall(i.key)}>安装</Btn>
+                  ) : null}
+                  {failed && st.state === "failed" ? (
+                    <Btn style={{ ...ghostBtn, padding: "5px 11px", fontSize: 11.5, borderRadius: 9 }} disabled={!!busy}
+                         onClick={() => startInstall(i.key)}>重试这一项</Btn>
+                  ) : null}
+                </Row>
+                <div style={{ gridColumn: "2 / 4" }}>
+                  <Bar pct={st.state === "done" || st.state === "ready" ? 100 : Number(st.pct || 0)} tone={st.state === "failed" ? "#e06666" : st.state === "active" ? undefined : "rgba(224,45,118,0.35)"} />
+                </div>
               </div>
             </div>
           )
@@ -640,8 +747,11 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
       </span>
       <div style={{ fontSize: 22, fontWeight: 800, color: INK }}>都准备好了</div>
       <div style={{ fontSize: 13.5, color: INK_2, lineHeight: 1.9, maxWidth: 480 }}>
-        全部就绪。以后打开插件不用再装东西了。先把几首歌放进「准备素材」，就能开始训练她的声音。
+        必需项已就绪。以后打开插件不用再装东西了。先把几首歌放进「准备素材」，就能开始训练她的声音。
       </div>
+      {optGb > 0 ? (
+        <Muted style={{ fontSize: 12 }}>可选的两档训练底模还没下载，想训练音色时可以在训练页按需下载，不装也能练。</Muted>
+      ) : null}
       <div style={{ padding: "12px 18px", borderRadius: 16, background: "rgba(255,229,239,0.5)", border: "1px solid rgba(224,45,118,0.10)", fontSize: 12.5, color: "#9c204e", lineHeight: 1.7 }}>
         小提示：第一次可以先在「让她唱歌」里挑一首歌，用内置的「沫沫」试一遍。
       </div>
@@ -702,10 +812,11 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
               <Row style={{ justifyContent: "space-between", alignItems: "center" }}>
                 <Btn style={ghostBtn} onClick={() => setStep(3)} disabled={installing}>上一步</Btn>
                 <Row style={{ gap: 10 }}>
-                  {allReady || mockDone ? null : (
+                  {/* 必需项齐了也能补装可选档位，所以这里只看「有没有可装的东西」，不看 allReady */}
+                  {!items.some((i: Item) => i.installable && i.status !== "ready") ? null : (
                     <Btn style={primaryBtn} disabled={!!busy || installing || !path.trim() || lack || !items.some((i: Item) => i.installable && i.status !== "ready")}
                          onClick={() => startInstall()}>
-                      {installing ? "正在安装…" : busy === "all" ? "正在启动…" : "一键安装全部"}
+                      {installing ? "正在安装…" : busy === "all" ? "正在启动…" : needGb > 0 ? "一键安装全部" : "安装可选项"}
                     </Btn>
                   )}
                   <Btn style={canNext ? primaryBtn : ghostBtn} disabled={!canNext || installing} onClick={() => setStep(5)}>

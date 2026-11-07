@@ -426,3 +426,45 @@ config.example.toml」，但移动会改变默认值来源，这次只记录不�
   `success/data` 外壳，不看 `ok`），向导检测走它；其它入口仍走原来的
   `callEntry`，避免把真正的失败吞掉。
 
+### 安装目录改成系统目录选择框（2026-11-07）
+
+用户反馈：「安装到哪里」不该让人手打绝对路径。第 4 页现在有「选择文件夹」按钮，
+手填输入框只作兜底：
+
+1. 优先 `window.nekoHost.pickDirectory({startPath,title})`（Electron 预加载桥，
+   `src/preload/shared/common.js` 里的 `setupHostCapabilityBridge`）。返回
+   `{cancelled:true}` 或 `{cancelled:false, selected_root}`，直接回填。
+2. 没有宿主桥（普通浏览器 / 旧宿主）时走新入口 `ms_setup_browse`：
+   `setup.py` 在后台线程里弹原生目录框，入口本身只等 `wait` 秒（上限 30，
+   因为 `plugin_runtime.timeout = 45`）。UI 用 `restart` 只在第一次传 true，
+   之后重复轮询拿结果，避免取消后又被轮询重新弹窗；返回
+   `state=picked|cancelled|open|error`，`error` 时给警告 + 盘符快捷填入按钮。
+3. 原生实现顺序：Windows 先走纯 `ctypes` 的 `shell32!SHBrowseForFolderW`
+   （`BIF_RETURNONLYFSDIRS|BIF_EDITBOX|BIF_NEWDIALOGSTYLE`，起始目录用
+   `BFFM_SETSELECTIONW` 设好）；失败再试 `tkinter.filedialog.askdirectory`。
+   **宿主内 tkinter 不可用**：PyInstaller 打进了 `_tkinter.pyd` / `tk86t.dll`，
+   但没打 `tkinter.filedialog` 子模块，`import` 直接 ImportError。
+- 原输入框保留，`suggested_root` 预填、剩余空间判断、「模型和程序只装到这个
+  目录」的说明都在；那句「必须自己填一个绝对路径……不会自动挑盘」的吓人文案
+  已换成「点「选择文件夹」在系统窗口里挑一个位置；模型和程序只装到这个目录，
+  不会改动系统设置。」
+- 入口靠 `@plugin_entry` 注册，`plugin.toml` 自 0.2.31 起不再写
+  `[[plugin.entries]]`（字段本身不被识别），所以这次只加装饰器、没改 toml。
+
+### 训练质量底模改可选（2026-11-07）
+
+`ddsp_base_low`（6x512，约 0.09 GB）/ `ddsp_base_high`（10x2048，约 0.97 GB）
+在 `MODEL_ITEMS` 里加了 `"optional": True`：
+
+- 报告里 `required=false`，缺了不参与 `ready` 判定；`required_missing_gb` 只算
+  必需项，可选单独给 `optional_missing_gb`（`total_missing_gb` 保留旧名，语义
+  已收窄为必需项）。
+- 第 4 页排序：必需缺失 → 可选缺失 → 必需就绪 → 可选就绪；可选组上方一条
+  「可选 · 只在训练音色时用；不装也能训练，会自动用中档底模」，状态用中性的
+  「可选」而不是红色「缺少」。
+- 「一键安装全部」在后端 `install(items=None)` 里就是「所有可安装且未就绪」，
+  所以包含可选项；必需项全齐时底部按钮 label 变成「安装可选项」。
+- 只有可选项缺失时 `ready=true`，跳过引导 / 下一步都放行；必需项缺失时仍然
+  拦（`knownMissing` 只看 `required && !ok && installable`）。
+
+
