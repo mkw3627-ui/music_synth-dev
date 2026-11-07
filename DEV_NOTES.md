@@ -232,3 +232,43 @@ ACE 原曲是立体声（左右相关约 0.93），经过「让她唱」后成�
 - 新增 `ms_base_status` / `ms_base_download`；训练页在质量档位下显示
   「底模已就绪」或「下载底模」按钮，并带真实下载进度。
 - 没有低/高档底模时训练会明确提示回退到中档，不再静默。
+
+## 产物校验 + 采集排障（2026-11-07，v0.2.27）
+
+两处改动都来自本机实测，不是推测。
+
+### 1. 生成产物有效性校验（`ace_runtime.py`）
+
+**问题**：GTX 1650（sm_75，pre-Ampere）上 fp16 采样溢出，DiT 仍返回 `success=True`，
+写出的 WAV 每个采样点都是 `-1.0`（唯一值数量 1、过零率 0）。调用方
+`workers/ace_worker.py` 只看 `success`，于是把死文件当成品交给用户，用户只听到「没声音」。
+
+**改动**：新增 `_probe_audio_file()`（纯标准库），在生成返回前抽首/中/尾三段共约 2.4 万采样点，
+检查唯一值数量与峰值：
+- 唯一值 ≤ 1 → 判定「常量信号」
+- 峰值 < 0.001 → 判定「近乎静音」
+- 命中即把 `success` 置 `False`，消息进 `error` 与 `status_message`（调用方 `error` 优先，两处必须一致）
+- 检测结果写进 `extra_outputs["quality"]["probes"]`，供面板展示
+
+**附带**：设备为 cuda/auto 时，失败消息追加 pre-Ampere 提示（改 `device=cpu` 重试）。
+
+### 2. 采集子进程 stderr 不再丢弃（`workers/app_song_worker.py`）
+
+**问题**：`Capture.start()` 用 `stderr=subprocess.DEVNULL` 丢弃子进程 stderr。缺
+`proctap/_native.*.pyd` 这类真因（`ImportError: No module named 'proctap._native'`）
+全在 stderr 里，被吞掉后用户只看到「录不到声音」，无从排障。
+
+**改动**：
+- stderr 重定向到 `<out_dir>/capture_stderr.log`（超过 2MB 自动轮转）
+- 新增 `Capture.stderr_tail()`；`packet()` 抛错时附带 stderr 末尾 12 行
+- `stop()` 用 `try/finally` 关闭日志句柄
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| `_probe_audio_file` 对有效音频（端到端成品 / MusicGen） | `ok=True`（uniq 15628 / 9559） |
+| 对人为构造的常量 −1.0 | `ok=False` →「常量信号（唯一值 1，峰值 1.000）」 |
+| 对全静音 WAV | `ok=False` →「常量信号（唯一值 1，峰值 0.000）」 |
+| `pytest plugin/plugins/music_synth/tests/` | 1 passed |
+| 沙箱实测（N.E.K.O standalone 服务器） | `/health` 200，`music_synth` = running |

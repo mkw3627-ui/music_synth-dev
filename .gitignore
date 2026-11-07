@@ -1,6 +1,6 @@
 # Python
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
 
 # 本地备份 / 调试

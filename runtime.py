@@ -1205,10 +1205,14 @@ def _capture_perception_paths(data_dir: Path) -> dict:
 
 
 def _capture_paths_ok(paths: dict) -> bool:
+    """目录存在 != 能 import：proc-tap 的 _native 是硬依赖，必须一并检查。"""
     python, vendor, addon = paths.get("python"), paths.get("vendor"), paths.get("addon")
-    return bool(python and Path(python).is_file()
-                and vendor and (Path(vendor) / "numpy").is_dir()
-                and addon and (Path(addon) / "proctap").is_dir())
+    if not (python and Path(python).is_file()
+            and vendor and (Path(vendor) / "numpy").is_dir()
+            and addon and (Path(addon) / "proctap").is_dir()):
+        return False
+    pkg = Path(addon) / "proctap"
+    return bool(list(pkg.glob("_native*.pyd")) or list(pkg.glob("_native*.so")))
 
 
 def locate_app_capture_runtime(data_dir: Path, synth_python: str = "") -> dict:
@@ -1233,7 +1237,7 @@ def locate_app_capture_runtime(data_dir: Path, synth_python: str = "") -> dict:
                 "root": str(mp["root"])}
     return {"ok": False,
             "error": "逐应用声道采集组件缺失（合成环境 numpy 或 proc-tap）",
-            "hint": "先完成一次合成环境安装；本插件已内置 proc-tap，不需要另装为她所听。"}
+            "hint": "先完成一次合成环境安装；若 proc-tap 目录在但缺 _native*.pyd，说明原生扩展未入库，请在合成环境里执行 pip install proc-tap==1.1.1 后重试。"}
 
 
 def _link_or_copy_tree(src: Path, dst: Path) -> int:

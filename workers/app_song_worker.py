@@ -146,6 +146,33 @@ class Capture:
     def __init__(self, job: dict):
         self.job = job
         self.proc = None
+        self._err_log = None
+
+    def _err_log_path(self) -> Path:
+        base = Path(str(self.job.get("out_dir") or ".")) / "capture_stderr.log"
+        return base
+
+    def _open_err_log(self):
+        """采集子进程的 stderr 不能丢：缺 _native、DLL 缺失这类真因全在 stderr 里。
+        实测原始实现用 DEVNULL，用户只能看到「录不到声音」，无从排障。"""
+        try:
+            path = self._err_log_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists() and path.stat().st_size > 2_000_000:
+                path.unlink()
+            return open(path, "ab")
+        except OSError:
+            return None
+
+    def stderr_tail(self, limit: int = 12) -> str:
+        try:
+            path = self._err_log_path()
+            if not path.is_file():
+                return ""
+            text = path.read_text(encoding="utf-8", errors="replace")
+            return "\n".join(text.splitlines()[-limit:])
+        except OSError:
+            return ""
 
     def start(self) -> None:
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
@@ -155,32 +182,47 @@ class Capture:
             str(self.job["capture_vendor"]), str(self.job["capture_addon"]),
             str(int(self.job["pid"])), str(self.job["token"]), "stereo",
         ]
+        self._err_log = self._open_err_log()
         self.proc = subprocess.Popen(
             argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, creationflags=flags, bufsize=0)
+            stderr=self._err_log if self._err_log is not None else subprocess.DEVNULL,
+            creationflags=flags, bufsize=0)
         return None
 
     def packet(self):
         if self.proc is None or self.proc.stdout is None:
             raise RuntimeError("capture process is not running")
-        return _read_packet(self.proc.stdout)
+        try:
+            return _read_packet(self.proc.stdout)
+        except Exception as exc:
+            tail = self.stderr_tail()
+            detail = f"\n采集子进程 stderr（末尾）:\n{tail}" if tail else ""
+            raise RuntimeError(f"{exc}{detail}") from exc
 
     def alive(self) -> bool:
         return bool(self.proc is not None and self.proc.poll() is None)
 
     def stop(self) -> None:
-        if self.proc is not None and self.proc.poll() is None:
-            try:
-                self.proc.terminate()
-            except OSError:
-                pass
-            try:
-                self.proc.wait(timeout=3)
-            except Exception:  # noqa: BLE001
+        try:
+            if self.proc is not None and self.proc.poll() is None:
                 try:
-                    self.proc.kill()
+                    self.proc.terminate()
                 except OSError:
                     pass
+                try:
+                    self.proc.wait(timeout=3)
+                except Exception:  # noqa: BLE001
+                    try:
+                        self.proc.kill()
+                    except OSError:
+                        pass
+        finally:
+            if self._err_log is not None:
+                try:
+                    self._err_log.close()
+                except OSError:
+                    pass
+                self._err_log = None
 
 
 def _smtc(job: dict) -> dict:

@@ -98,6 +98,53 @@ class AceStepGenerateResult:
     error: Optional[str] = None
 
 
+def _probe_audio_file(path: str, window: int = 8000) -> Dict[str, Any]:
+    """对生成的 WAV 做一次廉价合理性检查（仅标准库）。
+
+    目的：拦住「流程报成功、产物却是死信号」这类失败。实测在 sm_75（GTX 1650）
+    上 fp16 采样会溢出，DiT 仍返回 success=True，写出来的 WAV 每个采样点都是 -1.0。
+    只看 success 会把这种死文件当成品交给用户。
+    """
+    info: Dict[str, Any] = {"path": path, "ok": None, "reason": ""}
+    try:
+        import wave
+
+        with wave.open(path, "rb") as w:
+            frames = w.getnframes()
+            channels = w.getnchannels()
+            width = w.getsampwidth()
+            if frames <= 0:
+                return {**info, "ok": False, "reason": "文件为空（0 帧）"}
+            if width != 2:
+                return {**info, "ok": None, "reason": f"{width * 8}bit，跳过校验"}
+            raw_all = b""
+            for pos in (0, max(0, frames // 2 - window // 2), max(0, frames - window)):
+                w.setpos(pos)
+                raw_all += w.readframes(min(window, frames - pos))
+    except Exception as exc:  # noqa: BLE001
+        return {**info, "ok": None, "reason": f"无法解析 WAV：{type(exc).__name__}"}
+
+    import array
+    import sys as _sys
+
+    samples = array.array("h")
+    samples.frombytes(raw_all[: (len(raw_all) // 2) * 2])
+    if _sys.byteorder != "little":
+        samples.byteswap()
+    if not samples:
+        return {**info, "ok": False, "reason": "无采样数据"}
+
+    picked = samples[:: max(1, len(samples) // 20000)] or samples[:1]
+    uniq = len(set(picked))
+    peak = max(abs(v) for v in picked) / 32768.0
+    info.update({"frames": frames, "channels": channels, "uniq": uniq, "peak": round(peak, 4)})
+    if uniq <= 1:
+        return {**info, "ok": False, "reason": f"常量信号（唯一值 {uniq}，峰值 {peak:.3f}）"}
+    if peak < 0.001:
+        return {**info, "ok": False, "reason": f"近乎静音（峰值 {peak:.4f}）"}
+    return {**info, "ok": True, "reason": ""}
+
+
 class AceStepLocalRuntime:
     """Embedded ACE-Step runtime that does not depend on the original project path."""
 
@@ -259,6 +306,28 @@ class AceStepLocalRuntime:
         )
 
         audio_paths = [audio.get("path") for audio in result.audios if audio.get("path")]
+        probes = [_probe_audio_file(p) for p in audio_paths]
+        quality = {"probes": probes}
+        dead = [x for x in probes if x.get("ok") is False]
+        if dead and result.success:
+            hint = ""
+            if str(self.config.device).lower() in ("auto", "cuda", "gpu"):
+                hint = ("；若显卡为 pre-Ampere（sm_75 及以下，如 GTX 16 系），"
+                        "fp16 采样会溢出，可把 device 改为 cpu 重试")
+            # 调用方是 `raise RuntimeError(generated.error or generated.status_message)`，
+            # error 优先，所以排查提示必须同时写进 error，否则会被丢掉。
+            message = f"生成产物无效：{dead[0]['reason']}{hint}"
+            return AceStepGenerateResult(
+                success=False,
+                status_message=message,
+                audio_paths=audio_paths,
+                audios=result.audios,
+                prompt=params.caption,
+                lyrics=params.lyrics,
+                metas={"task_type": params.task_type, "duration": params.duration},
+                extra_outputs={**(result.extra_outputs or {}), "quality": quality},
+                error=message,
+            )
         metas = {
             "bpm": params.bpm,
             "duration": params.duration,
@@ -277,7 +346,7 @@ class AceStepLocalRuntime:
             prompt=params.caption,
             lyrics=params.lyrics,
             metas=metas,
-            extra_outputs=result.extra_outputs or {},
+            extra_outputs={**(result.extra_outputs or {}), "quality": quality},
             error=result.error,
         )
 
