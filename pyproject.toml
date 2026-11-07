@@ -1,0 +1,6 @@
+# 只为声明打包规则（N.E.K.O Plugin CLI 的 [tool.neko.build]）。
+# 插件市场不允许包内出现二进制文件：.exe / .pyd / .dll 一律排除。
+# proc-tap 与 winrt 由 setup.py 在安装时 pip 装进合成环境；
+# ACE 的 genres_vocab 改为随包发纯文本 genres_vocab.txt，不再带 .gz。
+[tool.neko.build]
+exclude = ["*.pyd", "*.exe", "*.dll", "*.so", "*.dylib", "*.gz"]

@@ -156,6 +156,12 @@ SEP_PACKAGES = [
     "audio-separator>=0.48", "soundfile", "librosa", "psutil", "pyyaml",
 ]
 
+# 原生扩展：市场禁止插件包带二进制，只能安装时装进合成环境。
+# proc-tap 提供逐应用 WASAPI 采集，winrt 提供系统媒体信息（SMTC）。
+CAPTURE_NATIVE_PACKAGES = [
+    "proc-tap==1.1.1", "winrt-Windows.Media.Control",
+]
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -912,6 +918,13 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
             installed.append("synth_deps")
         except Exception as exc:  # noqa: BLE001
             errors.append({"item": "synth_deps", "error": str(exc)})
+        # 市场不允许插件包携带 .pyd/.exe/.dll，逐应用采集（proc-tap）和系统媒体
+        # 信息（winrt）改用 pip 装进合成环境；缺了只是这两个功能不可用，不阻塞安装。
+        try:
+            _pip(synth_py, CAPTURE_NATIVE_PACKAGES, progress, "安装采集 / 系统媒体组件")
+            installed.append("capture_native")
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"item": "capture_native", "error": str(exc)})
     if "ffmpeg" in requested and synth_py.is_file():
         try:
             _pip(synth_py, ["imageio-ffmpeg"], progress, "安装 imageio-ffmpeg")

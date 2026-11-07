@@ -1204,15 +1204,25 @@ def _capture_perception_paths(data_dir: Path) -> dict:
     return {"root": env_dir, "python": python, "vendor": vendor, "addon": addon}
 
 
+def _proctap_native_ok(base) -> bool:
+    """proc-tap 的 _native 扩展在不在：目录在但缺原生扩展，import 一样会炸。"""
+    if not base:
+        return False
+    pkg = Path(base) / "proctap"
+    if not pkg.is_dir():
+        return False
+    return bool(list(pkg.glob("_native*.pyd")) or list(pkg.glob("_native*.so")))
+
+
 def _capture_paths_ok(paths: dict) -> bool:
     """目录存在 != 能 import：proc-tap 的 _native 是硬依赖，必须一并检查。"""
     python, vendor, addon = paths.get("python"), paths.get("vendor"), paths.get("addon")
     if not (python and Path(python).is_file()
-            and vendor and (Path(vendor) / "numpy").is_dir()
-            and addon and (Path(addon) / "proctap").is_dir()):
+            and vendor and (Path(vendor) / "numpy").is_dir()):
         return False
-    pkg = Path(addon) / "proctap"
-    return bool(list(pkg.glob("_native*.pyd")) or list(pkg.glob("_native*.so")))
+    # 市场禁止插件包携带二进制文件，proc-tap 改由安装流程 pip 装进合成环境；
+    # 这时它在 venv 的 site-packages 里，没有单独的 app_capture 目录。
+    return _proctap_native_ok(addon) or _proctap_native_ok(vendor)
 
 
 def locate_app_capture_runtime(data_dir: Path, synth_python: str = "") -> dict:
@@ -1229,7 +1239,7 @@ def locate_app_capture_runtime(data_dir: Path, synth_python: str = "") -> dict:
         return {"ok": True,
                 "source": "self_synth" if used_synth else "self",
                 "python": str(own["python"]), "vendor": str(own["vendor"]),
-                "addon": str(own["addon"]), "root": str(own["root"])}
+                "addon": str(own["addon"] or own["vendor"]), "root": str(own["root"])}
     mp = _capture_perception_paths(data_dir)
     if _capture_paths_ok(mp):
         return {"ok": True, "source": "perception", "python": str(mp["python"]),
@@ -1325,6 +1335,11 @@ def locate_smtc_runtime(data_dir: Path, synth_python: str = "") -> dict:
         for vendor in vendors:
             return {"ok": True, "python": str(synth_python), "vendor": str(vendor),
                     "worker_script": str(script), "source": "self"}
+        # 市场禁止插件包带 .pyd，winrt 改由安装流程 pip 装进合成环境。
+        venv = _venv_site_packages(Path(synth_python))
+        if venv and (venv / "winrt" / "windows" / "media" / "control").is_dir():
+            return {"ok": True, "python": str(synth_python), "vendor": str(venv),
+                    "worker_script": str(script), "source": "self_synth_pip"}
 
     for source, paths in (("self", _capture_own_paths(data_dir)),
                           ("perception", _capture_perception_paths(data_dir))):

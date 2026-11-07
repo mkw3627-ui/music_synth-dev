@@ -61,6 +61,9 @@ def keep(rel):
         return False
     if base.endswith(('.pyc', '.pyo', '~')):
         return False
+    # 市场拒绝包内二进制文件；原生组件由安装流程 pip 装进合成环境。
+    if base.endswith(('.pyd', '.exe', '.dll', '.so', '.dylib', '.gz')):
+        return False
     if '.bak' in base or '_bak' in base or base.startswith('_dbg'):
         return False
     return True

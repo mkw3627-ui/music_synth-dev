@@ -291,3 +291,31 @@ ACE 原曲是立体声（左右相关约 0.93），经过「让她唱」后成�
 - ACE：`candidates`（1–6 个候选，按频谱/动态打分挑最佳）与 `quantization`
   （auto / off / int8_weight_only / fp8_weight_only）参数透传。
 - 采集：新增 `workers/song_titles.py`，录制标题清洗与曲名处理增强。
+
+## 市场发布：包内不再带二进制（2026-11-07，v0.2.29）
+
+市场对插件包的硬规则：**包内不允许出现二进制文件**
+（`check --release` 报 `the Market rejects binary files in the package`）。
+v0.2.28 的发布任务就是死在这一条上，被点名的有：
+
+- `vendor/proc-tap-.../bin/proctap.exe`、`vendor/proc-tap-.../proctap/_native.cp311-win_amd64.pyd`
+- `vendor/smtc_vendor/winrt/_winrt*.pyd`（4 个）、`vendor/smtc_vendor/winrt/msvcp140.dll`
+- `vendor/acestep/genres_vocab.txt.gz`
+
+改法：
+
+- 新增 `pyproject.toml`，用 `[tool.neko.build] exclude = ["*.pyd","*.exe","*.dll","*.so","*.dylib","*.gz"]`
+  让官方打包 CLI 不收二进制；`tools/build_package.py` 同步加了同样的后缀过滤。
+- proc-tap 与 winrt 改为安装时 pip 装进合成环境：
+  `CAPTURE_NATIVE_PACKAGES = ["proc-tap==1.1.1", "winrt-Windows.Media.Control"]`，
+  装不上只影响「逐应用采集 / 系统媒体信息」，不阻塞环境安装。
+- `runtime.py` 找不到包内组件时回退到合成环境 venv 的 site-packages：
+  `_capture_paths_ok` 接受 `site-packages/proctap/_native*.pyd`，
+  `locate_app_capture_runtime` 的 addon 回退为 vendor 目录，
+  `locate_smtc_runtime` 增加 `site-packages/winrt/windows/media/control` 判定。
+- ACE 词表改为随包发纯文本 `vendor/acestep/genres_vocab.txt`（4.98MB），
+  `constrained_logits_processor` 本来就支持无 .gz。
+
+实测：在 `E:/NekoMusicSynth/envs/ddsp` 里 `pip install proc-tap==1.1.1 winrt-Windows.Media.Control`
+后，用插件同样的隔离方式 `python -I -S` 可以正常 `import proctap` 和
+`from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager`。

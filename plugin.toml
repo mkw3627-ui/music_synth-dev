@@ -4,7 +4,7 @@ name = "为她而唱"
 description = "全自动变声翻唱模块：采集 AI 正在听的歌 → 按静音/标题切歌 → 分离人声与伴奏 → 用 DDSP-SVC 6.3（RectifiedFlow）把原唱声线转换到目标音色 → 混回伴奏 → 面板出曲、AI 可调用演唱。"
 short_description = "听歌识歌、人声分离、DDSP-SVC 音色转换翻唱，一键出成品并让 AI 唱出来"
 keywords = ["唱歌", "翻唱", "变声", "音色转换", "DDSP-SVC", "人声分离", "SVC", "sing", "cover", "vocal", "voice conversion"]
-version = "0.2.28"
+version = "0.2.29"
 type = "plugin"
 entry = "plugin.plugins.music_synth:MusicSynthPlugin"
 
