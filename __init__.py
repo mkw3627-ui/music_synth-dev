@@ -247,6 +247,9 @@ class MusicSynthPlugin(NekoPluginBase):
         # 处理完要自动播放的曲目 id（AI 点了名但还没唱过的那首）
         self._pending_play: set = set()
         self._setup_job = ""
+        self._setup_job_ts = 0.0
+        # 首次安装只允许跑一条线程：向导/首页两个入口同时点会抢同一批 .part。
+        self._setup_lock = threading.Lock()
         # playback debounce state (2026-11-03)
         self._playback_proc = None
         self._last_play_target = ""
@@ -731,8 +734,7 @@ class MusicSynthPlugin(NekoPluginBase):
                    "size_gb": item["size_gb"]} for item in report["items"]]
         self._save_setup_state({"checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                                 "report": report,
-                                "completed": bool(report["ready"]) or
-                                bool(self._setup_state().get("completed"))})
+                                "completed": bool(report["ready"])})
         return Ok({"ok": report["ready"], "ready": report["ready"], "checks": checks,
                    "report": report,
                    "tier": runtime.plan_for(report["hardware"],
@@ -756,8 +758,7 @@ class MusicSynthPlugin(NekoPluginBase):
         report = await asyncio.to_thread(setup_mod.check_dependencies, paths)
         self._save_setup_state({"checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                                 "report": report,
-                                "completed": bool(report["ready"]) or
-                                bool(self._setup_state().get("completed"))})
+                                "completed": bool(report["ready"])})
         return Ok(report)
 
     @plugin_entry(id="ms_setup_browse", name="为她而唱 · 选择安装目录",
@@ -829,13 +830,27 @@ class MusicSynthPlugin(NekoPluginBase):
         selected = [str(x) for x in items] if isinstance(items, (list, tuple)) else None
         if selected is not None:
             selected = [x for x in selected if x]
-        if not report["installable_missing"] and not selected:
-            self._save_setup_state({"completed": True, "report": report,
-                                    "checked_at": time.strftime("%Y-%m-%d %H:%M:%S")})
-            return Ok({"ok": True, "already_ready": True, "report": report})
-        job_id = self._job_begin("setup")
-        self._setup_job = job_id
-        self._setup_pct = {}
+        if not selected and not report["installable_missing"]:
+            if report["ready"]:
+                self._save_setup_state({"completed": True, "report": report,
+                                        "checked_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+                return Ok({"ok": True, "already_ready": True, "report": report})
+            # 缺的必需项没有自动安装手段（例如安装盘读不到）：明说原因，
+            # 别返回 already_ready 把人骗进「完成」页。
+            return Ok({"ok": False, "report": report,
+                       "error": "以下必需项无法自动安装：" + "、".join(report["missing"])})
+        with self._setup_lock:
+            with self._jobs_lock:
+                cur = dict(self._jobs.get(self._setup_job) or {}) if self._setup_job else {}
+            if cur.get("state") == "running" and time.time() - self._setup_job_ts < 6 * 3600:
+                # 已经有一条安装线程在跑：把同一个 job 交回去，避免两个线程抢 .part。
+                return Ok({"ok": True, "started": True, "running": True,
+                           "job_id": self._setup_job,
+                           "report": self._setup_state().get("report") or report})
+            job_id = self._job_begin("setup")
+            self._setup_job = job_id
+            self._setup_job_ts = time.time()
+            self._setup_pct = {}
         probe = report["hardware"]
 
         def runner():
@@ -856,9 +871,14 @@ class MusicSynthPlugin(NekoPluginBase):
                     "report": after,
                     "last_install": {k: v for k, v in result.items() if k != "report"},
                 })
-                detail = ("安装完成" if result.get("ok")
-                          else "安装未全部完成：" + "；".join(
-                              f"{e.get('item')}: {e.get('error')}" for e in result.get("errors", [])))
+                errs = [f"{e.get('item')}: {e.get('error')}" for e in result.get("errors", [])]
+                if not result.get("ok"):
+                    if result.get("error"):
+                        errs.insert(0, str(result["error"]))
+                    if not errs:
+                        miss = result.get("missing_after") or []
+                        errs.append(("仍缺少：" + "、".join(miss)) if miss else "未知原因（没有可下载的项，但仍有必需项未就绪）")
+                detail = "安装完成" if result.get("ok") else "安装未全部完成：" + "；".join(errs)
                 self._job_update(job_id, state="done" if result.get("ok") else "failed",
                                  progress=100, detail=detail[-500:], result=result)
             except Exception as exc:  # noqa: BLE001
@@ -873,6 +893,32 @@ class MusicSynthPlugin(NekoPluginBase):
                    "paths": {"compute_root": str(paths["compute_root"]),
                              "models_dir": str(paths["models_dir"]),
                              "work_dir": str(paths["work_dir"])}})
+
+    @plugin_entry(id="ms_setup_redownload", name="为她而唱 · 重新下载模型",
+                  description=("把 ContentVec 编码器 / 人声分离权重挪进 models/_trash 后重新下载，"
+                               "用于修复被中断的残缺文件"),
+                  input_schema={"type": "object", "properties": {
+                      "model": {"type": "string", "enum": ["ddsp_contentvec", "sep_karaoke"]}}})
+    async def ms_setup_redownload(self, model: str = "", **_):
+        key = str(model or "").strip()
+        if key not in setup_mod.REDOWNLOAD_KEYS:
+            return Ok({"ok": False, "error": f"不支持重下的模型：{key or '（空）'}"})
+        paths = self._reload_paths()
+        if not paths.get("configured"):
+            return Ok({"ok": False, "needs_path": True,
+                       "error": "还没有选择安装位置，请先到安装向导里选一个目录"})
+        try:
+            moved = await asyncio.to_thread(setup_mod.stash_model_files, paths, key)
+        except Exception as exc:  # noqa: BLE001
+            return Ok({"ok": False, "error": f"移走旧文件失败：{type(exc).__name__}: {exc}"})
+        res = await self.ms_setup_install(items=[key])
+        payload = getattr(res, "value", res)
+        if isinstance(payload, dict):
+            payload = dict(payload)
+            payload["redownload"] = key
+            payload["moved"] = moved
+            return Ok(payload)
+        return res
 
     _setup_pct: dict = {}  # 下载类分项进度只增不减，重启插件后从 0 重新计
 

@@ -20,9 +20,12 @@ import os
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -721,6 +724,65 @@ def dynamic_parallel(plan: dict) -> int:
 # ---------------------------------------------------------------------------
 # Subprocess helpers
 # ---------------------------------------------------------------------------
+_PROXY_ALIVE: list[bool | None] = [None]
+
+
+def proxy_alive(timeout: float = 1.5, force: bool = False) -> bool:
+    """代理变量指向的本地端口到底能不能连上。
+
+    Windows 上常见「Clash/V2Ray 已经退出，但 HTTP_PROXY 还留在用户环境变量里」，
+    这时 urllib / pip / huggingface_hub 的每个请求都会立刻 10061 拒绝连接，
+    表现就是所有下载全失败。探测不到代理时调用方应改走直连。
+
+    ``force=True`` 丢弃缓存重新探测：代理可能在插件启动后才退出/启动，
+    一次性的缓存会让整套下载在会话中途永久走死代理。
+    """
+    if force:
+        _PROXY_ALIVE[0] = None
+    if _PROXY_ALIVE[0] is not None:
+        return _PROXY_ALIVE[0]
+    targets: set[tuple[str, int]] = set()
+    try:
+        proxies = urllib.request.getproxies()  # 环境变量 + Windows 系统代理
+    except Exception:  # noqa: BLE001 - 读不到就按直连处理
+        proxies = {}
+    for key in ("http", "https", "all"):
+        raw = str(proxies.get(key) or "").strip()
+        if not raw:
+            continue
+        if "://" not in raw:
+            raw = "http://" + raw
+        try:
+            parsed = urllib.parse.urlsplit(raw)
+        except ValueError:
+            continue
+        if parsed.hostname:
+            targets.add((parsed.hostname, int(parsed.port or 80)))
+    if not targets:
+        _PROXY_ALIVE[0] = True
+        return True
+    for host, port in targets:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                _PROXY_ALIVE[0] = True
+                return True
+        except OSError:
+            continue
+    _PROXY_ALIVE[0] = False
+    return False
+
+
+def without_dead_proxy(env: dict) -> dict:
+    """代理连不上时，把代理变量从子进程环境里摘掉（真能连上就原样保留）。"""
+    if proxy_alive():
+        return env
+    clean = dict(env)
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                "http_proxy", "https_proxy", "all_proxy"):
+        clean.pop(key, None)
+    return clean
+
+
 def _clean_env(extra: dict | None = None) -> dict:
     env = dict(os.environ)
     for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "VIRTUAL_ENV", "CONDA_PREFIX"):
@@ -734,7 +796,7 @@ def _clean_env(extra: dict | None = None) -> dict:
                 env.pop(key, None)
             else:
                 env[str(key)] = str(value)
-    return env
+    return without_dead_proxy(env)
 
 
 def run_worker(python: Path, script: Path, job: dict, *, cwd: Path,

@@ -15,6 +15,8 @@ type Report = { ready: boolean; items: Item[]; suggested_root: string; total_mis
 
 const STEPS = ["体验", "功能", "用法", "环境", "开始"]
 const STEP_TITLES = ["先听听效果", "她能做什么", "怎么用", "准备运行环境", "准备完成"]
+// 这两个模型文件一旦被中断下载，以前会一直显示「已就绪」；给个手动重下入口。
+const REDOWNLOAD_KEYS = ["ddsp_contentvec", "sep_karaoke"]
 
 /** 只有开发预览（?wizard= / ?bundle=）才允许用示例清单，正式使用必须读真实检测结果。 */
 function previewMode(): boolean {
@@ -258,6 +260,7 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
     if (!installing) return
     let stop = false
     let tick = 0
+    let idle = 0
     const loop = async () => {
       while (!stop) {
         await new Promise((r) => setTimeout(r, 1000))
@@ -281,6 +284,17 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
           setProg(st.progress || null)
           if (st.setup && st.setup.report) setReport(st.setup.report)
           const s = String((st.job || {}).state || "")
+          if (!s) {
+            // 插件重载 / 安装线程异常死掉时 job 会彻底消失，别让进度条永远转下去。
+            idle += 1
+            if (idle >= 30) {
+              setInstalling(false)
+              setErr("安装任务已丢失（插件可能重载过），请重新点一次安装。")
+              return
+            }
+          } else {
+            idle = 0
+          }
           if (s === "done") {
             setInstalling(false)
             const fresh = await check()
@@ -289,7 +303,15 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
             return
           }
           if (s === "failed") { setInstalling(false); return }
-        } catch (e: any) { /* 单次失败不影响，下一秒再试 */ }
+        } catch (e: any) {
+          // 单次失败不影响，下一秒再试；连续失败说明任务/插件已经没了。
+          idle += 1
+          if (idle >= 30) {
+            setInstalling(false)
+            setErr("读取安装进度失败，插件可能已重载；请重新打开面板确认。")
+            return
+          }
+        }
       }
     }
     loop()
@@ -317,6 +339,36 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
     } catch (e: any) {
       if (mockMode) { setMockT(0); setInstalling(true) }
       else setErr(String((e && e.message) || e))
+    }
+    setBusy("")
+  }
+
+  // 重新下载单个模型（ContentVec / 分离权重）：后端先把旧文件挪进 _trash。
+  const redownload = async (key: string) => {
+    if (installing || busy) return
+    setBusy("redownload:" + key)
+    setErr("")
+    setMustInstall(false)
+    try {
+      if (mockMode) {
+        setMockT(0)
+        setInstalling(true)
+        setBusy("")
+        return
+      }
+      const r: any = await callEntry(props.api, "ms_setup_redownload", { model: key }, 60000)
+      if (r && r.job_id) {
+        jobId.current = String(r.job_id)
+        setJob({ state: "running", progress: 0, detail: "正在准备重新下载…" })
+        setMockT(0)
+        setInstalling(true)
+      } else if (r && r.ok) {
+        await check()
+      } else {
+        throw Error(String((r && r.error) || "重新下载没能启动"))
+      }
+    } catch (e: any) {
+      setErr(String((e && e.message) || e))
     }
     setBusy("")
   }
@@ -367,6 +419,10 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
     ? Number(report.required_missing_gb !== undefined ? report.required_missing_gb : (report.total_missing_gb || 0)) || 0
     : 0
   const optGb = report ? Number(report.optional_missing_gb || 0) || 0 : 0
+  // 还没选安装目录时后端只返回一条 install_path，缺省大小是 0，
+  // 别把这种情况显示成「不用下载（已齐）」——实际上是什么都还没开始。
+  const needsPath = !!report && (report.needs_path === true
+    || (Array.isArray(report.missing) && report.missing.indexOf("install_path") >= 0))
   const lack = freeGb !== null && needGb > 0 && freeGb < Math.max(0.5, needGb * 1.15)
   const allReady = !!report && report.ready === true
   const canNext = allReady || mockDone
@@ -570,13 +626,15 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
   const failed = !!(prog && prog.job_state === "failed")
   // 摘要里的下载量与耗时只按必需项算；可选的训练底模单独标出来，避免让人以为「必须下 1.1GB」。
   const sizeText = !report ? "约 2 GB（以检测结果为准）"
-    : needGb > 0 ? "必需 " + needGb + " GB" + (optGb > 0 ? " · 可选 " + optGb + " GB" : "")
-      : optGb > 0 ? "必需 0 GB（已齐） · 可选 " + optGb + " GB"
-        : "不用下载（已齐）"
+    : needsPath ? "选好安装目录后再统计"
+      : needGb > 0 ? "必需 " + needGb + " GB" + (optGb > 0 ? " · 可选 " + optGb + " GB" : "")
+        : optGb > 0 ? "必需 0 GB（已齐） · 可选 " + optGb + " GB"
+          : "不用下载（已齐）"
   const timeText = !report ? "看网速，一般 10～40 分钟"
-    : needGb > 0 ? fmtEta(needGb * 900)
-      : optGb > 0 ? "必需项不用下；可选约 " + fmtEta(optGb * 900)
-        : "不用下载"
+    : needsPath ? "先选安装目录"
+      : needGb > 0 ? fmtEta(needGb * 900)
+        : optGb > 0 ? "必需项不用下；可选约 " + fmtEta(optGb * 900)
+          : "不用下载"
   const failLabels = items.filter((i) => {
     const st = prog && prog.items && prog.items[i.key]
     return st && st.state === "failed"
@@ -715,6 +773,11 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
                   {failed && st.state === "failed" ? (
                     <Btn style={{ ...ghostBtn, padding: "5px 11px", fontSize: 11.5, borderRadius: 9 }} disabled={!!busy}
                          onClick={() => startInstall(i.key)}>重试这一项</Btn>
+                  ) : null}
+                  {!installing && i.ok && REDOWNLOAD_KEYS.indexOf(i.key) >= 0 ? (
+                    <Btn style={{ ...ghostBtn, padding: "5px 11px", fontSize: 11.5, borderRadius: 9 }} disabled={!!busy}
+                         title="文件不完整时重下：旧文件会挪进 models/_trash"
+                         onClick={() => redownload(i.key)}>重新下载</Btn>
                   ) : null}
                 </Row>
                 <div style={{ gridColumn: "2 / 4" }}>

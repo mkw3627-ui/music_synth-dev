@@ -11,6 +11,8 @@ compute Python it is bootstrapping.
 """
 from __future__ import annotations
 
+import hashlib
+import http.client
 import json
 import os
 import re
@@ -22,6 +24,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -30,6 +33,13 @@ from . import runtime
 
 TORCH_CU128_INDEX = "https://download.pytorch.org/whl/cu128"
 TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
+
+# 国内加速：GitHub 直连在不少宽带上只有几十 KB/s，先走镜像，镜像全挂再回落官方。
+GH_MIRRORS = ("https://gh-proxy.com/", "https://ghfast.top/")
+GH_HOSTS = {"github.com", "codeload.github.com", "objects.githubusercontent.com",
+            "raw.githubusercontent.com"}
+# PyPI 走清华镜像；镜像连不上时 _pip 会自动退回官方源重试一次。
+PYPI_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"
 
 # DDSP-SVC 6.3 repo + pretrain assets (all release assets / codeload zips, so
 # no git binary is required on the target machine).
@@ -178,14 +188,15 @@ def _say(message: str) -> None:
     print(f"[setup] {message}", flush=True)
 
 
-def _free_gib(path: Path) -> float:
+def _free_gib(path: Path) -> float | None:
+    """Free space on ``path``'s volume; ``None`` when it can't be measured."""
     try:
         probe = Path(path)
         while not probe.exists() and probe.parent != probe:
             probe = probe.parent
         return shutil.disk_usage(str(probe)).free / 2**30
     except OSError:
-        return 0.0
+        return None
 
 def _run_stream(cmd: list[str], progress, label: str, env: dict | None = None,
                 cwd: Path | None = None, timeout: float = 7200.0) -> tuple[int, str]:
@@ -194,11 +205,26 @@ def _run_stream(cmd: list[str], progress, label: str, env: dict | None = None,
     proc = subprocess.Popen(
         [str(c) for c in cmd], cwd=str(cwd) if cwd else None,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-        env=env or runtime._clean_env(),
+        env=_proxy_free_env(env or runtime._clean_env()),
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     tail: list[str] = []
     started = time.time()
+    state = {"killed": False}
+
+    def _watchdog() -> None:
+        # 只在「一行输出都没有」时也能触发超时：原来只在读到行时才检查时间。
+        while proc.poll() is None:
+            if time.time() - started > timeout:
+                state["killed"] = True
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                return
+            time.sleep(5)
+
+    threading.Thread(target=_watchdog, name="ms-run-timeout", daemon=True).start()
     assert proc.stdout is not None
     for line in proc.stdout:
         line = line.strip()
@@ -208,19 +234,39 @@ def _run_stream(cmd: list[str], progress, label: str, env: dict | None = None,
         tail = tail[-40:]
         if progress:
             progress(f"{label}：{line[-160:]}")
-        if time.time() - started > timeout:
-            proc.kill()
-            return -1, "\n".join(tail)
     code = proc.wait()
+    if state["killed"]:
+        return -1, "\n".join(tail + ["（超时被终止）"])
     return code, "\n".join(tail)
 
 
+def _dead_proxy_text(text: str) -> bool:
+    """pip 输出的错误里有没有「代理拒绝连接」。"""
+    t = str(text or "").lower()
+    return "10061" in t or "connection refused" in t
+
+
 def _pip(python: Path, args: list[str], progress, label: str) -> None:
-    cmd = [str(python), "-m", "pip", "install", "--disable-pip-version-check",
-           "--no-input", "--retries", "5", "--timeout", "60"] + list(args)
+    base = [str(python), "-m", "pip", "install", "--disable-pip-version-check",
+            "--no-input", "--retries", "5", "--timeout", "60"]
+    has_index = any(str(a).startswith("--index-url") or str(a).startswith("-i") for a in args)
+    # 默认走清华 PyPI 镜像；镜像不通就退回官方源再试一次，避免安装卡死在网络上。
+    cmd = base + ([] if has_index else ["--index-url", PYPI_INDEX]) + list(args)
     code, tail = _run_stream(cmd, progress, label)
+    if code != 0 and not has_index:
+        _say(f"{label}: 清华镜像失败，改用官方 PyPI 重试")
+        code, tail = _run_stream(base + list(args), progress, f"{label}（官方源）")
+    if code != 0 and _dead_proxy_text(tail):
+        # 代理在插件启动后退出：缓存里仍是「代理可用」，子进程环境还带着死代理。
+        # 重新探测一次，确认代理真的死了就用干净环境再试一回。
+        _reset_proxy_state()
+        if not runtime.proxy_alive():
+            _say(f"{label}: 代理已失效，去掉代理变量重试")
+            retry = base + list(args) if has_index else cmd
+            code, tail = _run_stream(retry, progress, f"{label}（直连）")
     if code != 0:
         raise RuntimeError(f"{label} 失败（退出码 {code}）：{tail[-1500:]}")
+
 
 
 # ---------------------------------------------------------------------------
@@ -277,9 +323,153 @@ def find_base_python(paths: dict | None = None) -> tuple[str | None, str, str]:
     return None, "", "not_found"
 
 
+_OPENER: list = [None]
+
+
+def proxy_alive() -> bool:
+    """代理是否真的连得上（实现放在 runtime，worker / ACE 子进程共用同一判断）。"""
+    alive = runtime.proxy_alive()
+    if not alive and not _OPENER[0]:
+        _say("代理不可用（拒绝连接），下载改走直连")
+    return alive
+
+
+def _opener():
+    """urllib opener：代理挂了就返回强制直连的 opener。"""
+    if _OPENER[0] is None:
+        handlers = []
+        if not proxy_alive():
+            handlers.append(urllib.request.ProxyHandler({}))
+        _OPENER[0] = urllib.request.build_opener(*handlers)
+    return _OPENER[0]
+
+
+def _proxy_free_env(env: dict) -> dict:
+    """子进程（pip / venv）用的环境：代理不可用时把代理变量摘掉。"""
+    return runtime.without_dead_proxy(env)
+
+
+def _dead_proxy_detected(exc: BaseException) -> bool:
+    """异常是不是「代理端口拒绝连接」（10061 / Connection refused）。"""
+    if isinstance(exc, RuntimeError):
+        return False
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, ConnectionRefusedError):
+            return True
+        if int(getattr(cur, "winerror", 0) or 0) == 10061:
+            return True
+        text = str(cur).lower()
+        if "10061" in text or "connection refused" in text:
+            return True
+        nxt = getattr(cur, "reason", None)
+        cur = nxt if isinstance(nxt, BaseException) else (cur.__cause__ or cur.__context__)
+    return False
+
+
+def _reset_proxy_state(force_check: bool = True) -> None:
+    """丢掉代理探测/opener 缓存，让下一次请求按当前真实状态走。"""
+    try:
+        runtime.proxy_alive(force=force_check)
+    except TypeError:  # 老 runtime 没 force 参数时直接清缓存
+        try:
+            runtime._PROXY_ALIVE[0] = None  # noqa: SLF001
+        except (AttributeError, IndexError):
+            pass
+    _OPENER[0] = None
+
+
+def _mirror_urls(url: str) -> list[str]:
+    """GitHub 地址 → 国内加速镜像 + 原地址，按顺序尝试。"""
+    out: list[str] = []
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    if host in GH_HOSTS:
+        out.extend(m + url for m in GH_MIRRORS)
+    out.append(url)
+    return out
+
+
+_MODEL_SUFFIXES = {".bin", ".ckpt", ".pt", ".pth", ".safetensors", ".onnx", ".gguf"}
+
+
+def _write_marker(target: Path, size: int) -> None:
+    """Record the size of a *fully* downloaded file (``<name>.ms_ok``).
+
+    Later readiness checks compare against it, so a file that was cut short by
+    an interrupted download can't keep passing as "ready" forever.
+    """
+    try:
+        target.with_name(target.name + ".ms_ok").write_text(
+            json.dumps({"bytes": int(size), "at": time.strftime("%Y-%m-%d %H:%M:%S")},
+                       ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _legacy_min_bytes(spec: dict, name: str) -> int:
+    """Plausibility floor for a model file that predates the ``.ms_ok`` marker."""
+    if Path(name).suffix.lower() not in _MODEL_SUFFIXES:
+        # config.json / *.yaml 本来就只有几百字节，存在且非空即可。
+        return 1
+    floor = 8 * 1024 * 1024
+    try:
+        floor = max(floor, int(float(spec.get("size_gb") or 0) * 1024 ** 3 * 0.25))
+    except (TypeError, ValueError):
+        pass
+    return floor
+
+
+def _file_ready(spec: dict, path: Path) -> bool:
+    """Is this downloaded model file complete enough to use?"""
+    try:
+        if not path.is_file():
+            return False
+        size = path.stat().st_size
+    except OSError:
+        return False
+    marker = path.with_name(path.name + ".ms_ok")
+    if marker.is_file():
+        try:
+            want = int((json.loads(marker.read_text(encoding="utf-8")) or {}).get("bytes") or 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            want = 0
+        if want > 0:
+            return size >= want
+    return size >= _legacy_min_bytes(spec, path.name)
+
+
 def _download_file(url: str, target: Path, progress, label: str,
                    expected_bytes: int = 0, timeout: float = 120.0) -> None:
-    """Resumable HTTP download (Range) into ``target.part`` then rename."""
+    """Resumable download with mirrors, dead-proxy bypass and slow-source failover."""
+    errors: list[str] = []
+    proxy_retried = False
+    for candidate in _mirror_urls(url):
+        while True:
+            try:
+                _download_one(candidate, target, progress, label, expected_bytes, timeout)
+                if candidate != url:
+                    _say(f"{label}: 已通过国内镜像 {urllib.parse.urlsplit(candidate).hostname} 下载")
+                return
+            except (OSError, urllib.error.URLError, urllib.error.HTTPError,
+                    http.client.HTTPException, RuntimeError) as exc:
+                errors.append(f"{urllib.parse.urlsplit(candidate).hostname}: {exc}")
+                _say(f"{label}: {errors[-1][:160]}，换源重试")
+                if not proxy_retried and _dead_proxy_detected(exc):
+                    # 插件启动时代理还活着、之后被关掉：清缓存直连，同一个源再试一次。
+                    proxy_retried = True
+                    _reset_proxy_state()
+                    if not runtime.proxy_alive():
+                        _say(f"{label}: 代理已失效，改走直连重试")
+                        continue
+                break
+    raise RuntimeError(f"{label} 下载失败：" + "; ".join(errors)[-800:])
+
+
+def _download_one(url: str, target: Path, progress, label: str,
+                  expected_bytes: int, timeout: float) -> None:
+    """One source: Range-resume into ``target.part`` then rename."""
     target.parent.mkdir(parents=True, exist_ok=True)
     part = target.with_name(target.name + ".part")
     pos = part.stat().st_size if part.exists() else 0
@@ -287,36 +477,54 @@ def _download_file(url: str, target: Path, progress, label: str,
     if pos:
         headers["Range"] = f"bytes={pos}-"
     req = urllib.request.Request(url, headers=headers)
+    started = time.time()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            status = getattr(resp, "status", 200)
-            if status == 200 and pos:
-                pos = 0  # server ignored Range: restart cleanly
-                part.unlink(missing_ok=True)
-            total = int(resp.headers.get("Content-Length") or 0) + pos
-            mode = "ab" if pos else "wb"
-            done = pos
-            with part.open(mode) as fh:
-                while True:
-                    chunk = resp.read(1024 * 256)
-                    if not chunk:
-                        break
-                    fh.write(chunk)
-                    done += len(chunk)
-                    if progress and total:
-                        progress(f"{label}：{done / 2**20:.0f}/{total / 2**20:.0f} MB")
-                        if expected_bytes:
-                            pass
-                    elif progress and expected_bytes:
-                        progress(f"{label}：{done / 2**30:.2f}/{expected_bytes / 2**30:.2f} GB")
+        resp = _opener().open(req, timeout=timeout)
     except urllib.error.HTTPError as exc:
         if exc.code == 416 and part.exists():
-            pass  # already complete
-        else:
-            raise
-    if expected_bytes and part.stat().st_size < expected_bytes * 0.9:
-        raise RuntimeError(f"{label} 下载不完整：{part.stat().st_size} / {expected_bytes} 字节")
+            size = part.stat().st_size
+            os.replace(part, target)  # 已经下完了
+            _write_marker(target, size)
+            return
+        raise
+    with resp:
+        status = getattr(resp, "status", 200)
+        if status == 200 and pos:
+            pos = 0  # server ignored Range: restart cleanly
+            part.unlink(missing_ok=True)
+        total = int(resp.headers.get("Content-Length") or 0) + pos
+        mode = "ab" if pos else "wb"
+        done = pos
+        base = pos
+        with part.open(mode) as fh:
+            while True:
+                # 连接卡死时 read() 会阻塞到 socket 超时，先按「20 秒没进度」判死。
+                if time.time() - started > 20 and done - base < 512 * 1024:
+                    raise RuntimeError(f"速度过慢（20 秒 {done - base} 字节）")
+                chunk = resp.read(1024 * 256)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                done += len(chunk)
+                if progress and total:
+                    progress(f"{label}：{done / 2**20:.0f}/{total / 2**20:.0f} MB")
+                elif progress and expected_bytes:
+                    progress(f"{label}：{done / 2**30:.2f}/{expected_bytes / 2**30:.2f} GB")
+                # 20 秒还不到 512KB 的源直接判死，换下一个；.part 保留给后面的源续传。
+                if time.time() - started > 20 and done - base < 512 * 1024:
+                    raise RuntimeError(f"速度过慢（20 秒 {done - base} 字节）")
+    # 连接被掐断时 http.client 的 read(amt) 只是返回空串、不抛 IncompleteRead，
+    # 所以必须拿 Content-Length 对账；否则半个文件会被 os.replace 成「成品」。
+    size = part.stat().st_size
+    if total and done < total:
+        raise RuntimeError(f"{label} 下载不完整：{done} / {total} 字节")
+    if total and size < total:
+        raise RuntimeError(f"{label} 下载不完整：{size} / {total} 字节")
+    if expected_bytes and size < expected_bytes * 0.9:
+        raise RuntimeError(f"{label} 下载不完整：{size} / {expected_bytes} 字节")
     os.replace(part, target)
+    _write_marker(target, size)
+
 
 
 def download_portable_python(paths: dict, progress) -> str:
@@ -330,7 +538,7 @@ def download_portable_python(paths: dict, progress) -> str:
         api = urllib.request.Request(
             "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest",
             headers={"User-Agent": "NEKO-music-synth/0.2", "Accept": "application/vnd.github+json"})
-        with urllib.request.urlopen(api, timeout=30) as resp:
+        with _opener().open(api, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         pattern = re.compile(r"cpython-3\.10\.\d+\+.*x86_64-pc-windows-msvc-shared-install_only\.tar\.gz$")
         for asset in data.get("assets") or []:
@@ -363,10 +571,30 @@ def download_portable_python(paths: dict, progress) -> str:
 # ---------------------------------------------------------------------------
 # venv / repo / models
 # ---------------------------------------------------------------------------
+def _venv_ok(python: Path) -> bool:
+    """venv 里的 python 能不能用（建到一半的 venv 常常连 pip 都没有）。"""
+    try:
+        out = subprocess.run([str(python), "-c", "import pip,sys;print('ok')"],
+                             capture_output=True, text=True, timeout=60,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return out.returncode == 0 and "ok" in (out.stdout or "")
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _make_venv(base_python: str, venv_dir: Path, progress, label: str) -> Path:
     python = venv_dir / "Scripts" / "python.exe"
-    if python.is_file():
+    if python.is_file() and _venv_ok(python):
         return python
+    if venv_dir.exists():
+        # 半成品 venv 不删，挪到旁边留证；否则 venv 命令会因目录非空直接失败。
+        bak = venv_dir.with_name(f"{venv_dir.name}.broken-{time.strftime('%Y%m%d_%H%M%S')}")
+        progress(f"{label} 虚拟环境不完整，移到 {bak.name} 后重建…")
+        try:
+            shutil.move(str(venv_dir), str(bak))
+        except OSError as exc:
+            raise RuntimeError(
+                f"{label} 虚拟环境不完整且无法移开（{exc}）；关掉占用它的程序后重试") from exc
     progress(f"创建 {label} 虚拟环境…")
     venv_dir.parent.mkdir(parents=True, exist_ok=True)
     code, tail = _run_stream([base_python, "-m", "venv", str(venv_dir)], progress, f"创建 {label}")
@@ -374,6 +602,69 @@ def _make_venv(base_python: str, venv_dir: Path, progress, label: str) -> Path:
         raise RuntimeError(f"创建 {label} 虚拟环境失败：{tail[-1200:]}")
     _pip(python, ["--upgrade", "pip", "setuptools", "wheel"], progress, f"{label} 基础工具")
     return python
+
+
+_DDSP_PROBE_MODULES = ("librosa", "pyworld", "parselmouth", "torchcrepe", "transformers")
+_DEPS_CACHE: dict[tuple[str, int], tuple[bool, str]] = {}
+
+
+def ddsp_deps_status(python) -> tuple[bool, str]:
+    """Import DDSP-SVC's key deps inside the synth venv.
+
+    ``check_dependencies`` used to verify only ``python.exe`` and ``torch``, so a
+    half-finished ``pip install DDSP_PACKAGES`` still reported "ready" and gave
+    the user a cryptic ModuleNotFoundError on the first song.
+    """
+    p = Path(str(python))
+    if not p.is_file():
+        return False, "缺少 Python"
+    try:
+        key = (str(p), p.stat().st_mtime_ns)
+    except OSError:
+        key = (str(p), 0)
+    if key in _DEPS_CACHE:
+        return _DEPS_CACHE[key]
+    code = (
+        "import importlib,json,sys\n"
+        "miss=[]\n"
+        "for m in json.loads(sys.argv[1]):\n"
+        "    try:\n"
+        "        importlib.import_module(m)\n"
+        "    except Exception:\n"
+        "        miss.append(m)\n"
+        "print('MISS='+json.dumps(miss))\n"
+    )
+    try:
+        proc = subprocess.run(
+            [str(p), "-c", code, json.dumps(list(_DDSP_PROBE_MODULES))],
+            capture_output=True, text=True, timeout=180,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError) as exc:
+        res = (False, f"检测失败：{type(exc).__name__}: {exc}")
+        _DEPS_CACHE[key] = res
+        return res
+    if proc.returncode != 0:
+        tail = ((proc.stderr or proc.stdout or "")[-400:]).strip().replace("\n", " ")
+        res = (False, f"检测失败：{tail or '退出码 ' + str(proc.returncode)}")
+    else:
+        miss: list = []
+        for line in reversed((proc.stdout or "").splitlines()):
+            if line.startswith("MISS="):
+                try:
+                    miss = json.loads(line[5:])
+                except ValueError:
+                    miss = ["?"]
+                break
+        res = (not miss, "完整" if not miss else "缺少：" + "、".join(str(m) for m in miss))
+    _DEPS_CACHE[key] = res
+    return res
+
+
+def invalidate_deps_cache(python) -> None:
+    target = str(python)
+    for k in list(_DEPS_CACHE):
+        if k[0] == target:
+            _DEPS_CACHE.pop(k, None)
 
 
 def _torch_index(gpu: dict | None) -> str:
@@ -457,9 +748,12 @@ def _missing_files(spec: dict, target: Path) -> list[str]:
                 need_file = bool(Path(rel).suffix)
                 found = False
                 for cand in (target / rel, target / Path(rel).name):
-                    if cand.exists() and (cand.is_file() or not need_file):
-                        found = True
-                        break
+                    if not cand.exists() or not (cand.is_file() or not need_file):
+                        continue
+                    if need_file and not _file_ready(spec, cand):
+                        continue
+                    found = True
+                    break
         except OSError:
             found = False
         if not found:
@@ -597,7 +891,10 @@ def _install_zip(spec: dict, dest_root: Path, progress, label: str) -> None:
     ``rename`` renames extracted entries after placement (model.ckpt -> model).
     """
     dest_root.mkdir(parents=True, exist_ok=True)
-    archive = dest_root.parent / f"_{dest_root.name}_{abs(hash(spec['url'])) % 10**8}.zip"
+    # 用 url 的摘要而不是 hash()：Python 字符串 hash 每进程随机化，重启插件后
+    # 文件名会变，上次的 .part 就续不上、还留在盘上变成垃圾。
+    tag = hashlib.md5(str(spec["url"]).encode("utf-8")).hexdigest()[:8]
+    archive = dest_root.parent / f"_{dest_root.name}_{tag}.zip"
     _download_file(spec["url"], archive, progress, label)
     mode = str(spec.get("zip_mode") or "nest")
     with tempfile.TemporaryDirectory(dir=str(dest_root.parent)) as tmp:
@@ -650,12 +947,12 @@ def _download_http_model(paths: dict, spec: dict, progress, label: str) -> None:
     urls = spec.get("urls") or [spec["url"]]
     for filename in spec["files"]:
         target = target_dir / filename
-        if target.is_file() and target.stat().st_size > 1024:
+        if _file_ready(spec, target):
             continue
         errors = []
         for url in urls:
             try:
-                _download_file(url, target, progress, f"{label} · {filename}", timeout=600)
+                _download_file(url, target, progress, label, timeout=40)
                 break
             except (OSError, urllib.error.URLError, RuntimeError) as exc:
                 errors.append(f"{url}: {exc}")
@@ -706,8 +1003,11 @@ def _install_dlc_model(paths: dict, spec: dict, progress, label: str, python) ->
         "assert inner is not None,'DLC 里没有 model_0.pt'\n"
         "torch.save(inner,o)\n"
     )
-    proc = subprocess.run([str(py), "-c", code, str(dlc), str(target)],
-                          capture_output=True, text=True)
+    try:
+        proc = subprocess.run([str(py), "-c", code, str(dlc), str(target)],
+                              capture_output=True, text=True, timeout=900)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("底模转换超时（15 分钟）：文件可能不完整，请重试") from exc
     if proc.returncode != 0:
         raise RuntimeError("底模转换失败：" + ((proc.stderr or proc.stdout or "")[-1000:]))
     try:
@@ -737,17 +1037,57 @@ def _download_sep_weights(paths: dict, progress, label: str) -> None:
     target_dir.mkdir(parents=True, exist_ok=True)
     for filename in MODEL_ITEMS["sep_karaoke"]["files"]:
         target = target_dir / filename
-        if target.is_file() and target.stat().st_size > 1024:
+        if _file_ready(MODEL_ITEMS["sep_karaoke"], target):
             continue
         errors = []
         for url in _sep_weight_urls(filename):
             try:
-                _download_file(url, target, progress, f"{label} · {filename}")
+                _download_file(url, target, progress, label, timeout=40)
                 break
             except (OSError, urllib.error.URLError, RuntimeError) as exc:
                 errors.append(f"{url}: {exc}")
         else:
             raise RuntimeError(f"{filename} 下载失败：" + "; ".join(errors)[-1200:])
+
+
+REDOWNLOAD_KEYS = ("ddsp_contentvec", "sep_karaoke")
+
+
+def stash_model_files(paths: dict, key: str) -> list[str]:
+    """把某个模型的文件挪进 ``models_dir/_trash``，供面板「重新下载」使用。
+
+    直接删文件太粗暴：挪走既让安装器看到「缺失」，又保留旧文件可人工找回。
+    """
+    spec = MODEL_ITEMS.get(str(key))
+    if not spec or key not in REDOWNLOAD_KEYS:
+        raise RuntimeError(f"不支持重下的模型：{key or '（空）'}")
+    target = Path(paths[spec["target"]])
+    base = _model_base(spec, target)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    trash = Path(paths["models_dir"]) / "_trash" / f"{stamp}_{key}"
+    moved: list[str] = []
+    for rel in spec.get("files", ()):
+        for cand in (base / rel, base / Path(rel).name):
+            if not cand.is_file():
+                continue
+            trash.mkdir(parents=True, exist_ok=True)
+            dest = trash / cand.name
+            n = 1
+            while dest.exists():
+                dest = trash / f"{cand.stem}.{n}{cand.suffix}"
+                n += 1
+            shutil.move(str(cand), str(dest))
+            for side in (cand.with_name(cand.name + ".ms_ok"),
+                         cand.with_name(cand.name + ".part")):
+                try:
+                    side.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            moved.append(str(dest))
+            break
+    if not moved:
+        raise RuntimeError("没有找到可重下的文件")
+    return moved
 
 
 # ---------------------------------------------------------------------------
@@ -807,13 +1147,15 @@ def check_dependencies(paths: dict, probe: dict | None = None) -> dict:
     # GPU / driver ---------------------------------------------------------
     if gpu:
         cc = int(gpu.get("cc_major") or 0)
-        status = "ready" if cc >= 7 else "mismatch"
+        # sm<70 只是不能用 CUDA 加速，CPU 路线完全可用：别把它当「缺必需项」，
+        # 否则向导的 ready 永远为 False，用户装完 17GB 也过不了第 4 页。
+        status = "ready" if cc >= 7 else "optional"
         items.append(_item(
             "cuda_driver", "NVIDIA 驱动 / CUDA",
             status,
             f"{gpu['name']} · sm_{gpu['compute_cap']} · 驱动 {gpu.get('driver') or '?'}"
             f" · 显存 {gpu['total_gib']}GB（空闲 {gpu['free_gib']}GB）",
-            required=True,
+            required=cc >= 7,
             fix="" if cc >= 7 else "显卡过旧，将自动走 CPU 路线（可继续使用，只是慢）"))
     else:
         items.append(_item("cuda_driver", "NVIDIA 驱动 / CUDA", "optional",
@@ -860,6 +1202,22 @@ def check_dependencies(paths: dict, probe: dict | None = None) -> dict:
         fix=f"安装 {'CUDA 12.8' if gpu and int(gpu.get('cc_major') or 0) >= 7 else 'CPU'} 版 torch",
         size_gb=2.9 if gpu and int(gpu.get("cc_major") or 0) >= 7 else 0.25,
         action="" if torch_status == "ready" else "pip:synth:torch"))
+
+    # DDSP runtime packages: 以前只查 python.exe + torch，pip 断在中途也显示「就绪」，
+    # 第一次生成才报 ModuleNotFoundError，而且没有任何补装入口。
+    if not ddsp_exists:
+        items.append(_item(
+            "ddsp_deps", "安装 DDSP-SVC 依赖", "missing", "随 DDSP-SVC 环境一起安装",
+            required=True, installable=False,
+            fix="随 DDSP-SVC 环境创建后自动安装"))
+    else:
+        deps_ok, deps_detail = ddsp_deps_status(ddsp_py)
+        items.append(_item(
+            "ddsp_deps", "安装 DDSP-SVC 依赖",
+            "ready" if deps_ok else "missing", deps_detail,
+            required=True, installable=not deps_ok,
+            fix="" if deps_ok else "重装 librosa/pyworld/parselmouth/torchcrepe/transformers 等（走 pip 镜像）",
+            size_gb=0.6, action="" if deps_ok else "pip:synth:deps"))
 
     # separation env -------------------------------------------------------
     sep_py = Path(paths["sep_python"])
@@ -921,17 +1279,33 @@ def check_dependencies(paths: dict, probe: dict | None = None) -> dict:
 
     # disk -----------------------------------------------------------------
     root = Path(paths["compute_root"])
+    where = str(root.drive or root)
     free = _free_gib(root)
-    # 磁盘余量只需要覆盖「必需项」；可选的质量档位不装也能用，不算进必须空间。
-    missing_gb = sum(float(i["size_gb"]) for i in items
-                     if i["status"] == "missing" and i["installable"] and i["required"])
-    need = max(20.0, missing_gb * 1.15)
-    disk_ok = free >= need
+    # 余量要覆盖本次实际会下载的东西（「一键安装」连可选底模一起下），
+    # 但只有还缺东西时才需要预留；全部装好后不再因为「剩余 < 20GB」判失败。
+    download_gb = sum(float(i["size_gb"]) for i in items
+                      if i["status"] == "missing" and i["installable"])
+    optional_gb = sum(float(i["size_gb"]) for i in items
+                      if i["status"] == "missing" and i["installable"] and not i["required"])
+    opt_txt = f"（其中可选 {optional_gb:.1f}GB）" if optional_gb else ""
+    if download_gb <= 0:
+        disk_status, disk_ok = "ready", True
+        disk_detail = (f"{where} 剩余空间读不到；本次没有要下载的项" if free is None
+                       else f"{where} 剩余 {free:.1f}GB；本次没有要下载的项")
+        disk_fix = ""
+    elif free is None:
+        disk_status, disk_ok = "optional", True
+        disk_detail = f"{where} 剩余空间读不到；本次约需 {download_gb:.1f}GB{opt_txt}"
+        disk_fix = "读不到磁盘剩余空间，安装前请自行确认空间足够"
+    else:
+        need = download_gb * 1.15
+        disk_ok = free >= need
+        disk_status = "ready" if disk_ok else "mismatch"
+        disk_detail = f"{where} 剩余 {free:.1f}GB；还需约 {download_gb:.1f}GB{opt_txt}"
+        disk_fix = "" if disk_ok else "换一个剩余空间更大的目录（首次向导里可改）"
     items.append(_item(
-        "disk", "安装磁盘空间", "ready" if disk_ok else "mismatch",
-        f"{root.drive or root} 剩余 {free:.1f}GB；还需约 {missing_gb:.1f}GB",
-        required=True, installable=False,
-        fix="" if disk_ok else "换一个剩余空间更大的目录（首次向导里可改）"))
+        "disk", "安装磁盘空间", disk_status, disk_detail,
+        required=True, installable=False, fix=disk_fix))
 
     missing_keys = [i["key"] for i in items if i["required"] and i["status"] != "ready"]
     optional_missing = [i["key"] for i in items if not i["required"] and not i["ok"]]
@@ -1239,12 +1613,13 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
             installed.append("torch")
         except Exception as exc:  # noqa: BLE001
             errors.append({"item": "torch", "error": str(exc)})
-    if "synth_env" in requested and synth_py.is_file():
+    if ("synth_env" in requested or "ddsp_deps" in requested) and synth_py.is_file():
         try:
             _pip(synth_py, DDSP_PACKAGES, progress, "安装 DDSP-SVC 依赖")
             installed.append("synth_deps")
+            invalidate_deps_cache(synth_py)
         except Exception as exc:  # noqa: BLE001
-            errors.append({"item": "synth_deps", "error": str(exc)})
+            errors.append({"item": "ddsp_deps", "error": str(exc)})
         # 市场不允许插件包携带 .pyd/.exe/.dll，逐应用采集（proc-tap）和系统媒体
         # 信息（winrt）改用 pip 装进合成环境；缺了只是这两个功能不可用，不阻塞安装。
         try:
@@ -1310,6 +1685,62 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
         "errors": errors,
         "missing_after": report_after["missing"],
         "report": report_after,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 下载源体检（只读，只取 64KB）
+# ---------------------------------------------------------------------------
+def diagnose_download_sources(probe_bytes: int = 65536, timeout: float = 8.0) -> dict:
+    """探测代理是否真的可用，以及每个下载源能不能连上、速度多少。
+
+    面板「环境体检」里单独列出来，用户遇到下载慢/下不动时一眼能看出是哪一段断了。
+    """
+    sources = [
+        ("GitHub 直连", DDSP_ZIP),
+        ("GitHub 镜像 gh-proxy", GH_MIRRORS[0] + VOCODER_ZIP),
+        ("GitHub 镜像 ghfast", GH_MIRRORS[1] + VOCODER_ZIP),
+        ("HF 镜像 hf-mirror", CONTENTVEC_URLS[0]),
+        ("HuggingFace 官方", CONTENTVEC_URLS[1]),
+        ("PyPI 清华镜像", PYPI_INDEX + "/pip/"),
+        ("PyTorch 官方", TORCH_CU128_INDEX + "/"),
+    ]
+    rows: list[dict] = []
+    opener = _opener()
+    for label, url in sources:
+        started = time.time()
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "NEKO-music-synth/0.2",
+                "Range": f"bytes=0-{int(probe_bytes) - 1}"})
+            with opener.open(req, timeout=timeout) as resp:
+                chunk = resp.read(int(probe_bytes))
+                elapsed = max(0.001, time.time() - started)
+                total = resp.headers.get("Content-Range") or resp.headers.get("Content-Length") or ""
+                rows.append({
+                    "label": label, "url": url, "ok": True,
+                    "status": getattr(resp, "status", 200),
+                    "seconds": round(elapsed, 2),
+                    "kb_per_s": round(len(chunk) / elapsed / 1024, 1),
+                    "total": str(total)[-32:],
+                })
+        except Exception as exc:  # noqa: BLE001 - 体检要把失败原因带回去
+            rows.append({"label": label, "url": url, "ok": False,
+                         "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+                         "seconds": round(time.time() - started, 2)})
+    alive = proxy_alive()
+    try:
+        proxies = urllib.request.getproxies()
+    except Exception:  # noqa: BLE001
+        proxies = {}
+    return {
+        "proxy": {
+            "alive": alive,
+            "bypassed": not alive,
+            "raw": {k: proxies.get(k) for k in ("http", "https", "all") if proxies.get(k)},
+        },
+        "sources": rows,
+        "reachable": [r["label"] for r in rows if r["ok"]],
     }
 
 

@@ -164,15 +164,32 @@ export function Home(props: { api: any; snap: any; error: string; onRefresh: () 
     setSetupBusy(true)
     setSetupJob({ state: "starting", pct: 0, detail: "正在启动安装…" })
     try {
-      const r = await callEntry(api, "ms_setup_install", { path: setupPath.trim() }, 60000)
-      if (r.already_ready) { setSetupJob({ state: "done", pct: 100, detail: "环境已就绪，无需安装。" }); setSetupBusy(false); return }
+      const r: any = await callEntry(api, "ms_setup_install", { path: setupPath.trim() }, 60000)
+      if (r && r.already_ready) { setSetupJob({ state: "done", pct: 100, detail: "环境已就绪，无需安装。" }); setSetupBusy(false); return }
+      if (!r || !r.job_id) {
+        throw Error(String((r && r.error) || "安装任务没有启动"))
+      }
       const deadline = Date.now() + 6 * 3600 * 1000
+      let idle = 0
       while (Date.now() < deadline) {
         await new Promise((res) => setTimeout(res, 2500))
-        const st = await callEntry(api, "ms_setup_status", {}, 30000)
-        const job = st.job || {}
-        setSetupJob({ job_id: r.job_id, state: job.state || "running", pct: Number(job.progress || 0), detail: job.detail || "" })
-        if (job.state === "done" || job.state === "failed") {
+        let st: any = {}
+        try { st = await callEntry(api, "ms_setup_status", {}, 30000) } catch (e) { st = {} }
+        const job = (st && st.job) || {}
+        const state = String(job.state || "")
+        if (!state) {
+          // 任务被重载/线程死掉后 job 会变空；别演 6 小时的「安装中」。
+          idle += 1
+          if (idle >= 24) {
+            setSetupJob({ job_id: r.job_id, state: "failed", pct: 0, detail: "安装任务已丢失（插件可能重载过），请重试。" })
+            break
+          }
+          setSetupJob({ job_id: r.job_id, state: "running", pct: Number(job.progress || 0), detail: job.detail || "等待安装线程…" })
+          continue
+        }
+        idle = 0
+        setSetupJob({ job_id: r.job_id, state: state, pct: Number(job.progress || 0), detail: job.detail || "" })
+        if (state === "done" || state === "failed") {
           const report = (st.setup && st.setup.report) || null
           if (report) setSetup(report)
           break
@@ -440,7 +457,7 @@ export function Home(props: { api: any; snap: any; error: string; onRefresh: () 
             </Soft>
             <Soft style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               <div style={{ fontSize: 13, fontWeight: 600 }}>② 安装路径</div>
-              <Input placeholder="例如 D:NEKOMusicSynth" value={setupPath} onChange={(e: any) => setSetupPath(e.target.value)} />
+              <Input placeholder="例如 D:\\NEKOMusicSynth" value={setupPath} onChange={(e: any) => setSetupPath(e.target.value)} />
               <Row>
                 <Btn style={{ border: 0, background: BRAND, color: "#fff", borderRadius: 12, boxShadow: "0 6px 16px rgba(224,45,118,0.22)" }} disabled={setupBusy || !setupReport} onClick={setupInstall}>{setupBusy ? "安装中…" : "一键安装缺失项"}</Btn>
                 <Muted>{setupReport && setupReport.total_missing_gb ? "本次将下载约 " + setupReport.total_missing_gb + "GB" : ""}</Muted>

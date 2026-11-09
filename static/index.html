@@ -2222,6 +2222,10 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const [openAceAdv, setOpenAceAdv] = useState(false);
     const aceTouched = useRef(false);
     const aceSelTouched = useRef(false);
+    const [trainQuality, setTrainQuality] = useState("mid");
+    const [baseStatus, setBaseStatus] = useState(null);
+    const [baseJobId, setBaseJobId] = useState("");
+    const [baseJob, setBaseJob] = useState(null);
     const [nodeOpen, setNodeOpen] = useState(false);
     const [overOpen, setOverOpen] = useState(false);
     const nodeSeen = useRef("");
@@ -2383,6 +2387,62 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         setBusy("");
       }
     }
+    const loadBaseStatus = async () => {
+      try {
+        const r = await callEntry(api, "ms_base_status", {}, 3e4);
+        setBaseStatus(r);
+      } catch (e) {
+      }
+    };
+    useEffect(() => {
+      loadBaseStatus();
+    }, []);
+    useEffect(() => {
+      if (!baseJobId) return;
+      let alive = true;
+      const tick = async () => {
+        try {
+          const r = await callEntry(api, "ms_ace_job", { job_id: baseJobId }, 3e4);
+          const j = r && r.job || null;
+          if (!alive) return;
+          setBaseJob(j);
+          if (!j || j.state === "done" || j.state === "failed") {
+            setBaseJobId("");
+            loadBaseStatus();
+          }
+        } catch (e) {
+        }
+      };
+      tick();
+      const id = setInterval(tick, 3e3);
+      return () => {
+        alive = false;
+        clearInterval(id);
+      };
+    }, [baseJobId]);
+    const checkBase = () => run("base", async () => {
+      const r = await callEntry(api, "ms_base_inspect", { tier: trainQuality }, 12e4);
+      if (r && r.ok) {
+        const a = r.arch || {};
+        setMsg({
+          tone: "info",
+          text: "底模：" + (r.framework || "未知") + " · " + (a.n_layers || "?") + " 层 / " + (a.n_chans || "?") + " 通道" + (a.encoder ? " · " + a.encoder : "") + " · " + (r.path || "")
+        });
+      } else {
+        setMsg({ tone: "error", text: "底模检查失败：" + (r && r.error || "未知错误") });
+      }
+    });
+    const downloadBase = () => run("basedl", async () => {
+      const r = await callEntry(api, "ms_base_download", { tier: trainQuality }, 6e4);
+      if (r && r.ok && r.job_id) {
+        setBaseJobId(String(r.job_id));
+        setMsg({ tone: "info", text: "开始下载" + (trainQuality === "low" ? "低" : "高") + "质量底模…" });
+      } else if (r && r.ok && r.already) {
+        setMsg({ tone: "info", text: "这个档位的底模已经就绪" });
+      } else {
+        setMsg({ tone: "error", text: "没能开始下载：" + (r && r.error || "未知错误") });
+      }
+    });
     const deleteRun = async (withFiles) => {
       setDelRun(false);
       if (!runId) return;
@@ -2456,6 +2516,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         steps,
         name: name.trim() || void 0,
         from_corpus: true,
+        quality: trainQuality,
         auto: !!doAce,
         ace_models: doAce ? selectedAce : [],
         ace_name: doAce ? name.trim() || void 0 : "",
@@ -2688,6 +2749,46 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
                 effectiveBatch
               ] })
             ] }),
+            /* @__PURE__ */ jsxs(Row, { style: { gap: 8, flexWrap: "wrap" }, children: [
+              [["low", "低"], ["mid", "中"], ["high", "高"]].map(([k, label]) => /* @__PURE__ */ jsxs(
+                Btn,
+                {
+                  style: trainQuality === k ? PRIMARY_BTN : void 0,
+                  onClick: () => {
+                    setTrainQuality(k);
+                    setStepMode(k === "low" ? "speed" : k === "high" ? "quality" : "normal");
+                  },
+                  children: [
+                    label,
+                    "质量"
+                  ]
+                },
+                k
+              )),
+              /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: checkBase, children: busy === "base" ? "检查中…" : "检查底模" })
+            ] }),
+            /* @__PURE__ */ jsx(Muted, { style: { fontSize: 12 }, children: "低/中/高会换用对应的训练底模；显存或磁盘不够时会在这里提醒。" }),
+            (() => {
+              const info = baseStatus && baseStatus.tiers ? baseStatus.tiers[trainQuality] : null;
+              if (!info) return null;
+              if (info.exists) {
+                return /* @__PURE__ */ jsxs(Muted, { style: { fontSize: 12 }, children: [
+                  "底模已就绪：",
+                  String(info.path || "").split(/[\\/]/).pop(),
+                  " · ",
+                  info.size_gb,
+                  " GB"
+                ] });
+              }
+              return /* @__PURE__ */ jsxs(Row, { style: { gap: 8, flexWrap: "wrap", alignItems: "center" }, children: [
+                /* @__PURE__ */ jsx(Muted, { style: { fontSize: 12 }, children: "这档底模还没下载" }),
+                /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: downloadBase, children: busy === "basedl" ? "启动中…" : "下载底模" })
+              ] });
+            })(),
+            baseJob ? /* @__PURE__ */ jsxs(Col, { style: { gap: 6 }, children: [
+              /* @__PURE__ */ jsx(Bar, { pct: Number(baseJob.progress) || 0 }),
+              /* @__PURE__ */ jsx(Muted, { children: baseJob.detail || "正在下载底模…" })
+            ] }) : null,
             /* @__PURE__ */ jsxs(Row, { style: { gap: 8, flexWrap: "wrap" }, children: [
               STEPS_MODES.map((m) => /* @__PURE__ */ jsxs(
                 Btn,
@@ -3813,13 +3914,14 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const [language, setLanguage] = useState("auto");
     const [instrumental, setInstrumental] = useState(false);
     const [lora, setLora] = useState("");
-    const [postEngine, setPostEngine] = useState("");
+    const [postEngine, setPostEngine] = useState("ddsp");
     const [soulxStatus, setSoulxStatus] = useState(null);
     const [installConfirm, setInstallConfirm] = useState(null);
     const [openAdv, setOpenAdv] = useState(false);
     const [advSteps, setAdvSteps] = useState("0");
     const [advGuidance, setAdvGuidance] = useState("7");
     const [advSeed, setAdvSeed] = useState("-1");
+    const [candidates, setCandidates] = useState("4");
     const [model, setModel] = useState("");
     const modelTouched = useRef(false);
     const loraTouched = useRef(false);
@@ -3828,6 +3930,78 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const [job, setJob] = useState(null);
     const [notice, setNotice] = useState(null);
     const poll = useRef(null);
+    const CREATE_KEY = "ms_create_ui_v2";
+    const hydrated = useRef(false);
+    useEffect(() => {
+      try {
+        const raw = window.localStorage.getItem(CREATE_KEY);
+        if (raw) {
+          const v = JSON.parse(raw) || {};
+          if (typeof v.prompt === "string") setPrompt(v.prompt);
+          if (typeof v.lyrics === "string") setLyrics(v.lyrics);
+          if (typeof v.name === "string") setName(v.name);
+          if (typeof v.duration === "string") setDuration(v.duration);
+          if (typeof v.bpm === "string") setBpm(v.bpm);
+          if (typeof v.language === "string") setLanguage(v.language);
+          if (typeof v.instrumental === "boolean") setInstrumental(v.instrumental);
+          if (typeof v.postEngine === "string") setPostEngine(v.postEngine === "soulx" ? "soulx" : v.postEngine === "" ? "" : "ddsp");
+          if (typeof v.advSteps === "string") setAdvSteps(v.advSteps);
+          if (typeof v.advGuidance === "string") setAdvGuidance(v.advGuidance);
+          if (typeof v.advSeed === "string") setAdvSeed(v.advSeed);
+          if (typeof v.candidates === "string") setCandidates(v.candidates);
+          if (typeof v.openAdv === "boolean") setOpenAdv(v.openAdv);
+          if (typeof v.model === "string" && v.model) {
+            setModel(v.model);
+            modelTouched.current = true;
+          }
+          if (typeof v.lora === "string") {
+            setLora(v.lora);
+            if (v.lora) loraTouched.current = true;
+          }
+        }
+      } catch (e) {
+      }
+      hydrated.current = true;
+    }, []);
+    useEffect(() => {
+      if (!hydrated.current) return;
+      try {
+        window.localStorage.setItem(CREATE_KEY, JSON.stringify({
+          prompt,
+          lyrics,
+          name,
+          duration,
+          bpm,
+          language,
+          instrumental,
+          lora,
+          postEngine,
+          advSteps,
+          advGuidance,
+          advSeed,
+          candidates,
+          model,
+          openAdv
+        }));
+      } catch (e) {
+      }
+    }, [
+      prompt,
+      lyrics,
+      name,
+      duration,
+      bpm,
+      language,
+      instrumental,
+      lora,
+      postEngine,
+      advSteps,
+      advGuidance,
+      advSeed,
+      candidates,
+      model,
+      openAdv
+    ]);
     const check = async () => {
       try {
         const r = await callEntry(api, "ms_ace_status", {}, 3e4);
@@ -3934,6 +4108,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           inference_steps: Number(advSteps) || 0,
           guidance_scale: Number(advGuidance) || 7,
           seed: String(advSeed).trim() === "" ? -1 : Number(advSeed),
+          candidates: Math.max(1, Math.min(6, Number(candidates) || 1)),
           model,
           lora
         }, 6e4);
@@ -4008,7 +4183,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     };
     const loras = status && Array.isArray(status.loras) ? status.loras : [];
     const catalog = status && Array.isArray(status.model_catalog) ? status.model_catalog : [];
-    const modelMeta = (name2) => catalog.find((m) => m.name === name2) || null;
+    const modelMeta = (n) => catalog.find((m) => m.name === n) || null;
     const modelChoices = catalog.length ? catalog.map((m) => m.name) : status && Array.isArray(status.model_choices) && status.model_choices.length ? status.model_choices : status && status.model ? [status.model] : ["acestep-v15-turbo"];
     const MODEL_HINT = {
       "acestep-v15-turbo": "2B · 8 步 · 快",
@@ -4024,27 +4199,63 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const modelReady = !status || !model || Array.isArray(status.models) && status.models.includes(model);
     const otherProblems = (status && Array.isArray(status.problems) ? status.problems : []).filter((p) => !String(p).startsWith("ACE 模型 "));
     const ready = Boolean(status && modelReady && otherProblems.length === 0);
-    const loraVariantsOf = (name2) => {
-      const hit = loras.find((l) => l.name === name2);
+    const loraVariantsOf = (n) => {
+      const hit = loras.find((l) => l.name === n);
       const variants = hit && Array.isArray(hit.variants) ? hit.variants : [];
       if (variants.length) return variants;
       return hit && hit.base ? [{ name: hit.name, base: hit.base, path: hit.path }] : [];
     };
-    const loraBasesOf = (name2) => loraVariantsOf(name2).map((v) => String(v.base || "")).filter(Boolean);
-    const pickLora = (name2) => {
+    const loraBasesOf = (n) => loraVariantsOf(n).map((v) => String(v.base || "")).filter(Boolean);
+    const pickLora = (n) => {
       loraTouched.current = true;
-      setLora(name2);
-      if (!name2) return;
-      const variants = loraVariantsOf(name2);
+      setLora(n);
+      if (!n) return;
+      const variants = loraVariantsOf(n);
       if (!variants.length) return;
       if (variants.some((v) => v.base === model)) return;
       const target = variants.find((v) => Array.isArray(status == null ? void 0 : status.models) && status.models.includes(v.base));
       if (target && target.base) {
         modelTouched.current = true;
         setModel(String(target.base));
-        setNotice({ tone: "info", text: `「${name2}」没有 ${model} 版本，已自动切到 ${target.base}` });
+        setNotice({ tone: "info", text: `「${n}」没有 ${model} 版本，已自动切到 ${target.base}` });
       } else {
-        setNotice({ tone: "error", text: `「${name2}」需要的底模还没下载：${variants.map((v) => v.base).join("、")}` });
+        setNotice({ tone: "error", text: `「${n}」需要的底模还没下载：${variants.map((v) => v.base).join("、")}` });
+      }
+    };
+    const chooseModel = (v) => {
+      modelTouched.current = true;
+      setModel(v);
+      const variants = loraVariantsOf(lora);
+      if (lora && variants.length && !variants.some((x) => x.base === v)) {
+        setLora("");
+        setNotice({
+          tone: "info",
+          text: `已取消音色「${lora}」（它没有 ${v} 版本，可用于 ${variants.map((x) => x.base).join("、")}）`
+        });
+      }
+      if (Array.isArray(status == null ? void 0 : status.models) && status.models.includes(v)) {
+        callEntry(api, "ms_set_config", { ace_model: v }, 3e4).catch(() => {
+        });
+      }
+    };
+    const deleteModelOf = async (target) => {
+      if (busy) return;
+      const n = String(target || "").trim();
+      if (!n) return;
+      if (!window.confirm("删除模型 " + n + "？会移进回收站，下次生成前要重新下载。")) return;
+      setBusy("delmodel");
+      try {
+        const r = await callEntry(api, "ms_ace_delete_model", { model: n }, 6e4);
+        if (r && r.ok) {
+          setNotice({ tone: "info", text: "已删除 " + n });
+          check();
+        } else {
+          setNotice({ tone: "error", text: "删除失败：" + (r && r.error || "未知错误") });
+        }
+      } catch (e) {
+        setNotice({ tone: "error", text: String(e && e.message || e) });
+      } finally {
+        setBusy("");
       }
     };
     const isDownloadJob = Boolean(job && job.job === "ace-download");
@@ -4058,7 +4269,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         ] }),
         /* @__PURE__ */ jsxs(Row, { style: { gap: 8, flexWrap: "wrap" }, children: [
           /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: install, children: busy === "install" ? "安装中…" : "安装 ACE 依赖" }),
-          /* @__PURE__ */ jsx(Btn, { disabled: !!busy || modelReady, onClick: downloadModel, children: busy === "download" ? "下载中…" : "下载当前模型" }),
+          /* @__PURE__ */ jsx(Btn, { disabled: !!busy || modelReady, onClick: () => downloadModel(), children: busy === "download" ? "下载中…" : "下载当前模型" }),
           /* @__PURE__ */ jsxs(Muted, { children: [
             "依赖约 100MB；模型在「",
             model || "acestep-v15-turbo",
@@ -4066,24 +4277,31 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           ] })
         ] })
       ] }) }) : null,
-      /* @__PURE__ */ jsx(
-        Panel,
-        {
-          title: "原创歌曲（ACE-Step）",
-          extra: /* @__PURE__ */ jsx(Pill, { tone: ready ? "success" : "warning", children: ready ? "本地模型已就绪" : "环境未就绪" }),
-          children: /* @__PURE__ */ jsxs(Col, { style: { gap: 14 }, children: [
-            /* @__PURE__ */ jsxs("div", { style: { fontSize: 12.5, color: INK_2, lineHeight: 1.8 }, children: [
-              "用文字生成一首完整的歌（人声 + 伴奏），生成后可以：",
-              /* @__PURE__ */ jsx("b", { children: "只生成" }),
-              "（先试听原曲），或 ",
-              /* @__PURE__ */ jsx("b", { children: "生成并让她唱" }),
-              "（直接走分离 → 变声 → 混音，用当前音色）。"
-            ] }),
-            /* @__PURE__ */ jsxs(Grid, { cols: 2, min: 240, gap: 14, children: [
+      /* @__PURE__ */ jsxs(Col, { style: { gap: 18 }, children: [
+        /* @__PURE__ */ jsxs("div", { style: {
+          padding: "22px 24px",
+          borderRadius: 22,
+          background: "linear-gradient(135deg,#fff7fb 0%,#f6f2ff 100%)",
+          border: "1px solid " + LINE,
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          gap: 14,
+          flexWrap: "wrap"
+        }, children: [
+          /* @__PURE__ */ jsxs("div", { children: [
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 22, fontWeight: 750, color: INK, letterSpacing: 0.3 }, children: "写一首歌，让她唱" }),
+            /* @__PURE__ */ jsx("div", { style: { marginTop: 6, fontSize: 13, color: INK_2 }, children: "描述风格、填好歌词；生成后自动分离、变声、混音。" })
+          ] }),
+          /* @__PURE__ */ jsx(Pill, { tone: ready ? "success" : "warning", children: ready ? "环境就绪" : "环境未就绪" })
+        ] }),
+        /* @__PURE__ */ jsxs(Grid, { cols: 2, min: 300, gap: 18, children: [
+          /* @__PURE__ */ jsxs(Panel, { title: "歌曲内容", extra: /* @__PURE__ */ jsx(Muted, { children: "歌词支持 [verse] / [chorus]" }), children: [
+            /* @__PURE__ */ jsxs(Grid, { cols: 2, min: 180, gap: 14, children: [
               /* @__PURE__ */ jsx(Field, { label: "歌名（留空自动命名）", children: /* @__PURE__ */ jsx(Input, { value: name, placeholder: "例如 夏夜的风", onChange: (e) => setName(e.target.value) }) }),
               /* @__PURE__ */ jsx(Field, { label: "时长（秒；0 = 按歌词估算）", children: /* @__PURE__ */ jsx(Input, { type: "number", min: 10, max: 600, step: 5, value: duration, onChange: (e) => setDuration(e.target.value) }) })
             ] }),
-            /* @__PURE__ */ jsx(Field, { label: "风格 / 编曲描述", children: /* @__PURE__ */ jsx(
+            /* @__PURE__ */ jsx(Field, { label: "风格 / 编曲", children: /* @__PURE__ */ jsx(
               "textarea",
               {
                 style: TA_STYLE,
@@ -4097,119 +4315,137 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
               "textarea",
               {
                 style: TA_STYLE,
-                rows: 7,
+                rows: 10,
                 value: lyrics,
-                placeholder: "支持 [verse] / [chorus] 结构标签\n第一句歌词…\n第二句歌词…",
+                placeholder: "[verse]\n第一句歌词…\n\n[chorus]\n副歌…",
                 onChange: (e) => setLyrics(e.target.value)
               }
             ) }),
-            /* @__PURE__ */ jsxs(Grid, { cols: 3, min: 180, gap: 14, children: [
+            /* @__PURE__ */ jsxs(Grid, { cols: 3, min: 150, gap: 14, children: [
               /* @__PURE__ */ jsx(Field, { label: "BPM（0 = 自动）", children: /* @__PURE__ */ jsx(Input, { type: "number", min: 0, max: 300, step: 1, value: bpm, onChange: (e) => setBpm(e.target.value) }) }),
               /* @__PURE__ */ jsx(Field, { label: "演唱语言", children: /* @__PURE__ */ jsx(Select, { value: language, onChange: (e) => setLanguage(e.target.value), children: LANGS2.map(([v, t]) => /* @__PURE__ */ jsx("option", { value: v, children: t }, v)) }) }),
-              /* @__PURE__ */ jsx(Field, { label: "生成方式", children: /* @__PURE__ */ jsx(Row, { style: { paddingTop: 6 }, children: /* @__PURE__ */ jsx(Toggle, { on: instrumental, onChange: setInstrumental, label: "纯音乐（不唱）" }) }) })
+              /* @__PURE__ */ jsx(Field, { label: "纯音乐", children: /* @__PURE__ */ jsx(Row, { style: { paddingTop: 6 }, children: /* @__PURE__ */ jsx(Toggle, { on: instrumental, onChange: setInstrumental, label: "不唱" }) }) })
+            ] })
+          ] }),
+          /* @__PURE__ */ jsxs(Col, { style: { gap: 18 }, children: [
+            /* @__PURE__ */ jsx(Panel, { title: "生成模型", extra: /* @__PURE__ */ jsx(Pill, { tone: modelReady ? "success" : "warning", children: modelReady ? "已安装" : "未安装" }), children: /* @__PURE__ */ jsxs(Col, { style: { gap: 8 }, children: [
+              modelChoices.map((m) => {
+                const meta = modelMeta(m) || {};
+                const active = m === model;
+                return /* @__PURE__ */ jsxs("div", { onClick: () => chooseModel(m), style: {
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                  padding: "10px 12px",
+                  borderRadius: 14,
+                  border: "1px solid " + (active ? BRAND_DEEP : LINE),
+                  background: active ? "#fff5fa" : "#fff",
+                  cursor: "pointer"
+                }, children: [
+                  /* @__PURE__ */ jsxs("div", { style: { flex: "1 1 auto", minWidth: 0 }, children: [
+                    /* @__PURE__ */ jsx("div", { style: { fontSize: 13, fontWeight: 600, color: INK, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }, children: m }),
+                    /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_2, marginTop: 2 }, children: [
+                      meta.family || "",
+                      meta.steps ? " · " + meta.steps + " 步" : "",
+                      meta.quality ? " · 音质 " + meta.quality : "",
+                      meta.vram_min_gb ? " · ≥" + meta.vram_min_gb + "GB" : ""
+                    ].join("") })
+                  ] }),
+                  /* @__PURE__ */ jsx(Pill, { tone: meta.downloaded ? "success" : "warning", children: meta.downloaded ? "已下载" : "未下载" }),
+                  meta.downloaded ? /* @__PURE__ */ jsx(
+                    Btn,
+                    {
+                      style: { padding: "4px 9px", fontSize: 12 },
+                      onClick: (e) => {
+                        e.stopPropagation();
+                        deleteModelOf(m);
+                      },
+                      children: "删除"
+                    }
+                  ) : null,
+                  active ? /* @__PURE__ */ jsx(Pill, { tone: "neutral", children: "当前" }) : null
+                ] }, m);
+              }),
+              isDownloadJob && job ? /* @__PURE__ */ jsxs(Col, { style: { gap: 6 }, children: [
+                /* @__PURE__ */ jsx(Bar, { pct: Number(job.progress) || 0 }),
+                /* @__PURE__ */ jsx(Muted, { children: job.detail || "正在下载模型…" })
+              ] }) : null,
+              !modelReady ? /* @__PURE__ */ jsxs(Row, { style: { flexWrap: "wrap", gap: 8, alignItems: "center" }, children: [
+                /* @__PURE__ */ jsxs(Muted, { children: [
+                  "这个模型还没下载",
+                  modelMeta(model) && modelMeta(model).download_gb ? "（约 " + modelMeta(model).download_gb + "GB，需要 ≥" + (modelMeta(model).vram_min_gb || "?") + "GB 显存；可断点续传）" : ""
+                ] }),
+                /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: () => downloadModel(), children: busy === "download" ? "启动下载…" : "下载这个模型" })
+              ] }) : null,
+              (() => {
+                const meta = modelMeta(model);
+                if (!meta) return null;
+                return /* @__PURE__ */ jsxs(Muted, { style: { lineHeight: 1.8 }, children: [
+                  "能提升：",
+                  (meta.gains || []).join("；"),
+                  "。适合：",
+                  meta.best_for,
+                  "。"
+                ] });
+              })(),
+              status && status.model_recommended ? /* @__PURE__ */ jsxs(Muted, { style: { fontSize: 12 }, children: [
+                "这台电脑推荐：",
+                status.model_recommended,
+                "（按显存自动判断）"
+              ] }) : null,
+              status && status.gpu && status.gpu.cuda_ok === false ? /* @__PURE__ */ jsxs(Alert, { tone: "warning", children: [
+                "显卡不兼容：",
+                (status.gpu.notes || []).join("；"),
+                "。原创生成会退回 CPU（很慢）。"
+              ] }) : null,
+              status && status.gpu && status.gpu.cuda_ok ? /* @__PURE__ */ jsxs(Muted, { style: { fontSize: 12, lineHeight: 1.7 }, children: [
+                status.gpu.name || "GPU",
+                " · ",
+                String(status.gpu.vram_total_gib || "?"),
+                "GB · sm_",
+                status.gpu.compute_cap || "?",
+                " · ",
+                status.gpu.dtype || "?",
+                " 精度",
+                Array.isArray(status.gpu.quantization) && status.gpu.quantization.length ? " · 可用量化：" + status.gpu.quantization.join(" / ") : " · 不支持量化",
+                Number(status.gpu.vram_total_gib || 0) <= 6 ? " · 小显存：自动 int8 量化 + VAE 放内存解码" : ""
+              ] }) : null
+            ] }) }),
+            /* @__PURE__ */ jsxs(Panel, { title: "声音与后处理", children: [
+              /* @__PURE__ */ jsx(Field, { label: "ACE 音色（LoRA；按模型自动选版本）", children: /* @__PURE__ */ jsxs(Select, { value: lora, onChange: (e) => pickLora(e.target.value), children: [
+                /* @__PURE__ */ jsx("option", { value: "", children: "默认音色（不加载 LoRA）" }),
+                loras.map((l) => /* @__PURE__ */ jsxs("option", { value: l.name, children: [
+                  l.name,
+                  loraBasesOf(l.name).length ? " · " + loraBasesOf(l.name).join(" / ") : ""
+                ] }, l.name))
+              ] }) }),
+              /* @__PURE__ */ jsx(Muted, { style: { fontSize: 12 }, children: lora ? "已选「" + lora + "」；生成时自动挑当前模型对应的版本，默认直接用 ACE 唱这个音色。" : "不选则用 ACE 默认音色。" }),
+              /* @__PURE__ */ jsx(Field, { label: "唱完后再处理干声", children: /* @__PURE__ */ jsxs(Select, { value: postEngine, onChange: (e) => setPostEngine(e.target.value), children: [
+                /* @__PURE__ */ jsx("option", { value: "ddsp", children: "用翻唱声音（DDSP）" }),
+                /* @__PURE__ */ jsx("option", { value: "soulx", children: "SoulX → DDSP（保气音）" }),
+                /* @__PURE__ */ jsx("option", { value: "", children: "不用（ACE 直接出成品）" })
+              ] }) }),
+              /* @__PURE__ */ jsx(Muted, { style: { fontSize: 12, lineHeight: 1.7 }, children: postEngine === "" ? "不后处理：ACE 直接出成品，点「生成并让她唱」也不会换声。" : postEngine === "soulx" ? "SoulX 唱法 + DDSP 音色；比纯 DDSP 多一次变声。" : "分离 → 变声 → 混音，用当前翻唱声音。" }),
+              postEngine === "soulx" && soulxStatus && !soulxStatus.ready ? /* @__PURE__ */ jsxs(Row, { style: { flexWrap: "wrap", gap: 8, alignItems: "center" }, children: [
+                /* @__PURE__ */ jsxs(Muted, { children: [
+                  "SoulX 还没就绪：",
+                  (soulxStatus.problems || []).join("、")
+                ] }),
+                /* @__PURE__ */ jsx(Btn, { onClick: () => callEntry(api, "ms_soulx_status", {}, 3e4).then(setSoulxStatus).catch(() => {
+                }), children: "重新检查" })
+              ] }) : null
             ] }),
-            /* @__PURE__ */ jsx(Field, { label: "生成模型（质量 / 速度）", children: /* @__PURE__ */ jsx(Select, { value: model, onChange: (e) => {
-              const v = e.target.value;
-              modelTouched.current = true;
-              setModel(v);
-              const variants = loraVariantsOf(lora);
-              if (lora && variants.length && !variants.some((x) => x.base === v)) {
-                setLora("");
-                setNotice({
-                  tone: "info",
-                  text: `已取消音色「${lora}」（它没有 ${v} 版本，可用于 ${variants.map((x) => x.base).join("、")}）`
-                });
-              }
-              if (Array.isArray(status == null ? void 0 : status.models) && status.models.includes(v)) {
-                callEntry(api, "ms_set_config", { ace_model: v }, 3e4).catch(() => {
-                });
-              }
-            }, children: modelChoices.map((m) => {
-              const meta = modelMeta(m);
-              return /* @__PURE__ */ jsxs("option", { value: m, children: [
-                m,
-                meta ? " · " + meta.family + " · " + meta.steps + "步 · 音质" + meta.quality + " · 需≥" + meta.vram_min_gb + "GB" + (meta.downloaded ? " · 已下载" : " · 未下载") : MODEL_HINT[m] ? " · " + MODEL_HINT[m] : ""
-              ] }, m);
-            }) }) }),
-            (() => {
-              const meta = modelMeta(model);
-              if (!meta) return null;
-              return /* @__PURE__ */ jsxs(Muted, { style: { lineHeight: 1.8 }, children: [
-                "能提升：",
-                (meta.gains || []).join("；"),
-                "。适合：",
-                meta.best_for,
-                "。",
-                " ",
-                meta.downloaded ? "已下载。" : "还没下载，约 " + meta.download_gb + "GB，需要至少 " + meta.vram_min_gb + "GB 显存。"
-              ] });
-            })(),
-            status && status.model_recommended ? /* @__PURE__ */ jsxs(Muted, { children: [
-              "这台电脑推荐：",
-              status.model_recommended,
-              "（按显存自动判断）"
-            ] }) : null,
-            status && status.gpu && status.gpu.cuda_ok === false ? /* @__PURE__ */ jsxs(Alert, { tone: "warning", children: [
-              "显卡不兼容：",
-              (status.gpu.notes || []).join("；"),
-              "。原创生成会退回 CPU（很慢）。"
-            ] }) : null,
-            status && status.gpu && status.gpu.cuda_ok ? /* @__PURE__ */ jsxs(Muted, { style: { lineHeight: 1.7 }, children: [
-              status.gpu.name || "GPU",
-              " · ",
-              status.gpu.vram_total_gib,
-              "GB · sm_",
-              status.gpu.compute_cap,
-              " · ",
-              status.gpu.dtype,
-              " 精度",
-              Array.isArray(status.gpu.quantization) && status.gpu.quantization.length ? " · 可用量化：" + status.gpu.quantization.join(" / ") : " · 不支持量化",
-              Number(status.gpu.vram_total_gib || 0) <= 6 ? " · 小显存：自动 int8 量化 + VAE 放内存解码" : ""
-            ] }) : null,
-            !modelReady ? /* @__PURE__ */ jsxs(Row, { style: { flexWrap: "wrap", gap: 10, alignItems: "center" }, children: [
-              /* @__PURE__ */ jsx(Muted, { children: "这个模型还没下载（XL 仓库约 18.6GB，需要 ≥12GB 显存；可断点续传）。" }),
-              /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: downloadModel, children: busy === "download" ? "启动下载…" : "下载这个模型" })
-            ] }) : null,
-            /* @__PURE__ */ jsx(Field, { label: "ACE 音色（LoRA；按模型自动选版本）", children: /* @__PURE__ */ jsxs(Select, { value: lora, onChange: (e) => pickLora(e.target.value), children: [
-              /* @__PURE__ */ jsx("option", { value: "", children: "默认音色（不加载 LoRA）" }),
-              loras.map((l) => /* @__PURE__ */ jsxs("option", { value: l.name, children: [
-                l.name,
-                loraBasesOf(l.name).length ? " · " + loraBasesOf(l.name).join(" / ") : ""
-              ] }, l.name))
-            ] }) }),
-            lora ? /* @__PURE__ */ jsxs(Muted, { children: [
-              "已选 ACE 音色「",
-              lora,
-              "」",
-              loraBasesOf(lora).length ? "（可用于 " + loraBasesOf(lora).join("、") + "）" : "",
-              "：生成时会自动挑当前模型对应的版本；默认直接用 ACE 唱这个音色。"
-            ] }) : null,
-            /* @__PURE__ */ jsx(Field, { label: "唱完后再处理干声", children: /* @__PURE__ */ jsxs(Select, { value: postEngine, onChange: (e) => setPostEngine(e.target.value), children: [
-              /* @__PURE__ */ jsx("option", { value: "", children: "不用（ACE 直接出成品）" }),
-              /* @__PURE__ */ jsx("option", { value: "ddsp", children: "用翻唱声音（DDSP）" }),
-              /* @__PURE__ */ jsx("option", { value: "soulx", children: "SoulX-Singer SVC（实验）" })
-            ] }) }),
-            postEngine ? /* @__PURE__ */ jsxs(Muted, { style: { lineHeight: 1.75 }, children: [
-              postEngine === "soulx" ? "ACE 先生成整首，再取干声走 SoulX-Singer SVC，最后和伴奏混回去。" : "ACE 先生成整首，再取干声用当前翻唱声音变声，最后和伴奏混回去。",
-              "点「只生成」时不会后处理。"
-            ] }) : null,
-            postEngine === "soulx" && soulxStatus && !soulxStatus.ready ? /* @__PURE__ */ jsxs(Row, { style: { flexWrap: "wrap", gap: 8, alignItems: "center" }, children: [
-              /* @__PURE__ */ jsxs(Muted, { children: [
-                "SoulX 还没就绪：",
-                (soulxStatus.problems || []).join("、")
+            /* @__PURE__ */ jsxs(Panel, { title: "开始", children: [
+              /* @__PURE__ */ jsxs(Row, { style: { flexWrap: "wrap", gap: 8 }, children: [
+                /* @__PURE__ */ jsx(Btn, { disabled: !!busy || !ready, onClick: () => start(false), children: "只生成" }),
+                /* @__PURE__ */ jsx(Btn, { style: PRIMARY_BTN, disabled: !!busy || !ready, onClick: () => start(true), children: busy ? "正在生成…" : lora ? "用这个 ACE 音色生成" : "生成并让她唱" }),
+                /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: check, children: "检查环境" })
               ] }),
-              /* @__PURE__ */ jsx(Btn, { onClick: () => callEntry(api, "ms_soulx_status", {}, 3e4).then(setSoulxStatus).catch(() => {
-              }), children: "重新检查" })
-            ] }) : null,
-            /* @__PURE__ */ jsx(Row, { style: { flexWrap: "wrap", alignItems: "center", gap: 14 }, children: /* @__PURE__ */ jsx(Muted, { children: "首次加载 ACE 模型会慢一些；同一时间只跑一个生成/唱的任务。" }) }),
-            /* @__PURE__ */ jsxs(Row, { style: { flexWrap: "wrap", gap: 8 }, children: [
-              /* @__PURE__ */ jsx(Btn, { disabled: !!busy || !ready, onClick: () => start(false), children: "只生成" }),
-              /* @__PURE__ */ jsx(Btn, { style: PRIMARY_BTN, disabled: !!busy || !ready, onClick: () => start(true), children: busy ? "正在生成…" : lora ? "用这个 ACE 音色生成" : "生成并让她唱" }),
-              /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: check, children: "重新检查环境" })
+              /* @__PURE__ */ jsx(Muted, { style: { fontSize: 12 }, children: "首次加载模型较慢；同一时间只跑一个任务。高级选项里可以调候选数。" })
             ] })
           ] })
-        }
-      ),
+        ] })
+      ] }),
       job ? /* @__PURE__ */ jsx(Section, { title: isDownloadJob ? "模型下载" : "生成进度", extra: /* @__PURE__ */ jsx(Muted, { children: stateText }), children: /* @__PURE__ */ jsx(Panel, { children: /* @__PURE__ */ jsxs(Col, { style: { gap: 10 }, children: [
         /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between", flexWrap: "wrap", gap: 8 }, children: [
           /* @__PURE__ */ jsx("div", { style: { fontSize: 14, fontWeight: 700, color: INK }, children: job.state === "done" ? isDownloadJob ? "模型下载完成" : "生成完成" : job.state === "failed" ? isDownloadJob ? "模型下载失败" : "生成失败" : isDownloadJob ? "正在下载模型" : "ACE-Step 正在生成" }),
@@ -4220,7 +4456,6 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         job.state === "running" && Number(job.progress || 0) <= 5 ? /* @__PURE__ */ jsx(Muted, { children: "ACE 首次加载模型较慢；若长时间停在 5% 且没有变化，可能是插件被重载了，请重新点一次生成。" }) : null,
         job.state === "done" ? /* @__PURE__ */ jsxs(Row, { style: { flexWrap: "wrap", gap: 8 }, children: [
           isDownloadJob ? /* @__PURE__ */ jsx(Btn, { style: PRIMARY_BTN, onClick: check, children: "刷新环境" }) : null,
-          isDownloadJob ? /* @__PURE__ */ jsx(Btn, { style: PRIMARY_BTN, onClick: check, children: "刷新环境" }) : null,
           !isDownloadJob ? /* @__PURE__ */ jsx(Btn, { style: PRIMARY_BTN, onClick: () => props.onGo("sing"), children: "去「让她唱歌」看看" }) : null
         ] }) : null
       ] }) }) }) : null,
@@ -4230,9 +4465,9 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           open: openAdv,
           onToggle: () => setOpenAdv(!openAdv),
           title: "高级选项",
-          sub: /* @__PURE__ */ jsx(Muted, { children: "采样步数、引导强度、随机种子" }),
+          sub: /* @__PURE__ */ jsx(Muted, { children: "采样步数、引导强度、随机种子、候选数" }),
           children: /* @__PURE__ */ jsxs(Col, { style: { gap: 14 }, children: [
-            /* @__PURE__ */ jsxs(Grid, { cols: 3, min: 200, gap: 14, children: [
+            /* @__PURE__ */ jsxs(Grid, { cols: 4, min: 180, gap: 14, children: [
               /* @__PURE__ */ jsx(Field, { label: "采样步数（0 = 自动）", children: /* @__PURE__ */ jsx(
                 Input,
                 {
@@ -4264,9 +4499,20 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
                   value: advSeed,
                   onChange: (e) => setAdvSeed(e.target.value)
                 }
+              ) }),
+              /* @__PURE__ */ jsx(Field, { label: "候选数（1-6，越多越慢）", children: /* @__PURE__ */ jsx(
+                Input,
+                {
+                  type: "number",
+                  min: 1,
+                  max: 6,
+                  step: 1,
+                  value: candidates,
+                  onChange: (e) => setCandidates(e.target.value)
+                }
               ) })
             ] }),
-            /* @__PURE__ */ jsx(Muted, { children: "默认即可：turbo 模型固定 8 步且不使用 CFG；sft/base 默认 50 步。固定种子后，同样的描述和歌词会得到更接近的结果。" })
+            /* @__PURE__ */ jsx(Muted, { children: "默认建议 4 个候选：ACE 每次编曲差异很大，多抽几条后会自动按频谱平衡选一条，其余会留在「让她唱歌」里给你试听。 固定种子后，同样的描述和歌词会得到完全一样的结果。" })
           ] })
         }
       ),
@@ -5040,6 +5286,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
   // ../../.neko-plugin-installations/plugins/music_synth/ui/onboarding.tsx
   var STEPS = ["体验", "功能", "用法", "环境", "开始"];
   var STEP_TITLES = ["先听听效果", "她能做什么", "怎么用", "准备运行环境", "准备完成"];
+  var REDOWNLOAD_KEYS = ["ddsp_contentvec", "sep_karaoke"];
   function previewMode() {
     try {
       const q = String(window.location && window.location.search || "");
@@ -5297,6 +5544,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       if (!installing) return;
       let stop = false;
       let tick = 0;
+      let idle = 0;
       const loop = async () => {
         while (!stop) {
           await new Promise((r) => setTimeout(r, 1e3));
@@ -5320,6 +5568,16 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
             setProg(st.progress || null);
             if (st.setup && st.setup.report) setReport(st.setup.report);
             const s = String((st.job || {}).state || "");
+            if (!s) {
+              idle += 1;
+              if (idle >= 30) {
+                setInstalling(false);
+                setErr("安装任务已丢失（插件可能重载过），请重新点一次安装。");
+                return;
+              }
+            } else {
+              idle = 0;
+            }
             if (s === "done") {
               setInstalling(false);
               const fresh = await check();
@@ -5332,6 +5590,12 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
               return;
             }
           } catch (e) {
+            idle += 1;
+            if (idle >= 30) {
+              setInstalling(false);
+              setErr("读取安装进度失败，插件可能已重载；请重新打开面板确认。");
+              return;
+            }
           }
         }
       };
@@ -5363,6 +5627,34 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           setMockT(0);
           setInstalling(true);
         } else setErr(String(e && e.message || e));
+      }
+      setBusy("");
+    };
+    const redownload = async (key) => {
+      if (installing || busy) return;
+      setBusy("redownload:" + key);
+      setErr("");
+      setMustInstall(false);
+      try {
+        if (mockMode) {
+          setMockT(0);
+          setInstalling(true);
+          setBusy("");
+          return;
+        }
+        const r = await callEntry(props.api, "ms_setup_redownload", { model: key }, 6e4);
+        if (r && r.job_id) {
+          jobId.current = String(r.job_id);
+          setJob({ state: "running", progress: 0, detail: "正在准备重新下载…" });
+          setMockT(0);
+          setInstalling(true);
+        } else if (r && r.ok) {
+          await check();
+        } else {
+          throw Error(String(r && r.error || "重新下载没能启动"));
+        }
+      } catch (e) {
+        setErr(String(e && e.message || e));
       }
       setBusy("");
     };
@@ -5415,6 +5707,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const items = report && report.items || [];
     const needGb = report ? Number(report.required_missing_gb !== void 0 ? report.required_missing_gb : report.total_missing_gb || 0) || 0 : 0;
     const optGb = report ? Number(report.optional_missing_gb || 0) || 0 : 0;
+    const needsPath = !!report && (report.needs_path === true || Array.isArray(report.missing) && report.missing.indexOf("install_path") >= 0);
     const lack = freeGb !== null && needGb > 0 && freeGb < Math.max(0.5, needGb * 1.15);
     const allReady = !!report && report.ready === true;
     const canNext = allReady || mockDone;
@@ -5662,8 +5955,8 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       return Math.round(sum / list.length);
     })();
     const failed = !!(prog && prog.job_state === "failed");
-    const sizeText = !report ? "约 2 GB（以检测结果为准）" : needGb > 0 ? "必需 " + needGb + " GB" + (optGb > 0 ? " · 可选 " + optGb + " GB" : "") : optGb > 0 ? "必需 0 GB（已齐） · 可选 " + optGb + " GB" : "不用下载（已齐）";
-    const timeText = !report ? "看网速，一般 10～40 分钟" : needGb > 0 ? fmtEta(needGb * 900) : optGb > 0 ? "必需项不用下；可选约 " + fmtEta(optGb * 900) : "不用下载";
+    const sizeText = !report ? "约 2 GB（以检测结果为准）" : needsPath ? "选好安装目录后再统计" : needGb > 0 ? "必需 " + needGb + " GB" + (optGb > 0 ? " · 可选 " + optGb + " GB" : "") : optGb > 0 ? "必需 0 GB（已齐） · 可选 " + optGb + " GB" : "不用下载（已齐）";
+    const timeText = !report ? "看网速，一般 10～40 分钟" : needsPath ? "先选安装目录" : needGb > 0 ? fmtEta(needGb * 900) : optGb > 0 ? "必需项不用下；可选约 " + fmtEta(optGb * 900) : "不用下载";
     const failLabels = items.filter((i) => {
       const st = prog && prog.items && prog.items[i.key];
       return st && st.state === "failed";
@@ -5808,6 +6101,16 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
                   disabled: !!busy,
                   onClick: () => startInstall(i.key),
                   children: "重试这一项"
+                }
+              ) : null,
+              !installing && i.ok && REDOWNLOAD_KEYS.indexOf(i.key) >= 0 ? /* @__PURE__ */ jsx(
+                Btn,
+                {
+                  style: { ...ghostBtn, padding: "5px 11px", fontSize: 11.5, borderRadius: 9 },
+                  disabled: !!busy,
+                  title: "文件不完整时重下：旧文件会挪进 models/_trash",
+                  onClick: () => redownload(i.key),
+                  children: "重新下载"
                 }
               ) : null
             ] }),
