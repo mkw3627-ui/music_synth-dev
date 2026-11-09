@@ -123,6 +123,43 @@ def _title_writable(track: dict, source: str, incoming: str = "") -> bool:
     return True
 
 
+# ffplay 的进度行：`   12.34 M-A:  0.000 fd= ...`（用 \r 覆盖同一行）。
+# 第一个数是主时钟＝当前播放位置（音频为主时钟时就是解码器时钟）。
+_FFPLAY_POS_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s+M-A:")
+_FFPLAY_BUF_MAX = 8192
+
+
+def _pump_ffplay_clock(pipe, gen: int) -> None:
+    """把 ffplay 的实时播放位置喂给 lips_server（后台线程，随进程退出结束）。"""
+    buf = ""
+    try:
+        while True:
+            chunk = pipe.read(256)
+            if not chunk:
+                break
+            buf += chunk.decode("utf-8", "replace")
+            parts = re.split(r"[\r\n]", buf)
+            buf = parts.pop() if parts else ""
+            if len(buf) > _FFPLAY_BUF_MAX:
+                buf = buf[-512:]
+            for line in parts:
+                match = _FFPLAY_POS_RE.match(line.strip())
+                if not match:
+                    continue
+                try:
+                    lips_server.set_position(float(match.group(1)), gen)
+                except (TypeError, ValueError):
+                    pass
+    except Exception:  # noqa: BLE001 - 时钟断了不影响播放
+        pass
+    finally:
+        lips_server.end_audio_clock(gen)
+        try:
+            pipe.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 @neko_plugin
 class MusicSynthPlugin(NekoPluginBase):
     """全自动唱歌：采集 → 切歌 → 分离 → DDSP-SVC 变声 → 混音。"""
@@ -702,6 +739,14 @@ class MusicSynthPlugin(NekoPluginBase):
                                             paths.get("tier_override", ""),
                                             paths.get("precision", "auto"),
                                             paths.get("max_parallel", 0))})
+
+    @plugin_entry(id="ms_dl_diag", name="为她而唱 · 下载链路体检",
+                  description=("只读探测：代理是否真的可用、国内镜像（gh-proxy / ghfast / hf-mirror / 清华 PyPI）"
+                               "能不能连上、各源速度多少。遇到下载慢或下不动时用，不会下载模型。"),
+                  input_schema={"type": "object", "properties": {}})
+    async def ms_dl_diag(self, **_):
+        diag = await asyncio.to_thread(setup_mod.diagnose_download_sources)
+        return Ok(dict(diag, ok=True))
 
     @plugin_entry(id="ms_setup_check", name="为她而唱 · 首次使用检测",
                   description="首次使用向导第 1 步：检测依赖与模型，输出已就绪/缺失/可选清单、下载大小与建议安装目录",
@@ -3259,18 +3304,70 @@ class MusicSynthPlugin(NekoPluginBase):
         handles every WAV this module writes.
         """
         self._stop_playback()
+        return self._spawn_player(target)
+
+    def _start_singing(self, target: str) -> dict:
+        """起播一首成品：先交给主窗口的 <audio>。
+
+        主窗口那头的桥如果够新，会自己拉 ``/song.wav`` 播，并用
+        ``audio.currentTime`` 驱动口型——声音和嘴在同一个时钟里，中间只剩
+        「浏览器音频缓冲 + 一帧渲染」，没有跨进程解析、没有 HTTP 轮询。
+        桥不接管（页面没刷新 / 自动播放被拦）时由 ``_arm_playback_fallback``
+        在 1.8 秒后退回 ffplay，声音不会没有。
+        """
+        self._stop_playback()
+        return {"mode": "browser", "clock": "audio"}
+
+    def _arm_playback_fallback(self, target: str, seq: int) -> None:
+        """1.8 秒内网页没确认播放就退回 ffplay（后台线程，不挡主流程）。"""
+        def wait() -> None:
+            deadline = time.monotonic() + 1.8
+            while time.monotonic() < deadline:
+                state = lips_server.audio_state(seq)
+                if state == "playing":
+                    self.logger.info("[playback] 主窗口 <audio> 接管，链路=audio")
+                    return
+                if state == "failed":
+                    break
+                time.sleep(0.1)
+            if self._last_play_target != target:
+                return
+            if not lips_server.status().get("active"):
+                # 没有口型轨（连包络都没有）也别让人干等：直接出声。
+                pass
+            else:
+                self.logger.warning("[playback] 主窗口没有接管音频，退回 ffplay")
+            # 撤掉音频地址：避免网页那头稍后又把声音拉起来，两路一起响。
+            lips_server.drop_audio()
+            try:
+                self._spawn_player(target)
+            except OSError as exc:
+                self.logger.warning("[playback] 退回 ffplay 失败：%s", exc)
+
+        threading.Thread(target=wait, daemon=True,
+                         name="music_synth-play-fallback").start()
+
+    def _spawn_player(self, target: str) -> dict:
+        """外部进程播放：ffplay（带真实时钟）优先，winsound 兜底。"""
         ffplay = shutil.which("ffplay") or shutil.which("ffplay.exe")
         if ffplay:
             try:
+                gen = lips_server.begin_audio_clock()
                 proc = subprocess.Popen(
-                    [ffplay, "-nodisp", "-autoexit", "-loglevel", "error", str(target)],
+                    # -stats 让 ffplay 每 ~30ms 打印一行播放位置；口型直接用这个
+                    # 真实时钟，不再用墙钟 + 固定延迟去猜（那是「慢半拍」的来源）。
+                    [ffplay, "-nodisp", "-autoexit", "-loglevel", "info",
+                     "-stats", str(target)],
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
+                threading.Thread(target=_pump_ffplay_clock,
+                                 args=(proc.stderr, gen), daemon=True,
+                                 name="music_synth-ffplay-clock").start()
                 self._playback_proc = proc
                 self.logger.info("[playback] mode=ffplay pid=%s file=%s", proc.pid, target)
-                return {"mode": "ffplay", "pid": proc.pid}
+                return {"mode": "ffplay", "pid": proc.pid, "clock": "audio"}
             except OSError as exc:
                 self.logger.warning("ffplay 播放失败，改用 winsound：%s", exc)
         if sys.platform == "win32":
@@ -3287,7 +3384,7 @@ class MusicSynthPlugin(NekoPluginBase):
         self.logger.warning("[playback] 无可用后端（ffplay 缺失且 winsound 失败）file=%s", target)
         return {"mode": "none", "error": "没有可用的本地播放后端（ffplay 缺失且 winsound 失败）"}
 
-    def _lips_start(self, track: dict, target: str) -> dict:
+    def _lips_start(self, track: dict, target: str, *, audio: bool = False) -> dict:
         """Publish this song's per-character mouth track for the main window.
 
         The song plays through ffplay/winsound, so the app's own lip-sync (which
@@ -3295,15 +3392,25 @@ class MusicSynthPlugin(NekoPluginBase):
         plus a clock; ``music-groove-bridge.js`` in the main window polls it and
         writes ParamMouthOpenY / ParamMouthForm, which is what makes the mouth
         follow the sung syllables instead of flapping at random.
+
+        ``audio=True`` 时同时把成品文件挂到 ``/song.wav``：主窗口可以用
+        ``<audio>`` 播它，嘴直接读 ``currentTime``（同一条时间线）。
         """
         payload = self._lips_payload(track, target)
         cues = payload.get("cues") or []
         duration = float(payload.get("duration") or track.get("duration_s") or 0.0)
         song = str(payload.get("song") or track.get("title") or "")
         track_id = str(track.get("id") or "")
+        # audio=True：把成品 WAV 也挂到口型服务上，主窗口的 <audio> 拉起它边下边播，
+        # 嘴直接读 audio.currentTime。预演（ms_lips_preview）传 False，保持静音。
+        audio_path = str(target or "") if audio else ""
         if cues:
+            # v6：随 cue 轨一起发干声包络，桥用它调制张口度——只有五个元音
+            # 固定张度的话，嘴在字与字之间是"定格"的，看起来像木偶。
             state = lips_server.set_playing(cues=cues, song=song, track_id=track_id,
-                                            duration=duration)
+                                            duration=duration, audio_path=audio_path,
+                                            env=payload.get("env") or [],
+                                            hop=float(payload.get("hop") or 0.05))
             return {**state, "source": payload.get("source"),
                     "align": payload.get("align"),
                     "lang": payload.get("lang") or str(track.get("vocal_language") or "")}
@@ -3318,19 +3425,39 @@ class MusicSynthPlugin(NekoPluginBase):
             state = lips_server.set_playing(
                 cues=lipsync.envelope_cues({"amp": env_amp, "hop": hop}),
                 env=env_amp, hop=hop, mode="vocal_envelope",
-                song=song, track_id=track_id, duration=duration)
+                song=song, track_id=track_id, duration=duration,
+                audio_path=audio_path)
             return {**state, "source": "vocal_envelope", "stem": payload.get("stem")}
         lips_server.clear()
         return {"ok": True, "active": False, "reason": "no_cues",
                 "stem": payload.get("stem")}
+
+    # 口型包络只认这些「干净人声」工件。绝对不能把 final（伴奏+人声的成品）
+    # 或 source（原曲）喂进去：伴奏的鼓点会直接变成张嘴，间奏就跟着鼓乱动。
+    _LIPS_CLEAN_STEMS = ("vocal_wav", "vocal_mixed", "vocal_clean", "vocals")
+
+    def _lips_stem(self, track: dict) -> tuple[str, str]:
+        """曲目 → (干净人声路径, 工件名)。找不到干净人声就返回空。"""
+        artifacts = track.get("artifacts") or {}
+        # vocal_wav 是变声后的干声（最干净）；vocal_mixed 是混音里的成品人声；
+        # 后两个是原唱的分离/清理结果，只在前两者缺失时兜底。
+        for key in self._LIPS_CLEAN_STEMS:
+            candidate = str(artifacts.get(key) or "")
+            if candidate and Path(candidate).is_file():
+                return candidate, key
+        return "", ""
 
     def _lips_payload(self, track: dict, target: str) -> dict:
         """这首歌的口型包：流水线算过就直接读 ``lips.json``，没有才现场补算。
 
         「读进度条的时候把口型数据全弄出来」就是这一步：处理曲目时
         ``Pipeline._build_lips`` 已经算好落盘，播放时只剩一次读盘 + 一次发布。
+
+        包络和逐行对齐只用**干净人声**（见 ``_LIPS_CLEAN_STEMS``）；``target``
+        是成品混音，只拿去播放，绝不参与口型计算。
         """
         artifacts = track.get("artifacts") or {}
+        stem, stem_kind = self._lips_stem(track)
         cached = str(artifacts.get("lips") or "")
         if cached and Path(cached).is_file():
             try:
@@ -3339,13 +3466,26 @@ class MusicSynthPlugin(NekoPluginBase):
                 data = None
             if isinstance(data, dict) and data.get("mode") in ("cues", "envelope"):
                 # 口型轨 v3 起「不发音的字」沿用邻字口型（句中不再闭嘴）；
-                # 更早的缓存按旧规则生成了 rest cue，直接重算。
+                # v4 起每行最后一个 cue 带句尾标记，桥在句尾换气收口；
+                # v5 起行尾拖长音由干声包络补延续段；v6 起 cue 轨带包络，
+                # 桥按响度调制张口度；v7 起每个 cue 带重音强度；
+                # v8 起重音掺入「这一句里谁更响」的局部名次；
+                # v9 起包络只许来自干净人声（带 stem_kind），旧缓存重算。
                 try:
                     old_v = int(data.get("v") or 0)
                 except (TypeError, ValueError):
                     old_v = 0
-                if old_v < 3:
+                if old_v < 9:
                     data = None
+                elif isinstance(data, dict):
+                    kind = str(data.get("stem_kind") or "")
+                    if kind not in self._LIPS_CLEAN_STEMS and not (
+                            kind == "" and not data.get("stem")):
+                        # 用成品混音/原曲算出来的旧缓存：直接作废。
+                        self.logger.warning(
+                            "[lips] 口型缓存来源不干净（kind=%r stem=%r），重算",
+                            kind, data.get("stem"))
+                        data = None
             if isinstance(data, dict):
                 # 歌词后来又变了（比如处理完之后「为她所听」才认出这首歌），
                 # 缓存的口型轨就过期了，重算一份。
@@ -3354,15 +3494,13 @@ class MusicSynthPlugin(NekoPluginBase):
                 if str(data.get("lyrics_key") or "") == key_now:
                     return data
         # 老曲目（或者口型那一步被跳过）：现场补算一份，顺手落盘给下次用。
-        stem = ""
-        for key in ("vocal_mixed", "vocals", "vocal_wav", "final"):
-            candidate = str(artifacts.get(key) or "")
-            if candidate and Path(candidate).is_file():
-                stem = candidate
-                break
+        if not stem:
+            self.logger.warning("[lips] 没有干净人声可用（track=%s），"
+                                "不拿成品混音凑数", track.get("id"))
         payload = lipsync.build_track_payload(
             track, stem=stem, duration=float(track.get("duration_s") or 0.0),
             lrc_fetcher=self._fetch_lyrics)
+        payload["stem_kind"] = stem_kind
         official = payload.pop("official_lyrics", None)
         if official:
             try:
@@ -3438,7 +3576,7 @@ class MusicSynthPlugin(NekoPluginBase):
         if not target or not Path(target).is_file():
             return {"ok": False, "error": "这首还没有成品", "track_id": track.get("id")}
         try:
-            how = self._play_audio_file(target)
+            how = self._start_singing(target)
         except OSError as exc:
             return {"ok": False, "error": f"播放失败：{exc}", "path": target}
         if how.get("mode") == "none":
@@ -3448,10 +3586,11 @@ class MusicSynthPlugin(NekoPluginBase):
         self._last_play_at = time.monotonic()
         lips: dict = {}
         try:
-            lips = self._lips_start(track, target)
+            lips = self._lips_start(track, target, audio=True)
         except Exception as exc:  # noqa: BLE001 - 口型起不来不能挡播放
             self.logger.warning("[playback] 口型轨启动失败：%s", exc)
             lips = {"ok": False, "error": str(exc)}
+        self._arm_playback_fallback(target, int(lips.get("seq") or 0))
         self.logger.info("[playback] 已起播 track=%s mode=%s lips=%s file=%s",
                          track.get("id"), how.get("mode"),
                          {k: lips.get(k) for k in ("active", "cues", "source", "reason")},
@@ -3500,7 +3639,7 @@ class MusicSynthPlugin(NekoPluginBase):
             return Ok({"ok": True, "debounced": True, "playing": target,
                        "title": track.get("title"), "mode": "already_playing"})
         try:
-            how = await asyncio.to_thread(self._play_audio_file, target)
+            how = await asyncio.to_thread(self._start_singing, target)
         except OSError as exc:
             return Ok({"ok": False, "error": f"播放失败：{exc}", "path": target})
         if how.get("mode") == "none":
@@ -3509,10 +3648,11 @@ class MusicSynthPlugin(NekoPluginBase):
         self._last_play_at = now
         lips = {}
         try:
-            lips = await asyncio.to_thread(self._lips_start, track, target)
+            lips = await asyncio.to_thread(self._lips_start, track, target, audio=True)
         except Exception as exc:  # noqa: BLE001 - 口型起不来不能挡播放
             self.logger.warning("[playback] 口型轨启动失败：%s", exc)
             lips = {"ok": False, "error": str(exc)}
+        self._arm_playback_fallback(target, int(lips.get("seq") or 0))
         self.logger.info("[playback] ms_play 已起播 track=%s mode=%s lips=%s file=%s",
                          track_id, how.get("mode"),
                          {k: lips.get(k) for k in ("active", "cues", "source", "reason")},
@@ -3574,24 +3714,29 @@ class MusicSynthPlugin(NekoPluginBase):
                   or str(track.get("source") or ""))
         if not target or not Path(target).is_file():
             return Ok({"ok": False, "error": "这首还没有音频", **info})
-        lyrics = str(track.get("lyrics") or "")
-        if not lyrics.strip():
-            preview = track.get("lyrics_preview") or []
-            if isinstance(preview, list):
-                lyrics = "\n".join(str(x) for x in preview if str(x).strip())
+        if rebuild:
+            old = str((track.get("artifacts") or {}).get("lips") or "")
+            try:
+                if old and Path(old).is_file():
+                    Path(old).unlink()
+            except OSError:
+                pass
         try:
-            payload = await asyncio.to_thread(
-                lipsync.get_or_build, target, lyrics,
-                lang=str(track.get("vocal_language") or ""),
-                duration=track.get("duration_s") or None,
-                refresh=bool(rebuild))
+            # 和真正播放时同一条路径：只拿干净人声算包络，成品混音只用于播放。
+            payload = await asyncio.to_thread(self._lips_payload, track, target)
         except Exception as exc:  # noqa: BLE001
             return Ok({"ok": False, "error": f"{type(exc).__name__}: {exc}", **info})
         cues = payload.get("cues") or []
+        track_id_now = str(track.get("id") or track_id)
+        sidecar = str(((self._pipeline.store.get(track_id_now) or {})
+                       .get("artifacts") or {}).get("lips") or "")
         return Ok({"ok": True, "track_id": track_id, "title": track.get("title"),
                    "cues": len(cues), "source": payload.get("source"),
                    "duration": payload.get("duration"),
-                   "sidecar": str(lipsync.cues_path(target)),
+                   "stem": payload.get("stem") or "",
+                   "stem_kind": payload.get("stem_kind") or "",
+                   "env": len(payload.get("env") or []),
+                   "sidecar": sidecar,
                    "sample": cues[:6], **info})
 
     @plugin_entry(id="ms_lips_preview", name="为她而唱 · 口型试音",

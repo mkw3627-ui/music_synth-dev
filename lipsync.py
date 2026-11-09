@@ -562,12 +562,178 @@ def _snap_bounds(bounds: list[float], onsets: list[float],
     return snapped, moved
 
 
-def build_timed_cues(lines, duration: float, *, onsets=None) -> list[list]:
+def _breath_marks(cues: list[list], env: dict) -> list[list]:
+    """句尾标记只留在「干声真的掉下去」的行尾上。
+
+    LRC 的行与行常常首尾相接，时间轴上没有空隙；可录音里并不一定每一行
+    都换气——连着唱的两句之间嘴不该闭。逐行看句尾前 0.15 秒、后 0.20 秒
+    的最低能量，掉到本行峰值 55% 以下就算换气（阈值放宽过：按 30% 判，
+    很多只轻轻掉一点的句尾不被认可，画面上就几乎看不到闭嘴）。
+    没有包络（纯估计轨）时保留原标记，由桥按标记收口。
+    """
+    amp = list((env or {}).get("amp") or [])
+    hop = float((env or {}).get("hop") or 0.0)
+    if not amp or hop <= 0:
+        return cues
+    out: list[list] = []
+    for cue in cues:
+        if len(cue) > 4 and cue[4]:
+            a, b = float(cue[2]), float(cue[3])
+            ia, ib = max(0, int(a / hop)), min(len(amp), int(b / hop) + 1)
+            seg = amp[ia:ib]
+            ref = max(seg) if seg else 0.0
+            i0 = max(0, int((b - 0.15) / hop))
+            i1 = min(len(amp), int((b + 0.20) / hop) + 1)
+            low = min(amp[i0:i1]) if i1 > i0 else 0.0
+            # 包络在这一段是 0（例如分离人声前段是静音）时无法判断，宁可不标。
+            if ref <= 0.05 or low > 0.55 * ref:
+                cue = cue[:4]
+        out.append(cue)
+    return out
+
+
+def _apply_stress(cues: list[list], env) -> list[list]:
+    """给每个字估一个 0..1 的重音强度（桥用它决定张口幅度和起手速度）。
+
+    三路信号：
+    - 全局：这个字在自己的时长里能到多响（对整首 20%~90% 分位归一化）；
+    - 局部：比前后各三个字的中位数响多少——同一句里被强调的那个词；
+    - 名次：在前后各四个字里排第几，副歌整段都响时也能分出轻重。
+    最后按本曲自己的分位二次拉伸，轻音压到 0、重音顶到 1。没有包络时统一
+    给 0.5，桥的行为和以前一样。顺带把 cue 统一成
+    ``[字, 口型, 起, 止, 句尾标记, 重音]`` 六元组，旧的四/五元组也能读。
+    """
+    amp = list((env or {}).get("amp") or [])
+    hop = float((env or {}).get("hop") or 0.0)
+    n = len(cues)
+    if n <= 0:
+        return cues
+    peaks: list[float] = []
+    for cue in cues:
+        a = b = 0
+        if amp and hop > 0:
+            try:
+                # 前后各放宽一帧：0.1 秒的短字本来只盖住两三个包络帧，
+                # 落在换气缝里就会读出 0，重音直接判成轻音。
+                a = max(0, int(float(cue[2]) / hop) - 1)
+                b = min(len(amp), int(float(cue[3]) / hop) + 2)
+            except (TypeError, ValueError, IndexError):
+                a = b = 0
+        seg = amp[a:b]
+        if seg:
+            # 取「字里较响的那一半帧」的平均，而不是取峰值：包络是按全曲 p95
+            # 归一化的，响一点的字峰值全被削到 1.0，只看 max 会让副歌整段
+            # 都是同一个重音；平均半边能分出「一直很响」和「碰巧顶了一下」。
+            ordered = sorted(seg)
+            half = ordered[len(ordered) // 2:]
+            peaks.append(sum(half) / len(half))
+        else:
+            peaks.append(0.0)
+    lo = span = 0.0
+    if any(peaks):
+        ordered = sorted(peaks)
+        last = len(ordered) - 1
+
+        def pct(q: float) -> float:
+            return ordered[min(last, max(0, int(round(q * last))))]
+
+        lo = pct(0.20)
+        span = max(pct(0.90) - lo, 0.12)
+    raw: list[float] = []
+    for i, cue in enumerate(cues):
+        stress = 0.5
+        if span > 0:
+            g = min(1.0, max(0.0, (peaks[i] - lo) / span))
+            neigh = [peaks[j] for j in range(max(0, i - 3), min(n, i + 4)) if j != i]
+            local = 0.0
+            if neigh:
+                neigh.sort()
+                med = neigh[len(neigh) // 2]
+                # 比邻字中位数响 20% 记一半，60% 记满。
+                local = min(1.0, max(0.0, (peaks[i] - med) / max(med, 0.18) * 0.5))
+            stress = 0.65 * g + 0.35 * local
+        raw.append(stress)
+    # 二次拉伸：上面那路信号天生挤在 0.2~0.8（g 只到过自己曲子的 p90，local
+    # 也很少打满），直接用的话重音和轻音差不到两成，画面上还是一样。按本曲
+    # 自己的 15%~90% 分位再拉开一次：轻音压到 0、重音顶到 1，桥那边才真的有
+    # 「重」和「轻」的分别（张口更深、起手更快）。
+    lo2 = hi = 0.5
+    if any(raw):
+        ordered = sorted(raw)
+        last = len(ordered) - 1
+        lo2 = ordered[max(0, int(round(0.15 * last)))]
+        hi = ordered[max(0, int(round(0.90 * last)))]
+    spread = max(hi - lo2, 0.10)
+    def _local_rank(i: int, w: int = 4) -> float:
+        """这个字在前后各 w 个字里排第几（0..1，并列算半个）。"""
+        lo_i = max(0, i - w)
+        hi_i = min(n, i + w + 1)
+        pool = sorted(peaks[j] for j in range(lo_i, hi_i) if j != i)
+        if not pool:
+            return 0.5
+        value = peaks[i]
+        less = bisect.bisect_left(pool, value - 1e-9)
+        eq = bisect.bisect_right(pool, value + 1e-9) - less
+        return (less + 0.5 * eq) / len(pool)
+
+    out: list[list] = []
+    for i, cue in enumerate(cues):
+        flag = 1 if len(cue) > 4 and cue[4] else 0
+        if span <= 0:
+            # 没有包络就没有依据，别把整首歌压成轻音：保持中性。
+            out.append([cue[0], cue[1], cue[2], cue[3], flag, 0.5])
+            continue
+        t = min(1.0, max(0.0, (raw[i] - lo2) / spread))
+        t = t ** 1.15
+        # 局部名次：在前后各四个字里排第几。全曲归一化在副歌里会把一整段
+        # 压成同一个值，相邻字之间看不出轻重；掺一点「这一句里谁更响」的
+        # 名次，轻音和重音挨在一起也分得开。0.4 是实测既不来回跳、又能
+        # 把相邻字的差拉开一半的位置（0.5 以上就会一重一轻地抖）。
+        t = 0.6 * t + 0.4 * _local_rank(i)
+        out.append([cue[0], cue[1], cue[2], cue[3], flag, round(t, 2)])
+    return out
+
+
+def _vocal_span_end(env, start: float, limit: float, *,
+                    thr: float = 0.14, max_gap: float = 0.55,
+                    start_window: float = 0.80) -> float:
+    """干声从 ``start`` 起一直唱到哪一秒；没有包络/没有声音时返回 0。
+
+    LRC 的行结束时间只是「下一行什么时候开始」，录音里最后一个字常常还
+    拖着长音（或者 ラララ、副歌延长），这一行真正收声的时刻要靠包络量。
+    """
+    amp = list((env or {}).get("amp") or [])
+    hop = float((env or {}).get("hop") or 0.0)
+    if not amp or hop <= 0 or limit <= start:
+        return 0.0
+    i0 = max(0, int(start / hop))
+    i1 = min(len(amp), int(limit / hop) + 1)
+    last = -1
+    gap = 0.0
+    for i in range(i0, i1):
+        if amp[i] >= thr:
+            last, gap = i, 0.0
+        elif last >= 0:
+            gap += hop
+            if gap > max_gap:
+                break
+        elif (i - i0) * hop > start_window:
+            # 行尾之后半天都没声音：这是真的间奏，不是拖长音。
+            break
+    if last < 0:
+        return 0.0
+    return min(limit, (last + 1) * hop)
+
+
+def build_timed_cues(lines, duration: float, *, onsets=None,
+                     env=None) -> list[list]:
     """``[{"at_s": 12.0, "text": "…"}]`` → cues using the real line timestamps.
 
     「为她所听」识别出的歌词带每行的起唱时间，比按字数铺满整首准得多：
     行与行的边界是真时间，行内仍然按字数均分；传了 ``onsets``（干声的起音
     时刻）时再把这些均分边界吸到最近的起音上，就细化到「每个音节」了。
+    传了 ``env``（干声响度包络）时，行尾拖长音会用它量出真实收声点，
+    用同一个元音把这段补成延续段——否则嘴会先闭上、声音还在唱。
     """
     timed: list[tuple[float, str]] = []
     for row in lines or []:
@@ -608,12 +774,37 @@ def build_timed_cues(lines, duration: float, *, onsets=None) -> list[list]:
         if onset_list and len(units) >= 2:
             # 均分只是估计；真正唱出来的音节起点在干声的起音上。
             bounds, _moved = _snap_bounds(bounds, onset_list, tol=step * 0.6)
+        line_start = len(cues)
         for pos, (ch, viseme) in enumerate(units):
             begin = bounds[pos]
             stop = bounds[pos + 1]
             if stop <= begin:
                 stop = begin + 0.05
-            cues.append([ch, viseme, round(begin, 3), round(stop, 3)])
+            row = [ch, viseme, round(begin, 3), round(stop, 3)]
+            # v4：句尾标记。LRC 的行与行往往首尾相接（间隙为 0），
+            # 光看时间轴永远没有换气口；这里显式标出每行最后一个字，
+            # 由桥在句尾做一次短暂收口。标记不影响唱字本身。
+            if pos == len(units) - 1:
+                row.append(1)
+            cues.append(row)
+        # v5：行尾拖长音。按字数铺完的时间只是估计，录音里最后一个字常常
+        # 还在拖（或者接着 ラララ、副歌延长），到这里嘴就提前闭上了——听感
+        # 正是「这几个词没有口型」。用干声包络量出这一行真正唱到什么时刻，
+        # 再用最后一个字的元音补一段延续段，把嘴一直唱到真正收声为止。
+        limit = timed[index + 1][0] if index + 1 < len(timed) else max(total, end)
+        hold_from = bounds[-1]
+        if env and limit > hold_from + 0.25:
+            hold_to = _vocal_span_end(env, hold_from, limit)
+            if hold_to > hold_from + 0.22 and len(cues) > line_start:
+                if len(cues[-1]) > 4:
+                    # 这是长音的中段，不是换气口：别让桥在这里收嘴。
+                    cues[-1] = cues[-1][:4]
+                viseme = units[-1][1]
+                cursor = hold_from
+                while cursor < hold_to - 0.06:
+                    stop = min(hold_to, cursor + 0.45)
+                    cues.append(["ー", viseme, round(cursor, 3), round(stop, 3)])
+                    cursor = stop
     return cues
 
 
@@ -660,7 +851,10 @@ def build_cues(lyrics: str, duration: float, *, lead_in: float | None = None,
         step = usable / len(units)
         for index, (text, viseme) in enumerate(units):
             begin = cursor + index * step
-            cues.append([text, viseme, round(begin, 3), round(begin + step, 3)])
+            row = [text, viseme, round(begin, 3), round(begin + step, 3)]
+            if index == len(units) - 1:
+                row.append(1)   # 句尾：桥在这里收一下嘴
+            cues.append(row)
         cursor += line_span
     return cues
 
@@ -807,7 +1001,8 @@ def build_track_payload(track: dict, *, stem: str = "", duration: float | None =
     if dur <= 0 and stem_ok:
         dur = song_duration(stem)
     cues = build_timed_cues(timed, dur,
-                            onsets=vocal_syllable_onsets(env) if env.get("amp") else None)
+                            onsets=vocal_syllable_onsets(env) if env.get("amp") else None,
+                            env=env if env.get("amp") else None)
     if cues and lrc_source.startswith("perception"):
         source = "perception_timed"
     elif cues and lrc_source:
@@ -822,11 +1017,25 @@ def build_track_payload(track: dict, *, stem: str = "", duration: float | None =
         if cues:
             dur = dur or guess
             source = "estimate"
+    # 句尾标记只有在干声真的掉下去时才保留：连着唱的两句之间不该闭嘴。
+    cues = _breath_marks(cues, env)
+    # 每个字的轻重：桥按它调张口幅度和起手速度，重音张得开、起得快。
+    cues = _apply_stress(cues, env)
     mode = "cues" if cues else ("envelope" if env.get("amp") else "none")
     payload = {
         # v3：长音符/促音/表外字不再单独给 rest（以前唱到就在句中闭一下嘴），
         # 改成沿用邻字的口型。版本号进缓存，旧曲目的 lips.json 会自动重算。
-        "v": 3,
+        # v4：每行最后一个 cue 带句尾标记（第 5 位 = 1），桥在句尾做一次
+        # 换气收口——LRC 行首尾相接时，光靠时间轴空隙永远不会闭嘴。
+        # v5：行尾拖长音用干声包络补延续段，长音里嘴不再提前闭上。
+        # v6：cue 轨也带干声包络——桥用它调制张口度（唱得响张得大、轻的地方
+        #     收一点），不再只有 A/O/E/I/U 五个固定张度，嘴才有微动作。
+        # v7：每个 cue 第 6 位是重音强度 0..1（包络峰值 + 邻字对比），桥用它
+        #     决定张口幅度和起手快慢——重音咬得开、轻音收着唱。
+        # v8：重音掺入「这一句里谁更响」的局部名次。
+        # v9：包络/对齐只允许来自干净人声（payload 里带 stem_kind）；
+        #     用成品混音算出来的旧缓存全部作废重算——伴奏鼓点会让嘴乱张。
+        "v": 9,
         "track_id": str(track.get("id") or ""),
         "song": str(track.get("title") or ""),
         "duration": round(dur, 3),
@@ -837,9 +1046,9 @@ def build_track_payload(track: dict, *, stem: str = "", duration: float | None =
         "lyrics_key": lyrics_key(lyrics) if lyrics.strip() else "",
         "stem": stem if stem_ok else "",
         "cues": cues,
-        # 只在没有歌词时才把包络一起带上；有 cue 时桥优先读 cue，带上是白占体积。
-        "hop": float((env or {}).get("hop") or 0.05) if mode == "envelope" else 0.05,
-        "env": list((env or {}).get("amp") or []) if mode == "envelope" else [],
+        # 有歌词时包络也带上：不再是「没歌词才用」，而是作为张口度的调制信号。
+        "hop": float((env or {}).get("hop") or 0.05),
+        "env": list((env or {}).get("amp") or []),
         "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     if official_saved:
