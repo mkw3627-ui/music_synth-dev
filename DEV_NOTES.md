@@ -1119,3 +1119,20 @@ UI 一并覆盖掉了（源码里从来没有这些片段），于是两处界�
 
 教训：面板只有 `ui/*.tsx` 是源码，`html/panel.html` / `static/index.html` 是产物；
 任何直接改产物的补丁都会在下一次 build 时丢失。
+
+## 0.2.34 发布：修复下载依赖（2026-11-09）
+
+市场更新说明：修复下载依赖。
+
+下载/依赖链路（已实测：本地 HTTP 模拟截断下载、ms_setup_check ready=True、ms_dl_diag 跑通）：
+- 截断下载不再误判成功（按已下字节数校验完整性，抛 TruncatedDownloadError）
+- ddsp_deps 依赖校验上线：缺依赖先装、装不上明确报错而非死等编译
+- disk/cuda 空间语义修正；死代理自动重探，未开代理时强制直连（runtime.proxy_alive；
+  lyrics_fetch 同一套代理判定，避免 10061）
+- 下载并发闸门 _setup_lock、慢速守卫、失败 detail 带 missing_after
+- 无法自动安装时报错给出路径；新增 ms_setup_redownload 重新下载入口
+- 未复跑：_install_dlc_model 900s 超时、_pip 代理重试、坏 venv 迁移全流程
+
+面板 UI 补回源码（ui/pageTrain.tsx 低/中/高底模档位、ui/pageCreate.tsx 双栏原创页），
+产物与源码一致重建（panel.html 481,091 字节）。口型链路已在 b87b9cc 回填源码
+（口型轨 v5–v9 + 桥 g29–g42）。

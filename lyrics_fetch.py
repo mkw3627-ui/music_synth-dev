@@ -27,6 +27,11 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+try:  # 和下载器共用同一套代理判定；单独跑本文件时没有包上下文就退回默认行为
+    from .runtime import proxy_alive as _proxy_alive
+except ImportError:  # pragma: no cover
+    _proxy_alive = None
+
 # 制作人员 / 元数据行关键词（清洗时剔除，它们不是歌词）
 _META_PREFIXES = (
     "作词", "作曲", "编曲", "编", "混", "母", "策划", "监制", "出品",
@@ -50,6 +55,11 @@ def env_flag(name: str, default: bool = True) -> bool:
 def _http_json(url: str, data: bytes | None = None, timeout: float = 15.0):
     headers = {"User-Agent": _UA, "Referer": "https://music.163.com"}
     req = urllib.request.Request(url, data=data, headers=headers)
+    # 系统代理填了但代理没开时，urllib 会直接 10061；这种情况强制直连。
+    if _proxy_alive is not None and not _proxy_alive():
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", errors="replace"))
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8", errors="replace"))
 

@@ -77,6 +77,13 @@ export function PageTrain(props: { api: any; snap: any; onRefresh: () => void; o
   const aceTouched = useRef<boolean>(false)
   const aceSelTouched = useRef<boolean>(false)
 
+  // 翻唱训练底模：低 / 中 / 高三档（DDSP-SVC 官方 pretrain 的三个变体）。
+  // 只影响「翻唱的声音」这一段；底模没下载时可以在这里按需下，不装也能训（回退中档）。
+  const [trainQuality, setTrainQuality] = useState<string>("mid")
+  const [baseStatus, setBaseStatus] = useState<any>(null)
+  const [baseJobId, setBaseJobId] = useState<string>("")
+  const [baseJob, setBaseJob] = useState<any>(null)
+
   const [nodeOpen, setNodeOpen] = useState<boolean>(false)
   const [overOpen, setOverOpen] = useState<boolean>(false)
   const nodeSeen = useRef<string>("")
@@ -256,6 +263,59 @@ export function PageTrain(props: { api: any; snap: any; onRefresh: () => void; o
     } finally { setBusy("") }
   }
 
+  // ---- 三档训练底模：状态 / 下载 / 结构检查 --------------------------------
+  const loadBaseStatus = async () => {
+    try {
+      const r: any = await callEntry(api, "ms_base_status", {}, 30000)
+      setBaseStatus(r)
+    } catch (e) { /* 底模状态读不到不影响训练 */ }
+  }
+  useEffect(() => { loadBaseStatus() }, [])
+  useEffect(() => {
+    if (!baseJobId) return
+    let alive = true
+    const tick = async () => {
+      try {
+        const r: any = await callEntry(api, "ms_ace_job", { job_id: baseJobId }, 30000)
+        const j = (r && r.job) || null
+        if (!alive) return
+        setBaseJob(j)
+        if (!j || j.state === "done" || j.state === "failed") {
+          setBaseJobId("")
+          loadBaseStatus()
+        }
+      } catch (e) { /* 下一拍再试 */ }
+    }
+    tick()
+    const id = setInterval(tick, 3000)
+    return () => { alive = false; clearInterval(id) }
+  }, [baseJobId])
+
+  const checkBase = () => run("base", async () => {
+    const r: any = await callEntry(api, "ms_base_inspect", { tier: trainQuality }, 120000)
+    if (r && r.ok) {
+      const a = r.arch || {}
+      setMsg({
+        tone: "info",
+        text: "底模：" + (r.framework || "未知") + " · " + (a.n_layers || "?") + " 层 / "
+          + (a.n_chans || "?") + " 通道" + (a.encoder ? " · " + a.encoder : "") + " · " + (r.path || ""),
+      })
+    } else {
+      setMsg({ tone: "error", text: "底模检查失败：" + ((r && r.error) || "未知错误") })
+    }
+  })
+  const downloadBase = () => run("basedl", async () => {
+    const r: any = await callEntry(api, "ms_base_download", { tier: trainQuality }, 60000)
+    if (r && r.ok && r.job_id) {
+      setBaseJobId(String(r.job_id))
+      setMsg({ tone: "info", text: "开始下载" + (trainQuality === "low" ? "低" : "高") + "质量底模…" })
+    } else if (r && r.ok && r.already) {
+      setMsg({ tone: "info", text: "这个档位的底模已经就绪" })
+    } else {
+      setMsg({ tone: "error", text: "没能开始下载：" + ((r && r.error) || "未知错误") })
+    }
+  })
+
   const deleteRun = async (withFiles: boolean) => {
     setDelRun(false)
     if (!runId) return
@@ -325,6 +385,7 @@ export function PageTrain(props: { api: any; snap: any; onRefresh: () => void; o
     }
     const r: any = await callEntry(api, "ms_train_start", {
       steps, name: name.trim() || undefined, from_corpus: true,
+      quality: trainQuality,
       auto: !!doAce,
       ace_models: doAce ? selectedAce : [],
       ace_name: doAce ? (name.trim() || undefined) : "",
@@ -544,6 +605,42 @@ export function PageTrain(props: { api: any; snap: any; onRefresh: () => void; o
                     <span style={{ fontSize: 13.5, fontWeight: 700, color: INK }}>翻唱训练强度</span>
                     <Pill tone="success">{steps} 步 · 等效 batch {effectiveBatch}</Pill>
                   </Row>
+                  <Row style={{ gap: 8, flexWrap: "wrap" }}>
+                    {[["low", "低"], ["mid", "中"], ["high", "高"]].map(([k, label]: any) => (
+                      <Btn key={k} style={trainQuality === k ? PRIMARY_BTN : undefined}
+                           onClick={() => {
+                             setTrainQuality(k)
+                             setStepMode(k === "low" ? "speed" : k === "high" ? "quality" : "normal")
+                           }}>
+                        {label}质量
+                      </Btn>
+                    ))}
+                    <Btn disabled={!!busy} onClick={checkBase}>{busy === "base" ? "检查中…" : "检查底模"}</Btn>
+                  </Row>
+                  <Muted style={{ fontSize: 12 }}>低/中/高会换用对应的训练底模；显存或磁盘不够时会在这里提醒。</Muted>
+                  {(() => {
+                    const info = baseStatus && baseStatus.tiers ? baseStatus.tiers[trainQuality] : null
+                    if (!info) return null
+                    if (info.exists) {
+                      return (
+                        <Muted style={{ fontSize: 12 }}>
+                          底模已就绪：{String(info.path || "").split(/[\\/]/).pop()} · {info.size_gb} GB
+                        </Muted>
+                      )
+                    }
+                    return (
+                      <Row style={{ gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                        <Muted style={{ fontSize: 12 }}>这档底模还没下载</Muted>
+                        <Btn disabled={!!busy} onClick={downloadBase}>{busy === "basedl" ? "启动中…" : "下载底模"}</Btn>
+                      </Row>
+                    )
+                  })()}
+                  {baseJob ? (
+                    <Col style={{ gap: 6 }}>
+                      <Bar pct={Number(baseJob.progress) || 0} />
+                      <Muted>{baseJob.detail || "正在下载底模…"}</Muted>
+                    </Col>
+                  ) : null}
                   <Row style={{ gap: 8, flexWrap: "wrap" }}>
                     {STEPS_MODES.map((m: any) => (
                       <Btn key={m.key} style={stepMode === m.key ? PRIMARY_BTN : undefined}
