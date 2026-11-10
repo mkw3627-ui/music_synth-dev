@@ -11,9 +11,10 @@ on:
 permissions:
   contents: write
   # 上游 plugin-market-release.yml 2026-11-10 起拆成 release/evidence/attest 三个作业，
-  # attest 需要 id-token: write 做 provenance 签名；调用方不授权会在启动阶段直接
-  # startup_failure（无任何作业日志）。
+  # attest 需要 id-token: write + attestations: write 做 provenance 签名；调用方不授权
+  # 会在启动阶段直接 startup_failure（无任何作业日志）。
   id-token: write
+  attestations: write
 
 jobs:
   release:
