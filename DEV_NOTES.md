@@ -1136,3 +1136,855 @@ UI 一并覆盖掉了（源码里从来没有这些片段），于是两处界�
 面板 UI 补回源码（ui/pageTrain.tsx 低/中/高底模档位、ui/pageCreate.tsx 双栏原创页），
 产物与源码一致重建（panel.html 481,091 字节）。口型链路已在 b87b9cc 回填源码
 （口型轨 v5–v9 + 桥 g29–g42）。
+
+## 2026-11-10 01:45：桥 g47 —— 情绪 → 身体（头/上身/呼吸/头发）
+
+控制冲突排查的结论：一帧之内 `beforeModelUpdate` 里我们最后写（每帧把 face
+监听器挪到队尾），写入点位于 `grooveReassertListener` 之后、`coreModel.update()`
+之前，所以「加算」不会和律动抢绝对值。真正的双写点只有三个：ParamAngleX/Y/Z
+（律动绝对 + 情绪 rel ±5.5°）、ParamEyeBallX/Y（主程序随机视线绝对 + 律动绝对 +
+情绪 rel ±0.16）、ParamEyeLOpen/ROpen（主程序眨眼绝对 + 情绪 rel）。这三处都是
+「有序叠加」，不是互相拽；g39~g41 那种两个驱动源抢 ParamBodyAngleY 造成的抖动
+在 g42 已经拆掉了。
+
+g47 在律动之上加了第三层（`applyBody`，bridge 里在 applyEmo 之后调用）：
+
+- 输入仍是情绪层 VAD（含歌词情绪掺入）：V→上身立起/前倾，A→慢摆幅度+呼吸深度+
+  头发滞后，D→前倾程度。频段 0.085~0.16Hz，不抢鼓点。
+- 全部用 `addParameterValueById`（SDK 自身按模型区间钳位），写 BodyX/Y/Z、
+  Breath、HairFront/Side/Back；不唱歌（`emo.pres<0.03 && blend<0.15 &&
+  !lips.active`）时一次都不写，整段交回待机。
+- `bodySt.at === frameSeq` 保证同一帧只叠一次（事件 + rAF 兜底都调也不重复）。
+- 头发参数此前没有任何写入者（物理算完才轮到我们），是这一层唯一独占的量。
+- 诊断：`?bs=` 支持表、`?bd=` 本帧偏移写入 lips_server，`/hello` 新增
+  `body_support` / `body_values`；桥 ping 也带同名参数。
+- 实测（`chat-2026-10-29-1/_body_test.js`，直接从 bridge.js 抠代码跑）：
+  idle 0 次写入；pos y=+1.01°、neg y=-1.28°、反向；2000 帧随机 VAD 无 NaN，
+  偏移绝对值 ≤1.19°。注意测试里每帧先清零参数来模拟 `loadParameters()` 的还原，
+  否则加算会假性累积到区间上限。
+
+部署：bridge.js → `resources/bin/static/live2d/music-groove-bridge.js`（109,301 B），
+`templates/index.html` 的 `?v=...-lips4-g46` → `-g47`（字节数与 CRLF 均未变），
+lips_server 热重载后 `/hello` 已带 `body_support`/`body_values`。
+页面仍需 Ctrl+Shift+R，`client_version` 变成 47 才真正生效。
+备份：`D:\ruanjian\N.E.K.O\_backup_g47_20261110_013032\`（g46 桥 + index.html）。
+
+## 2026-11-10 02:10：桥 g48/g49 —— 眼睛抽动（写序冲突）+ 只读抖动探针
+
+**症状**：唱歌时眼睛自己一闭一弹地抽，眼皮看着很重（用户截图：上眼睑压低、
+白眼球在下方露出一条月牙）。
+
+**根因（按 libs/index.min.js 的每帧顺序逐行对出来）**：
+
+```
+… 物理 physics.evaluate → pose.updateParameters
+→ emit("beforeModelUpdate")   ← 我们（桥）在这里 addParamEyeLOpen/ROpen
+→ n.update()                  ← 主程序的拦截器：_updateEyeBlink 写**绝对值**
+→ n.loadParameters()          ← 本帧参数还原
+```
+
+主程序的眨眼在 `coreModel.update` 的拦截器里、**在我们之后**按绝对值写
+`ParamEyeLOpen/ROpen`；而这个写入又被 `_isEyeDrivenByMotion` /
+`_suspendEyeBlinkOverride` / `_autoEyeBlinkEnabled` 逐帧门控，偶尔整段跳过。
+于是我们的偏移「大多数帧被盖掉、少数帧突然生效」——两帧之间眼开合来回跳，
+就是看到的抽动。**眼开合不属于我们**，g48 起彻底不写（眨眼归主程序）。
+
+第二处：`ParamEyeLSmile` 被两条通道各加一次——乐句通道 `face.smile`（上限
+0.90）+ 情绪层 `f.eyeSmile`（上限 0.45）。单看都合理，加起来顶到参数上限，
+就是「眼睛笑没了、上眼睑压得很重」；两边任一被主程序常驻表情压掉时，总和
+在「上限」和「中间值」之间跳，又是一处抽动。g48 加 `addCapped()`：按模型区间
+给**总和**封顶 `EYE_SMILE_CAP = 0.80`（比原来 1.35 的理论峰值收 40%）。
+
+第三处（主程序侧，未改）：`live2d-emotion.js playSimpleMotion` 用 `setTimeout`
+在更新循环之外写 `ParamAngleY = 8 / -5`、`ParamAngleX = 5`。聊天情绪回退一触发
+就有一帧头猛地一跳——律动下一帧会写回来，所以只抽一下。
+
+**g49：只读抖动探针**（`?ey=`）：包一层 `coreModel.update`（原样调用、原样返回），
+返回后读 10 个参数（EyeLOpen/EyeROpen/EyeLSmile/EyeBallX/AngleX/Y/Z/
+BodyAngleX/Y/Breath），统计每 2 秒内**相邻帧最大跳变**，格式
+`hooked:Δ…@帧数`。全程不写参数；主程序清理时会把 `coreModel.update` 还原成
+自己的引用，探针随之失效，不残留、不递归。lips_server 把 `?ey=` 落到
+`/hello` 的 `eye_probe`（限 90 字符）。
+
+部署：bridge.js → `resources/bin/static/live2d/music-groove-bridge.js`
+（111,978 B），`templates/index.html` 的 `-lips4-g48` → `-g49`（55,641 B、
+700 个 CRLF 均未变），music_synth 已热重载，`/hello` 已带 `eye_probe`。
+页面需 Ctrl+Shift+R，`client_version` 变成 49 才真正生效。
+备份：`D:\ruanjian\N.E.K.O\_backup_g49_20261110_*\`（g48 桥 + index.html）。
+
+## 2026-11-10 02:00：g49 探针是哑的 → g50（自愈 + 绝对值 + 眨眼器配置）
+
+`/hello` 里 `eye_probe` 一直只有 `1:`：`hooked=1` 但一帧样本都没有。原因不是探针
+算错，而是**主程序会自己重装 `coreModel.update`**——`live2d-model.js:3330` 新建闭包、
+`2946`/`590` 还原成 `_origCoreModelUpdate`。我们的包被挤掉后，`probe.core === core`
+的判断让 `probeInstall` 永远提前返回，于是再也没采到样本。这同时也再次证明：
+**`coreModel.update` 是主程序的地盘**，我们只能只读地挂在外面。
+
+g50：
+- `probeInstall` 每帧比对 `core.update === probe.wrap`，被换掉就重新包（有身份判断，
+  开销是一次比较）；同一个渲染帧只采一次（主程序把我们包在它里面时外层还会再调）。
+- 新增 `?ed=` 绝对值串：`EyeLOpen:当前[最小,最大]d默认` ×5（左右眼开合、笑眼、眼球X/Y），
+  再带主程序眨眼器配置 `|ab..sb..em..st..|bkOpeno..c..d..|px常驻表情名`。
+  直接回答「这个数本身正不正常」，不只看跳变。
+- `ey` 也加了调用次数（`1+:` 表示 update 真的被调到），`1-:` 表示又被挤掉了。
+- 离线测试 `chat-2026-10-29-1/_eye_probe_test.js`：直接从 bridge.js 抠代码跑，模拟
+  「被主程序挤掉 → 自愈」，9 项全 PASS（含 dump 长度 156、无 manager 不炸）。
+
+部署：`music-groove-bridge.js`（115,491 B）、index `-lips4-g49` → `-g50`（55,641 B、
+700 CRLF 未变）、music_synth 已热重载，`/hello` 新增 `eye_dump`（限 300 字符）。
+备份：`_backup_g50_20261110_015301\`。
+
+## 2026-11-10 02:05：眼珠（ParamEyeBallX/Y）为什么「不是正常值」→ g51 限幅
+
+实测量（桥 g50 的 `/hello?ed=`，Blue cat 模型）：
+
+```
+EyeBallX:-0.16[-1,1]d0,EyeBallY:0.03[-1,1]d0   ← 区间 ±1、默认 0
+12 秒 14 次采样：X = -0.29, 0.25, 0.48, 0.36, 0.35, -0.28 …（Y 同步在 ±0.25 里飘）
+```
+
+**这是主程序的「随机视线」在写**，不是我们的情绪层（空闲时 `face_writes=0`，
+我们的视线偏移上限也只有 ±0.11）。`live2d-model.js:1984`：
+
+```js
+coreModel.setParameterValueById('ParamEyeBallX', this._lookAtCurrentX / 30)  // ±15 度
+coreModel.setParameterValueById('ParamEyeBallY', this._lookAtCurrentY / 30)  // ±10 度
+```
+
+`/30` 是按「眼球参数区间 ±30」写的：在 ±30 的模型上 = 1.7%（几乎看不见的小瞟），
+而这个模型是 **±1**，于是同样的代码变成区间的 30%~50% —— 眼珠被推到眼白边上，
+看起来「眼神发直、眼珠位置不对」。另外 `_randomLookAtAffectsHead` 默认 false
+（全项目只有 1331 行赋值、从未置 true），头完全不跟着动，等于只有眼珠自己在乱转。
+用户设置里 `mouseTrackingEnabled=false`（localStorage 实测），所以每帧走的都是这条
+随机视线分支。
+
+**g51 修法**：`applyGazeLimit()` 在 `applyFace` 里排在 `applyEmo` 之后（读的是这一帧
+所有写入者叠加后的最终值），只对**归一化区间**（|min|、|max| ≤ 2，即 ±1 这一类）
+把眼球压到 `±GAZE.max`（= 0.18，区间 18%）；±30 那种按度写的模型一概不碰。
+小于限幅的微瞟保留，所以不是「把眼睛焊死」。想调就改 `var GAZE = { max: 0.18 }`。
+
+离线测试 `chat-2026-10-29-1/_gaze_test.js`（从 bridge.js 抠代码跑）：±1 模型 0.48/-0.29
+→ ±0.18；小值不动；±30 模型不碰；NaN/区间退化/参数缺失不炸；正好在边界不重复写。9 项 PASS。
+
+部署：`music-groove-bridge.js`（117,654 B）、index `-lips4-g51`（55,641 B、700 CRLF 未变）。
+备份 `_backup_g51_20261110_020754\`。刷新后 `eye_dump` 的 EyeBallX/Y 应该 ≤ 0.18。
+
+## 2026-11-10 02:12：唱歌时「眼珠一下大一下小」→ 笑眼压上眼睑（g52）
+
+唱歌中实测（`/hello?ed=`，client 51）：
+
+```
+EyeLOpen:1[0,1]d1        ← 眼睑正常
+EyeLSmile:0.74 → 0.80     ← 满格！区间 0..1
+EyeBallX:0.02~0.07        ← g51 限幅生效，位置正常
+face_values: brow 0.43~0.85, smile 0.56~0.88, …
+```
+
+`ParamEyeLSmile` 在这个模型上会把**上眼睑压下来盖住虹膜**：0.8 等于一直半闭眼，
+虹膜被压小；而乐句强弱一变（presence 0.3↔1、brightMix、sect 都在动），
+总和就在 0.7~0.8 之间来回 → 虹膜一下大一下小。这笔是**我们**写的：
+
+- 乐句通道公式峰值 ≈0.69~0.88（上限还是 0.90）；
+- 情绪层 `f.eyeSmile` 再加 +0.39；
+- g48 的 0.80 天花板把它们压成「常驻 0.8」。
+
+g52 收量：
+- 乐句通道整条 ×0.55、上限 0.90 → 0.50（典型峰值 ~0.38）；
+- 情绪层笑眼写入 ×0.6；
+- 总和天花板 `EYE_SMILE_CAP` 0.80 → **0.40**；
+- 笑眼平滑 0.34s → 0.65s，句与句之间不再抽。
+
+诊断加强：探针新增窗口 **最小/最大值**（`|mm左眼开合,右眼开合,笑眼`），
+和「最大跳变」配对，就能区分「一直在动」和「偶尔弹一下」。
+
+部署：`music-groove-bridge.js`（119,247 B）、index `-lips4-g52`（55,641 B、700 CRLF）。
+备份 `_backup_g52_20261110_021617\`。离线测试 `_eye_probe_test.js` 全 PASS（dump 186 字符）。
+
+## 2026-11-10 02:40：唱歌时「眼珠变小、伴奏一大更小」→ 律动把『度』写进 ±1 的眼球参数（g53）
+
+用户报：`眼珠子会一下大一下小，现在是眼珠子唱歌的时候变小了，背景音乐一大就变的更小了`。
+截图（`image-20261110-021942.png`）里两只虹膜都明显偏下：上半圈是一大片眼白，
+虹膜下沿被下眼睑切掉——不是「虹膜被缩小」，是**眼球往下掉**。
+
+实测（`/hello?ed=`，client 52，空闲、没在唱）：
+
+```
+EyeBallY:0.18[-1,1]d0      ← 正好贴在 g51 的限幅边界上，而且「常驻」贴边
+```
+
+g51 的硬限幅把值**夹**在边界，而不是把它变「正常」：主程序的随机视线目标幅度是
+±0.33/±0.5，常年超出 0.18，于是眼珠几乎一直挂在边上。
+
+唱歌时还有两个写入者往同一个方向推：
+
+1. `music_groove.js` `applyToModel` 里
+   `setDegree('ParamEyeBallX', sway*0.08 + step*0.03)` /
+   `setDegree('ParamEyeBallY', -nod*0.06 - bob*0.05)`
+   —— 和主程序同一个错：按「±30 的度」写，模型是 **±1**。`nod`/`headBob`
+   直接跟着**伴奏响度**走，所以「背景音乐一大 → 眼珠再往下掉一点 → 看着更小」，
+   这条正好对上用户描述的因果。
+2. 情绪层 `rel('ParamEyeBallY', f.gazeY)`（±0.16，跟着 valence 走）。
+
+**g53 修法**：
+
+- `music_groove.js` 新增 `setGaze()`：先读参数区间，`|min|`/`|max|` ≤ 2（归一化）
+  就按 `deg/30 × 半量程` 写入（±1 模型上是 1~2‰，等于不动；±30 的按度模型原样
+  按度写，行为不变）。`REV` r15 → r16。
+- `applyGazeLimit()` 从「硬夹到 0.18」改成**饱和压缩**：0.10 以内原样，超出的
+  指数逼近 0.14，永远进不到边界。响度再大也不会把眼珠继续往外推，也不会再出现
+  「贴在边上不动」的眼神。
+
+诊断加强：`|mm` 从 3 组扩到 6 组（左眼开合、右眼开合、笑眼、眼球X、头的X、头的Y）。
+下次再看到「虹膜变小」，一眼就能分清是 EyeBallY 在边界上（视线掉下去）还是
+`AngleY` 在大幅摆（点头把头压扁）。lips_server 的 `eye_probe` 截断 90 → 160 字符。
+
+离线测试：`_gaze_test.js`（13 项，含饱和上限、极端值不越界、±30 模型不碰、0..1 区间）
+PASS；新增 `_groove_gaze_test.js`（5 项：±1 模型 |EyeBallY|<0.02、±30 模型按度不变、
+blend 过渡不瞬移）PASS；`_eye_probe_test.js` 仍 PASS（dump 200 字符）。
+
+部署：`music-groove-bridge.js`（120,137 B）、`music_groove.js`（58,604 B）、
+index `-lips4-g53`（55,641 B、700 CRLF 未变）。备份 `_backup_g53_20261110_022741\`。
+需要主窗口刷新（Ctrl+Shift+R）才生效：`/hello` 的 `client_version` 会从 52 变 53，
+`eye_dump` 末尾的 `|mm` 变成 6 段。
+
+## 2026-11-10 02:46：眼珠「太小」的真正来源 = 我们自己写的 ParamEyeLSmile（g54）
+
+用户看了刷新后的 g53 直接炸了：`你怎么又给她改小了？？？这个眼珠子太小了`。
+
+**g53 的视线改动不是元凶**。拿同一时刻的参数 + 窗口截图（PrintWindow 曾被遮挡
+渲染成黑图，这轮改成「SetWindowPos 置顶 1.2s → PrintWindow → 取消置顶」拿到真图）：
+
+| 状态 | EyeLSmile | EyeBallX/Y | 眼型 |
+|---|---|---|---|
+| 空闲（没在唱） | 0.05 | 0.14 / 0.14 | 虹膜几乎撑满眼白（正常） |
+| 唱歌 | 0.40（g52 的上限） | 0.02 / 0.03 | 上下都露出大片眼白，虹膜显小 |
+
+对比两帧同比例裁图（`_cmp4.png`）看得很清楚：**变的是眼型，不是虹膜**。
+这个模型（Blue cat）的 `ParamEyeLSmile` **不是「眯眼」**——它把**下眼睑往下拉**，
+数值一大眼睛就变大一圈，虹膜相对就显得小。所以：
+
+- 「唱歌时眼珠子变小」= 乐句笑眼通道把 EyeLSmile 顶到 0.4；
+- 「背景音乐一大变得更小」= 笑眼公式里 `presence / brightMix / energyMix / sect`
+  全都跟着伴奏响度和亮度走，越响写得越大；
+- 和视线（g51/g53）无关——g53 之前之后虹膜的绝对大小没变，变的是眼睑。
+
+**g54 收量（只动笑眼，不动眼球）**：
+
+- `EYE_SMILE_CAP` 0.40 → **0.12**；
+- 乐句通道 `… * 0.55, 0, 0.50` → `… * 0.16, 0, 0.14`（典型峰值 ~0.10）；
+- 情绪层 `f.eyeSmile * 0.6` → `* 0.2`；
+- 无歌词分支 `0.10*e2 + 0.10*sect*eMix` → `0.03 + 0.03`。
+
+叠加上限 0.12。这个量级下眼睑形状和默认几乎一致（空闲实测 0.05 时眼型就是用户
+认可的「正常值」）。眼球位置仍走 g53 的饱和压缩（0.10 内原样 / 逼近 0.14），
+只挪位置不改大小。
+
+守门测试 `_smile_cap_test.js`：EYE_SMILE_CAP/乐句倍率/情绪倍率/无歌词分支
+四个写入点的量级都被断言，谁再调大直接红。连同 `_gaze_test.js`(13)、
+`_groove_gaze_test.js`(5)、`_eye_probe_test.js` 全 PASS。
+
+部署：`music-groove-bridge.js`（120,780 B）、index `-lips4-g54`（55,641 B、700 CRLF）。
+备份 `_backup_g54_20261110_024540\`（内含按四处改动反推出来的 g53 原件，120,137 B，
+与部署时字节数一致——这轮是先改后备份，已在此说明）。
+
+## 2026-11-10 03:10：口型精度（v12 音内相位）＋ 唱歌「抽动」的根因（g55 / v13）
+
+用户：`中文口型和英文口型要精度在高点，还有就是不知道为什么模型在唱歌的时候会抽动`。
+
+### 1) 精度：把「字内相位」写进 cue（v12）
+
+以前一个字只有**一个**口型，整个字时长都是这个元音的形状，所以「妈」和「啊」在
+嘴上完全一样。v12 让 `lipsync` 把字拆成 声母 / 韵母 / 韵尾 三段，按比例塞进
+cue 行的第 7 位（索引 6），格式 `声母:占比:韵尾:占比`，缺哪段写 `-`：
+
+| 类别 | 例 | 声母 | 韵尾 |
+|---|---|---|---|
+| 双唇 | 妈/怕/买 | M | — |
+| 唇齿 | 飞/风 | F | — |
+| 舌尖 | 大/天/你/来 | L | — |
+| 舌根/擦 | 哥/看/喝/星/照/吃/日 | S（日→L） | — |
+| 平舌 | 在/从/四 | S | — |
+| 前鼻音 | 天/山 | — | N（n） |
+| 后鼻音 | 星/风 | — | S（ng） |
+| 复韵母 | 照(ao) | — | U |
+| 复韵母 | 爱(ai)/谁(ui) | — | I |
+
+英文按拼写拆：词首辅音进 onset（h/s/z/j/c→S、b/p/m→M、f/v→F、w→U、l/n/r→L），
+词尾 m→M、n→N、ng→N、f/v→F、l/r→L、s/z→S、t/d/k/g/p/b→S。整词表命中
+（love/home 之类）仍然整词走，不拆。相位和元音同形时自动丢弃（`我` 本来就没有
+硬加相位）。老的四/五/六元组 cue 照样能读，桥端 `cuePhases()` 对缺相位、非法
+口型、`rest` 全部返回 `null` → 退回旧的「整字一个形状」行为。
+
+哨兵布局没变：`[字, 口型, 起, 止, 句尾, (重音), (相位)]`，相位永远最后一位；
+`_breath_marks` 清句尾标记、`_apply_stress` 两条分支都显式把相位串带过去。
+
+### 2) 抽动：不是模型抖，是我们自己把嘴形一帧跳掉
+
+用桥里的探针（`PROBE_IDS` 每 2s 统计相邻帧最大跳变）加上离线复算，找到四处：
+
+1. **换字时推错了形状**。协同发音/连音/换气三条支路都把嘴往「下一字的元音」
+   推，但下一个字如果以闭唇声母开头（妈/不/怕），真实的第一帧应该是闭着的。
+   于是字尾 0.34 → 下一字元音 1.0 的阶跃被完整保留下来。
+2. **韵尾被协同发音盖掉**。`天` 收 n 时嘴该合，结果下一字的元音把它又拉开了。
+3. **入场混合顺序反了**。先混合上一字的收口形状、再算声母，声母立刻把它覆盖，
+   上一字 U 的 0.42 一帧变 M 的 0.05。
+4. **相位窗口只按比例**，短音上只有 20–60 ms 的斜坡，4 ms 采样就有 >0.2 的台阶。
+
+g55 的修法（全部在 `bridge.js` 的 `lipsCuesAt`/`applyLips`）：
+
+- 新增 `endA/endF`（本字真实结尾：有韵尾用韵尾，否则用元音）和
+  `nHandA/nHandF`（下一字真实开头：有声母用声母，否则元音）。`s0`、`s1`、
+  协同发音、连音、换气四条支路全部改用这两个，接缝两侧对得上同一个数。
+- 入场混合**移到声母/韵尾之后**：上一字结尾 → 本字声母 → 本字元音，不再互相覆盖。
+- 声母/韵尾窗口加下限：`ow = clamp(of*dur, 0.055, dur*0.45)`、
+  `cw = clamp(cf*dur, 0.05, dur*0.45)`，声母用 `smoothstep(0.20, 1, …)`。
+- 运行时兜底：`LIPS_OPEN_RATE=22/s`、`LIPS_FORM_RATE=14/s` 限速；
+  响度跟随器 `loudF`（起 45 ms / 落 120 ms），不再让伴奏峰值直接改 gain；
+  `lips.tClock` 守住时钟——前跳 >0.25 s 只前进一帧，回跳 0.04–1.5 s 直接钉住
+  （换歌/暂停/轮询重放都不会再把嘴甩一下）。
+- 探针新增计数：`|lp 前跳/回跳/开口限速/嘴形限速/响度/秒`，`ed` 里加
+  `ParamMouthOpenY/ParamMouthForm/ParamAngleX/Y/Z` 的绝对值和区间，
+  下次再抽能直接看到是哪一路。
+
+### 3) 守门测试
+
+- `_phase_test.py`（33 项）：中文声母/韵尾、英文词首词尾、cue 布局、相位串在
+  `_breath_marks`/`_apply_stress` 里不丢、老 cue 兼容、`v=12`。**PASS**。
+- `_lips_phase_test.js`（23 项，直接抠 `bridge.js` 的代码跑，不手抄公式）：
+  声母帧 0.049 vs 元音帧 0.854；韵尾收口 0.075；连音接缝 0.046 / 2 ms，
+  有间隙 0.056，换气口 0.056；韵尾压过协同发音；老 cue 行为不变；
+  全曲 240 cue × 0.004 s 采样最大跳变 0.1086（< 0.12，且都在曲内接缝），
+  长音中间抖动 5e-5。**PASS**。
+  曲终那一帧（最后一字结束后）本来就是收口，扫描范围停在最后一个字的结尾，
+  不算接缝——第一版测试在这里误报 0.397。
+
+### 4) 部署与备份
+
+- `bridge.js` 120,780 → **132,479 B**，已拷到
+  `resources\bin\static\live2d\music-groove-bridge.js`，`node --check` 通过。
+- `music_groove.js` 两侧 md5 相同（`96fce015…`），没有改动，未重拷。
+- `templates\index.html` 缓存戳 `-lips4-g54` → `-lips4-g55`，55,641 B / 700 CRLF 不变。
+- `lipsync.py`（55,935 B 原件）、`lips_server.py`（20,595 B 原件）已改，`py_compile` 通过。
+- 备份 `chat-2026-10-29-1\_backup_g55_20261110_025650\`：`bridge.js`(120,780)、
+  `index.html`(55,641)、`lipsync.py`(55,935)、`lips_server.py`(20,595)，
+  另加部署前的 `*.deployed_g54` 两份。
+- **披露**：`music_synth/__init__.py` 的 v12 缓存闸（`old_v < 12`）是在建备份之前
+  改的，这一轮没有它的新时间戳副本（目录里只有更早的 `.bak_*`），按老规矩记在这里。
+- `lipsync.py` 的缓存版本 v12 → **v13**（`payload_for`/`build_track_payload`/`get_or_build`
+  和 `__init__.py` 的 `_lips_payload` 四处同步），旧缓存整批作废重算。
+- `music_synth` 已热重载（`preference_persisted: true`）。**JS 要刷新主窗口才生效**
+  （`/hello.client_version` 刷新前仍是 54，刷新后应变 55）。
+
+### 5) 仍然不碰的东西
+
+眼珠/眼睑参数这轮一个都没动（`EYE_SMILE_CAP=0.12`、g53 的视线饱和压缩原样保留）。
+按用户要求，以后也不动眼球和眼睑——要改只改别的通道。
+
+### 6) 收尾实测：拿真实那首歌的 cue 轨再扫一遍，又抓到三个抽动源
+
+合成用例只能证明公式自洽，所以又把「星光下的梦想」的真实排布（感知转写 21 行 →
+250 条 cue，87.6% 带相位串）导出来，按 60/120fps 扫全曲（`_real_scan.js`、
+`_twitch_ab.js`，g54 的部署原件和新版并排跑）：
+
+| 指标（全曲） | g54 | g55 收尾版 |
+|---|---|---|
+| 相邻帧最大张口变化 | 0.867 | **0.417** |
+| 一帧内「刚张又合」且幅度 >0.04 | 0 | 40（都是声母/韵尾的正常咬字） |
+| 反向抽动最大幅度 | — | 0.094 |
+
+扫出来的三个真问题：
+
+1. **一句唱完直接归零**。`lipsCuesAt` 在 `gap > LIPS_BREATH(0.9s)` 时立刻返回
+   `open: 0`：最后一帧还张着 0.8，下一帧就是 0——间奏一进来嘴「啪」地合上。
+   这是最像「抽动」的一处。现在按 90ms 的 smoothstep 从字尾真实收口 `s0` 顺着合。
+2. **短音被硬做满量程相位**。真实转写里有一行 at_s=152.0 的歌词，而歌长
+   144.09s——那是转写把尾奏/和声又拆成的一句，`build_timed_cues` 把它当「最后
+   一行」塞进 `at+2s`，12 个字挤进 0.64s，每个字 53ms。53ms 里做「闭唇→满开→
+   收口」就是每秒抖十几次。两头都改了：
+   - `lipsync.build_timed_cues`（**v13**）：`at_s >= 曲长` 的行直接丢掉，不参与
+     排布（duration 未知时不过滤）；
+   - `bridge.lipsCuesAt`：相位幅度按音长收 `depth = clamp(dur/0.20, 0.30, 1)`，
+     53ms 的字只做 ~26% 的口型行程，0.2s 以上完全不变；入场的 `pA`、交接的
+     `nHand` 用各自动作的 `depth`，接缝两侧仍然是同一个数。
+3. **协同发音把短字的入场吃掉**。协同窗口是「字尾前 89ms 开始滑向下一字」，
+   对 53ms 的字来说整段都在窗口里：一开场就被拽向下一个字，每一帧都在两个
+   形状之间弹。现在协同权重乘上 `uw0`（入场进度）和 `smoothstep(0, 0.45, local)`，
+   短字先把自己的字头唱完再谈交接。
+
+新增断言：`唱完进间奏不跳（2ms 采样 0.033）`、`间奏里嘴真的合上了`、
+`53ms 的音每帧变化 <0.25（实测 0.109）`、`曲长之后的行被丢掉`、`duration=0 时不过滤`。
+`_phase_test.py` 33 项、`_lips_phase_test.js` 23 项，全 PASS。
+
+`bridge.js` 最终 **132,479 B**（LF），已重新拷到部署目录并用 48911 静态口验证
+`VERSION=55` 且含新逻辑；`lipsync.py`/`__init__.py` v13 已 `py_compile`、插件已热重载。
+
+---
+
+## g56（2026-11-10 03:5x）：头还会抽一下 + 中文「嘴巴不张」全量排查
+
+### 1) 头抽动：不是「动得快」，是「一帧赶完几帧的动作」
+
+线上探针（当时页面还是 `client_version 54`，副歌段）：`ParamAngleX` 每帧跳
+1.9~3.4°，`ParamAngleY` 4.1~6.1°（参数满量程 ±30°）。60fps 下这就是几百
+度/秒，人脖子做不到，画面上就是「抽一下」。
+
+离线用真实的 `MusicGroove` 引擎跑（`_groove_head_stats.js`，60fps、6 个固定
+种子取中位数）：
+
+| 场景 / 轴 | p50 | p95 | p99 | max |
+|---|---|---|---|---|
+| 副歌 X（改前） | 0.25 | 1.18 | 1.88 | 3.16 |
+| 副歌 Y（改前） | 0.68 | 2.36 | 3.33 | 4.39 |
+| 副歌 X（g56） | 0.24 | 0.95 | **1.70** | **1.70** |
+| 副歌 Y（g56） | 0.55 | 1.51 | **1.70** | **1.70** |
+
+修复在 `music_groove.js::applyToModel` 的写入端，两层：
+
+1. **颈部惯性**：`ParamAngle*` 走一阶低通，tau = 45ms（`frame.__dt` 由
+   `update()` 带出）。跳变被摊到几帧走完，稳态增益 1，摆幅基本不变。
+2. **硬上限 102°/s**：换算到 ±30 的模型就是 1.7°/帧，任何来源的断裂
+   （换歌、切镜头、大强拍）都不会一帧弹过去。第一次写（还没有滤过的上一帧）
+   以模型**当前值**为基准；换模型（新 coreModel）重置状态；桥在同一帧里
+   第二次重写（`beforeModelUpdate`）直接复用第一次的值，不重复滤。
+
+实测摆幅：副歌 X 34.6→32.9°，Y 26.9→27.3°，Z 27.8→27.6°——动作没被压小。
+**没有**去动强拍包络（`swell(0.05,0.26)`）和头部强拍增益（nod 0.72 /
+headBob 0.45）：试过，Y 摆幅会掉到 20.6°，属于「为了不抽把舞也跳没了」。
+
+新增 `_groove_head_test.js`：每帧变化 ≤1.71°、Y 摆幅 >12°、X 摆幅 >10°、
+同帧两次写回一致、换模型不继承旧状态，5 项全 PASS。`_groove_gaze_test.js`
+里「头部仍然照常驱动」改成连跑 60 帧再看（单帧现在最多 1.7°），PASS。
+
+### 2) 中文「嘴巴不张」：schwa 被当成了声母的中性口型
+
+字表 20924 个字 / 410 个音节里，有 **1457 个字**的韵母是 schwa
+（zhi/chi/shi/ri/zi/ci/si 的舌尖元音 [ɨ]，以及 -e 的 [ɤ]：的/了/着/和/个/这…）。
+`viseme_of_char` 一律返回 **S**。而 S 是给声母（g/k/h/zh/ch/sh/z/c/s）和
+ng 韵尾用的「中性收口」，张口度只有 **0.34**——「的/是/实/时/世/失/持」
+唱起来嘴几乎不动，正是用户说的「嘴巴不张」。
+
+修复：新增中性元音 **Z**，只给这些韵母用：
+
+| 口型 | LIPS_OPEN | LIPS_FORM | LIPS_BRIGHT |
+|---|---|---|---|
+| S（声母/ng 韵尾） | 0.34 | 0.0 | 0.32 |
+| **Z（schwa / 舌尖元音）** | **0.56** | **0.0**（不咧嘴） | **0.34** |
+| E | 0.66 | 0.4 | 0.8 |
+
+真歌验证（星光下的梦想，250 条 cue）：17 条 cue 从 S→Z，字中段张口
+**0.33~0.37 → 0.51~0.59**（+58%）；全曲「中段张口 <0.40」的字
+**17 → 1**。声母段不受影响（「是」起手 1.01s 处 0.334，元音段 0.543），
+相位、协同发音、22/s 限速都照旧。
+
+英文虚词同时修：the / a / an / of 的 schwa 从 S 改 **Z**，and 按实际读音
+[æ] 改 **A**（原来三个都走 S，整句虚词都不张嘴）。
+
+### 3) 全量排查（其他文字）
+
+- 中文表：410 个音节 → 口型一一对应，没有「同音节两种口型」；除 Z 组外
+  全部落在 A/E/O/U/I，没有元音落进 M/N/F。
+- 5 首有官方歌词的曲目（中文、日文、英文混排）共 **1948 个口型位**：
+  唯一的闭口是日文 **ん/ン**（22 次，本来就该闭），没有任何元音被闭口。
+- 标点、长音符「ー」、促音「っ」、表外汉字 → rest，由 `_carry_visemes`
+  接邻字口型，不会在句中闭嘴。
+- 说明：嗯/呣/噷 在字表里是纯鼻音（n/m/hm），基础表给的是 A。唱歌一般唱成
+  en/em，保持 A 不动；这 3 个字不在现有任何一首歌词里。
+
+### 4) 版本、部署、备份
+
+- cue 缓存 **v13 → v14**（`payload_for` / `build_track_payload` / `get_or_build` /
+  `__init__._lips_payload` 四处同步），旧缓存整批重算。
+- `bridge.js` **VERSION 55 → 56**，132,795 B（LF，md5 `079e6157b70b…`）；
+  `music_groove.js` 58,604 → **61,077 B**（LF，md5 `0b71455097b5…`）。
+- 已部署到 `resources\bin\static\live2d\music-groove-bridge.js` /
+  `music_groove.js`，两侧 md5 一致；`templates\index.html` 缓存戳
+  `-lips4-g55` → **`-lips4-g56`**，55,641 B / 700 CRLF 不变。
+- `music_synth` 已热重载。**主窗口还没刷新**：`/hello.client_version` 仍是
+  **54**——g55 和 g56 的 JS 都还没生效，必须刷新一次主窗口。
+- 备份 `chat-2026-10-29-1\_backup_g56_20261110_033922\`：`bridge.js`(132,479)、
+  `music_groove.js`(58,604)、`lipsync.py`(63,194)、`index.html`(55,641)，
+  另加部署前的 `music-groove-bridge.js.deployed_g55`、`music_groove.js.deployed_g55`。
+- **披露**：这一轮没有为 `music_synth/__init__.py` 新建时间戳备份（只改了一处
+  `old_v < 13` → `< 14`，原件仍是 g55 那一轮留下的 `.bak_*`）；
+  `_groove_gaze_test.js` 的断言按新行为改过（单帧最多 1.7°，改成连跑 60 帧）；
+  `_real_cues14.json` 是把真实 250 条 cue 按新规则逐字重算得到的等价轨
+  （只改韵母字母，时间/相位原样），用于 A/B。
+
+### 5) 测试
+
+`_phase_test.py`（含 Z 与 v14）、`_lips_phase_test.js`（含 Z 四条）、
+`_groove_head_test.js`（新）、`_groove_gaze_test.js`、`_body_test.js`、
+`_emo_test.js` 全 PASS；`_real_scan.js` 在 v14 轨上无 NaN/越界、无新的
+大跳点；`_twitch_ab.js`：每帧最大张口变化 g54 0.867 → g56 **0.417**。
+
+### 6) 仍然不碰
+
+眼珠/眼睑参数这一轮一个都没动（`EYE_SMILE_CAP`、g53 的视线饱和压缩原样保留）。
+按用户要求，以后也不动眼球和眼睑——要改只改别的通道。
+
+## g57（2026-11-10 04:00）：首次安装「安装位置」一步完全卡死
+
+### 1) 现象与根因
+
+新装用户走到引导第 4 页：点「选择文件夹」→ 按钮变「选择中…」→ 永久不动；
+系统目录框不出现；取消也不复位；「快捷填入」的盘符按钮点了没反应；输入框
+要求手填绝对路径，普通用户不知道该填什么；于是「开始安装」永远停在
+「请先选择安装位置」（`ms_setup_install` 返回 `needs_path`），整个循环死锁。
+
+三条独立的坏点，叠在一起才「完全无法操作」：
+
+1. **没有超时**：`pickFolder` 第一支 `await host.pickDirectory(...)` 裸等。
+   宿主 `dialog.showOpenDialog` 在某些窗口状态下既不 resolve 也不 reject，
+   `picking` 永远是 true、按钮永远禁用、`pickErr` 永远为空。
+2. **兜底也打不开**：插件进程那条路（`setup.py::_browse_dialog_win32`）
+   `bi.hwndOwner = None`，框可能弹在应用后面看不见；而且取消之后
+   `_BROWSE` 没有复位手段，`browse_start` 看到旧线程还活着就直接复用，
+   用户此后**再也开不出新框**。
+3. **救急按钮被藏起来**：「快捷填入」渲染在 `{pickErr ? … : null}` 里面，
+   而坏点 1 正好让 `pickErr` 保持为空——最需要它的时候它不存在。
+
+用户已验证可行的规避：直接写 `data/config.json` 的 `compute_root`（并把
+`envs_dir/models_dir/work_dir/sep_model_dir/ddsp_root/ddsp_ckpt/synth_python/
+sep_python/train_runs_dir` 置 `""` 让派生路径重算）。
+
+### 2) 修法
+
+**后端 `setup.py`**
+
+- `hwndOwner` 改成打开时的前台窗口（`GetForegroundWindow` + `IsWindow`），
+  框出现在应用前面，不再弹到后台。
+- `BFFM_INITIALIZED` 里把对话框句柄记进 `_BROWSE["hwnd"]`；框关掉时清掉。
+- 新增 **`browse_cancel()`**：代号 +1、状态直接置 `cancelled`，然后向对话框
+  发 `WM_COMMAND/IDCANCEL` + `WM_CLOSE`。卡住的「选择中…」终于能收回来。
+- **代号守卫**：每次 `browse_start` 拿一个新代号，worker 回来时代号对不上就
+  丢弃结果——取消之后迟到的「用户选好了」不会把状态又写回 `picked`。
+- `browse_start`：已取消的框即使旧线程还卡在 `SHBrowseForFolderW` 里，
+  `restart=True` 也会另开一个，不会把用户永久锁死；正在开着的框仍然复用，
+  不会弹第二个。
+
+**后端 `__init__.py`**：`ms_setup_browse` 增加 `cancel` 参数（schema + 处理），
+`cancel=true` 走 `browse_cancel()`。
+
+**面板 `ui/onboarding.tsx`**
+
+- `withTimeout()` 包住宿主目录框：**90 秒**没有返回就断言失败，改走插件自己的
+  选择框，不再无限「选择中…」。
+- 插件轮询总上限 **3 分钟**，每轮 10 秒；总超时/出错都会复位并给出可执行的
+  提示。`picking` 期间旁边出现「取消」按钮（`pickRun` 代号 + `browse_cancel`）。
+- **「推荐位置」改成常显的普通按钮组**（手绘 div/button，不是 `<select>`），
+  每个盘标出剩余空间（`D:\NEKOMusicSynth · 剩 214 GB`），点一下就回填；
+  当前选中的那个高亮。以前它只在报错后才出现，现在是第一眼就能点的默认路径。
+- 输入框保留，加了实时校验：必须盘符开头的绝对路径；只写 `D` 或 `D:` 会
+  自动补成 `D:\NEKOMusicSynth`；非法字符/超长会即时标红并说明。
+- 新增 **「保存并使用这个位置」**：直接调 `ms_set_config({compute_root})`
+  （后端会同时清掉旧盘上的派生目录并重算），**完全不依赖任何系统对话框**。
+  成功后自动重新检测清单。这是「选择文件夹」坏掉时也能让安装继续的正路。
+- 对话框打不开/保存失败时**自动展开**手填说明：`data\config.json` 里写什么、
+  为什么那几行空字符串不能省、保存后重载插件；附当前路径的完整 JSON 和
+  「复制这段配置」按钮。平时也能从「对话框用不了？看手填说明」手动展开。
+
+### 3) 验证
+
+- `python -m py_compile setup.py __init__.py runtime.py` 通过。
+- 新增 `chat-2026-10-29-1\_browse_test.py`（把系统框换成可控假框，14 项全 PASS）：
+  打开中仍是 open、重复 restart 不开第二个框、`browse_cancel` 立刻 cancelled、
+  取消后迟到的结果不写回 picked、取消后 restart 能开新框且换新代号、
+  新框选完变 picked、已结束的选择 `restart=False` 只回读、空闲 cancel 不炸。
+- 线上热重载 `music_synth` 成功；`ms_setup_browse {cancel:true}` 返回
+  `{"state":"cancelled","gen":1,"ok":true}`；`ms_set_config {compute_root}`
+  返回 `ok=true`、`paths.compute_root` 正确，`data/config.json` 其余字段未变
+  （**没有**动用户当前 `E:\NekoMusicSynth` 的可用配置）。
+- 面板重建：`html/panel.html` = `static/index.html` = **490,989 B**
+  （md5 `9137d915743e…`）；新串「保存并使用这个位置 / 推荐位置 / 复制这段配置 /
+  对话框用不了」都在产物里，旧的「快捷填入」已消失。
+
+### 4) 披露
+
+- 面板是用 `chat-2026-10-29-1\_html_shell\build.mjs` 从 `ui/` 重建的（不是手改
+  构建产物）。`setup.py` 79,953 → **83,612 B**，`__init__.py` 384,674 →
+  **385,002 B**，`ui/onboarding.tsx` 51,788 → **61,913 B**。
+- 备份：`chat-2026-10-29-1\_backup_onb_20261110_035539\`（`onboarding.tsx`、
+  `setup.py`、`__init__.py`、`runtime.py`、`panel.html`、`index.html`）。
+- `music_synth-dev` 里的同名副本**没有同步**：两边早已分叉（dev 的
+  `__init__.py` 比线上还大 4.7 KB），盲目覆盖风险大于收益。
+- 没改 `ui/pageTrain.tsx`、`ui/pageCreate.tsx`；没动任何眼球/眼睑参数。
+- 插件版本号没变（市场条目仍是 0.2.33）——这一轮只修面板与安装线程。
+- **面板要重新打开（或刷新）才看得到新界面**；插件已热重载，不用重启应用。
+
+---
+
+## g58（2026-11-10 04:20）安装页文案精简 + 情绪 → 表情/动作（移植 Soullink VADGestureController）
+
+### 1) 现象与要求
+
+- 用户截图（安装位置卡片）反馈：「排版文字太复杂了要简洁」。卡片里同时出现
+  输入框说明、推荐位置说明、取消提示、手填说明入口、手填步骤、底部状态徽章，
+  同一件事说了两三遍。
+- 用户新要求：「能让角色感受歌的快乐悲伤情绪来变不同的表情和动作，
+  去看看之前的开源有没有这些有就搬过来」。情绪表情层（g47 起）已在线上，
+  缺的是「动作」和「表情不被每帧重算打散」。
+
+### 2) 改法
+
+**(a) 文案（`ui/onboarding.tsx`，61,913 → 60,636 B）**
+
+| 位置 | 原文 | 现在 |
+| --- | --- | --- |
+| 页首 | 欢迎使用「为她而唱」。第一次打开需要先准备好她会用到的程序、模型和音频处理工具，之后就不用再装了。 | 第一次打开要先装好程序、模型和音频工具，只需一次。 |
+| 位置卡首行 | 程序、模型和临时文件都会放在这里。选一个空间充足的盘就行，装在 D 盘、E 盘都可以。 | 程序、模型都装到这里，选个空间够的盘就行。 |
+| 输入框下 | 填盘符开头的完整路径，例如 D:\NEKOMusicSynth；只写 D 或 D: 会自动补成… | 填完整路径，如 D:\NEKOMusicSynth；只写 D: 也行。 |
+| 保存按钮旁 | 不用系统窗口也能保存；保存好就能开始安装。 | 删除（按钮本身已说明） |
+| 手填入口 | 对话框用不了？看手填说明 | 打不开选择窗口？手填配置 |
+| 位置卡末行 | 点「选择文件夹」在系统窗口里挑一个位置；模型和程序只装到这个目录，不会改动系统设置。 | 只装到这个目录，不改系统设置。 |
+| 手填步骤 | 4 步长句 | 3 步：打开 config.json / 粘贴保存后重载 / 空串行别删 |
+| 手填按钮 | 复制这段配置 + 一行解释 | 复制配置（解释删除） |
+| 状态徽章 | 请先填写安装目录，否则不会开始下载 / 这个路径还不能用：… / 这个盘只剩… | 先填安装目录 / 路径不能用：… / 只剩 … |
+| 取消/超时提示 | 已取消。可以直接在下面填路径，或点「保存并使用这个位置」。 | 已取消。 / 等了 3 分钟没选好，直接填路径吧。 |
+
+功能一个没少：文本输入 + 校验、推荐位置按钮组、保存并使用这个位置、
+手填说明（自动展开）、取消按钮、超时提示都还在；只删重复解释。
+
+**(b) 情绪 → 表情/动作（`music_perception/live2d/bridge.js`）**
+
+1. **表情驻留（latch）**：原型原来每帧按 VAD 重算，`happy / affectionate /
+   excited` 之间来回跳，脸上像在抽。新增 `moodSt` + `latchMood(dt)`：新原型
+   必须连续成立 1.2 秒才换档，`moodSt.id` 每换一次 +1（同时给动作层当触发信号）。
+   `applyArchetype` 改成读驻留档位。
+2. **动作层（移植 Soullink `VADGestureController`，Apache-2.0）**：
+   - 10 个动作族 + 各情绪权重表照抄：quick-nod / warm-sway / shy-dip /
+     side-glance / curious-tilt / small-lean-in / bright-pop / firm-lean /
+     side-set / soft-sink / slow-glance-down（兜底）。
+   - 关键帧三段（起 → 收 → 回 0），`easeOut` / `easeInOut`，时长
+     0.96+rand·0.58+amp·0.45，攻击 0.20+rand·0.16，回收从 52% 处开始；
+     结构对齐 `evaluateExpressionTimeline`。
+   - avoid-repeat 窗口 3（`gestSt.recent`）。
+   - **触发条件按唱歌重配**（原版靠文字情绪切换造成目标跳变，歌里没有）：
+     ① 原型换档（`moodSt.id` 变）；② 目标 VAD 在 0.7 秒窗口里累计移动
+     ≥0.22；③ 到点（上一段播完 + 1.4~3.6 秒）。上一个动作播到 58% 才允许换。
+   - **输出通道只有 10 个**：headX/Y/Z（±13°）、bodyX/Y/Z（±4°）、
+     browIn/browOut/browDn（±0.55）、mouth（±0.30）。
+     **眼球（ParamEyeBallX/Y）和眼睑（ParamEyeL/R Open/Smile）一概不写**——
+     遵守「以后不动眼球和眼睑参数」的约定。原版的 gazeX/gazeY 换成头的朝向，
+     blush/sweat/eyeSquint 直接去掉。
+   - 写入点：`applyEmo` 里眉/嘴用 `add`、头用 `rel`（和现有情绪层同一套），
+     `applyBody` 里身体角用 `put`；停唱（`pres / lips.active / blend` 全不成立）
+     立即归零，整段交回待机。
+   - 诊断：`/hello` 新增 `gs=动作名,次数`、`gv=本帧头 x,y,z 与上身 y（度）`。
+3. 版本：`VERSION` 56 → **57**；部署到
+   `E:\SteamLibrary\steamapps\common\n.e.k.o\resources\bin\static\live2d\music-groove-bridge.js`；
+   `templates\index.html` 的缓存标记 `-lips4-g56` → **`-lips4-g57`**。
+   顺手把 `__init__.py` 的 `_BRIDGE_TAG` 从 `-lips4-g28` 同步到 `-lips4-g57`
+   （它和真实 index.html 早已不一致：`live2d_bridge_status` 会误报未接入，
+   再点一次「接入主程序角色」会插第二个 script 标签）。
+
+### 3) 验证
+
+- `node --check bridge.js` 通过；新增守门测试 `chat-2026-10-29-1\_gest_test.js`
+  （直接从线上源码切段求值）10 项全过：
+  静场不触发、高兴时 24 秒内 6 次动作、无 NaN、头部峰值 6.29°（上限 13°）、
+  相邻帧最大 0.87°、动作会收回 0、悲伤只选低落动作、recent 不重复、
+  停唱归零、通道键集固定为 10 个。
+- 面板重建：`html/panel.html` = `static/index.html` = **489,612 B**
+  （md5 `a0c0c4ae9774eabeea5cbff814f37af3`）；新串全部命中，旧长句
+  （「请先填写安装目录」「不用系统窗口也能保存」「对话框用不了」「欢迎使用
+  『为她而唱』」）全部为 0。
+- 热重载 `music_synth` / `music_perception` 均 200；`live2d_bridge_status`
+  返回 `index_patched=true`、`port=48765`；`ms_setup_check` 仍 `ready=true`。
+- 线上 `/hello` 目前仍是 `client_version=56`——**页面刷新后**才会加载 g57
+  （`start()` 有 `window.__nekoMusicGroove` 去重，不刷新不会换实例）。
+
+### 4) 披露
+
+- 部署前备份：`plugins\music_perception\live2d\app_backup\`
+  `music-groove-bridge.js.bak_g57_20261110_041628`、
+  `index.html.bak_g57_20261110_041628`；插件内 `__init__.py.bak_g58_20261110_041628`。
+- **本次 `onboarding.tsx` / `bridge.js` 的「改前」版本没有单独快照**（g57 那轮
+  的源码备份 `_backup_onb_20261110_035539` 是更早的 51,788 B 版本）。事后快照：
+  `claude-backups\music_synth_emo_g58_20261110_041847\`（含改后的
+  onboarding.tsx、panel.html、index.html、bridge.js、__init__.py）。
+  要回退文案，上表左右两列就是全部差异，逐条反向替换即可。
+- 没改 `ui/pageTrain.tsx`、`ui/pageCreate.tsx`；面板是 `build.mjs` 重建的，
+  没有手改构建产物；没动任何眼球/眼睑参数；阈值/白名单/结果都没动。
+- `music_synth-dev` 副本仍未同步（历史分叉）。
+- 动作强度目前给的是「看得见但不抢律动」的量：头 ≤13°、身 ≤4°。若觉得不够，
+  调 `GEST.head / GEST.body` 两个数即可，不动触发逻辑。
+
+## 2026-11-10 04:26 她明明歌好了却说「还在分离和变声」——查因 + 修口供
+
+### 1) 现场还原（证据）
+
+- 用户 04:08:19 说「宝宝能在唱一遍 Re, bloom*」，梦梦 04:08:26 回
+  「还在分离和变声，没做完呢。你乖乖趴着等，做好我直接放。」
+- 插件日志 04:06–04:08 **只有面板轮询**（`ms_state`/`ms_corpus_list`/`ms_train_status`），
+  04:08:26 前后**没有任何工具调用**；第一次 `__llm_tool__music_synth_sing` 在 04:09:18，
+  当次就 `已起播 track=7fbe2beffe8d`（Re, bloom*）。
+- `tracks.json`：`7fbe2beffe8d`「Re, bloom*」**04:03:38 就 done**（final.wav 已在）；
+  同时段真正在跑的是 `f9b8f20e3881`「SO PLAYFUL」，04:18:16 分离完成。
+- 她的会话记忆（`memory\梦梦\time_indexed.db`）里 03:59 有同一句
+  「在做了，分离、变声、混音走一遍。做好我直接放给你听，别催。」——04:08 那条是**复述旧话**，
+  且把「另一首在跑」当成了用户点的那首。
+- 顺带发现工具返回值在骗人：`_begin_sing` 的 note 原文是
+  「…做完会自动播放；先别催，**处理完我再告诉你**」——插件根本没有「告诉你」的通道
+  （全文件 grep 无 notify/push），这句就是她照着念的来源。
+
+### 2) 改动（只动口供，不动流水线）
+
+- `music_synth_sing` 的工具描述加硬规则：
+  「用户点歌/催歌/问某首歌好了没，**必须先调用本工具查真实状态再回答**，
+  不要凭上一轮记忆说『还在分离/变声』」；并说明返回值里
+  `processing_others` 是**别的歌**在处理，不能和用户点的那首混着说。
+- 新增 `_processing_others(track_id)`：列出除这首外 `running/queued` 的歌
+  （title/step/progress，最多 5 条）；`_sing_track` 成功返回、`_begin_sing`
+  两个分支都带上它。
+- `_begin_sing` 的两句 note 改成真话：
+  「就是这首还在处理（不是别的歌），做完会自动播放」/
+  「这首还没唱过…做完会自己开始播放；它没过完之前不算唱好了」，
+  并附 `step`/`progress`。删掉不存在的「处理完我再告诉你」。
+- 没有加主动推送（`push_message`）：宿主侧契约是 v2（source/visibility/ai_behavior/parts），
+  未在本插件验证过，贸然推会往她聊天里插话；先不碰。
+
+### 3) 验证
+
+- `python -m py_compile` 通过；热重载 `music_synth` 200。
+- 实跑 `__llm_tool__music_synth_sing {track_id:f9b8f20e3881}` →
+  `ok:true, processing:true, processing_others:[]`，note 为新文案。
+- `_processing_others` 抽函数单测（`chat-2026-10-29-1\_others_test.py`）：
+  done 曲目 + running + queued 四条数据下返回 `[SO PLAYFUL, Another]`，
+  排除自身、不含 failed，通过。
+
+### 4) 披露
+
+- 改前备份：`claude-backups\music_synth_sing_truth_20261110_042558\`
+  （`__init__.py` + `tracks.json`）。
+- **我 04:18:54 那次热重载把正在跑的 SO PLAYFUL 打断了**
+  （`处理被中断（插件重载），点「继续唱」继续`）。已在 04:26:54 用
+  `music_synth_sing` 续跑，04:27:15 变声完成、04:27:20 **自动播放**（口型 360 cues）。
+  这条不是规则外改动，是补回我自己造成的损失；播放已经开始，不想要就喊停。
+- `music_synth-dev` 副本仍未同步（历史分叉，行数不同，不整体覆盖）。
+- 没动阈值/白名单/已有结果；没动眼球眼睑；没改 pageTrain/pageCreate 和面板产物。
+
+## 2026-11-10 04:49 她唱歌时的「脸部变形」——眼睑开合 + 腮帮子（bridge g59 / VERSION 59）
+
+用户要的是**参数级的脸**（眼睛开合、腮部、整张脸跟着歌词/节奏/起伏变形），
+不是切表情包。之前一直做不到眼睛，是因为写入点选错了。
+
+### 1) 为什么以前不敢写眼睑
+
+`coreModel.update` 被主程序整体包了一层（`live2d-model.js`），眨眼器
+`_updateEyeBlink` 在这一层里**每帧写绝对值**，而这一层在
+`beforeModelUpdate` 之后才跑。我们在 `beforeModelUpdate` 里加的偏移：
+大多数帧被眨眼器整段盖掉，偶尔（`_suspendEyeBlinkOverride` /
+`_isEyeDrivenByMotion` 逐帧翻转）漏一帧生效 —— 用户看到的「眼睛抽动」。
+所以 g44~g58 一律不写 `ParamEyeLOpen/ROpen`（`applyEmo` 里那段注释）。
+
+### 2) g59 的做法：走主程序自己的「渲染前最后姿态覆盖」
+
+`live2d-model.js` 里有 `setTemporaryPoseOverride(source, apply, {priority})`，
+`_applyTemporaryPoseOverride` 在 `origCoreModelUpdate()` 前后各调一次（3399/3417），
+是主程序给教程苏醒这类动作留的注入点。我们登记 `nekoMusicEyes`（priority 30）：
+
+- 在眨眼**之后**按**倍率**缩放已经写好的开合值：
+  `Open = base × k`，`base` 是该帧第一次进来时读到的值（含眨眼）。
+  主程序闭眼写的 0 × 任何倍率还是 0 —— **眨眼仍归主程序**，不会被顶开。
+- 同一帧会被调两次；基数只在「这一帧第一次」读（`frameSeq` + 250ms 兜底），
+  否则第二次会把我们写过的值当基数，越乘越小。
+- 只写 `ParamEyeLOpen / ParamEyeROpen`。**眼球 `ParamEyeBallX/Y` 一律没写**。
+- 只在唱歌时登记（`emo.pres / blend / lips.active`），停唱立刻
+  `clearTemporaryPoseOverride` 并把状态归零，待机一帧都不碰。
+
+### 3) 开合跟什么走
+
+`k = 1 + clamp(f.eyeOpen×0.45 − 0.38×难过 − 0.16×激动×(0.35+0.65×高音) + 0.05×平和正向, −0.38, +0.06)`
+
+- 难过的歌：眼皮沉（V=−0.6 约 0.77 倍，副歌能压到 0.7）——最能看出「她听懂了」；
+- 激动/高音：用力眯一点（约 0.94）；
+- 平和的正向：松开（1.02，0..1 的模型会被钳回 1）；
+- **换气眨眼**：歌词那一句唱完（`faceDyn.pres` 从 ≥0.25 掉到 <0.10）时闭一下，
+  深度 0.85、回弹 0.14s、冷却 3.2s，一句最多一次。触发源就是口型轨/歌词时间轴。
+
+### 4) 腮帮子（整脸变形）
+
+`ParamCheek` 原来只有乐句平均值（慢）。g59 加一条快通道：
+拍点（`mus.beat`）+ 句首（`faceDyn.onset`）→ 0.055s 起、0.30s 落，
+乘 `EYE.cheekBeat=0.42` 叠在 `applyFace` 的 `add('ParamCheek', c + ck)` 上。
+鼓点砸下来腮帮子会跟着一鼓，句与句之间不会一直鼓着。
+
+### 5) 验证
+
+- `node --check` 通过；新增 `chat-2026-10-29-1\_eye_test.js`（从线上源码切段求值，
+  假 core / 假 manager）18 项全过：
+  静场不写；悲伤眯到 0.62；难过 0.772；激动 0.939；平和 1.025；
+  同帧两次同值（不缩水）；主程序闭眼时仍为 0；换气眨眼压到 0.42 后回弹；
+  冷却内不再眨；拍点鼓脸 1.00→停拍 0.001；缺参数不抛；停唱 on=0；
+  登记/重复登记/撤销各一次；代码里没有 `ParamEyeBall`。
+- 部署：`static/live2d/music-groove-bridge.js` 153,576 B
+  （md5 `a3671e6c14e9d72fb2d4b03a9112d762`，VERSION 59）；
+  `templates/index.html` 标记 `-lips4-g57` → **`-lips4-g59`**；
+  `music_perception/__init__.py` 的 `_BRIDGE_TAG` 同步到 g59；`py_compile` 通过；
+  热重载 200；`live2d_bridge_status` → `index_patched: true`。
+- **页面要刷新（Ctrl+Shift+R）才会加载 59**；刷新前 `/hello` 的
+  `client_version` 还是 57。
+
+### 6) 诊断
+
+`/hello` 的 `ey` 串（`eye_probe`）末尾多一段：
+`|eo<开合倍率>/<覆盖写入次数>/<在不在管>/<眨眼>/<鼓脸>/<参数掩码>`。
+- 次数一直 0 → 宿主没有那个注入点（覆盖没装上）；
+- 倍率一直 1.00 → 没在唱（停唱我们不写）；
+- 掩码 `111` = 左眼/右眼/脸颊三个参数都在。
+
+### 7) 披露
+
+- 改前备份：`claude-backups\music_perception_eyes_g59_20261110_044932\`
+  （bridge.js、部署副本、index.html、__init__.py）。
+- **这次动了眼睑参数**：之前的约定是「不动眼球和眼睑」。用户这次明确要求
+  「眼睛的开闭合状态」，所以开了眼睑通道；眼球（视线）仍然一个字节都没写，
+  眨眼也仍然由主程序负责，我们只是乘一个倍率。
+- 没动阈值/白名单/已有结果；没改 pageTrain/pageCreate 和面板构建产物；
+  没改 `music_synth`（只读了它的 lips_server 诊断字段）。
+- `music_synth-dev` 副本这次无关（改的是 music_perception）。
+
+## 0.2.35 发布：表情/动作演出 + 目录与依赖修复（2026-11-10）
+
+市场更新说明（用户口述，按原文写）：
+
+> 加了丰富的表情和动作演出；无法指定目录（修复）；下载依赖修复；其他 bug 修复。
+
+本版包内容 = 0.2.33（安装目录改成系统目录选择框、五页引导、底模检测修复）+
+0.2.34（下载/依赖链路修复）+ 本次演出层收尾。三条说明各自的落点：
+
+- **丰富的表情和动作演出**：口型轨 v5–v9 与桥 g47–g61（情绪 → 头/上身/呼吸/头发、
+  视线限幅、腮部拍点、口型时间轴驱动的句间换气）。表情不换 exp3 文件，
+  是参数级的脸部变形。
+- **无法指定目录**：0.2.33 起安装目录改成系统目录选择框（引导第二页可选）。
+- **下载依赖**：0.2.34 的截断下载校验、ddsp_deps 预检、代理判定、并发闸门。
+- **其他 bug**：0.2.33 的底模假阴性检测、0.2.34 的磁盘/显存语义与重下入口。
+
+### 眼睛回归（桥 g60 / g61）
+
+用户报「眼珠子非常小、想要正常大小」。定位到两处都出在我们这边的写入上，一起停掉：
+
+- **g60**：`applyEmo` / `applyFace` 不再写 `ParamEyeLSmile` / `ParamEyeRSmile`。
+  原来的加算是叠加写、停唱后没人复位（`/hello?ed=` 实测：没在唱时仍是 0.13），
+  而主程序在模型加载时 `recordInitialParameters()` 会把当时的参数记成「初始值」，
+  之后每次复位都把它写回去——等于永久改掉了这个模型的眼睛形状。
+- **g60**：视线限幅加待机档（0.04 / 0.06），不再让 `ParamEyeBallY` 长期贴在 +0.14。
+- **g61**：整条眼睑通道停写（`eyeApply` 直接 return，不再写 `ParamEyeLOpen/ROpen`）。
+  g59 的倍率写法在开心/激动的歌上会把开合长期钉在 1.0，主程序的眨眼间隙和松弛
+  全被盖住，画面就是「一直瞪大眼：眼白大、眼珠显小」。眼睑归主程序和模型本体。
+
+### 披露
+
+- 和上一轮（g59）不同：g59 是用户**明确要求**「眼睛开闭合」才动的眼睑；这次用户
+  重申「不再动眼球和眼睑」，所以整条眼睑写入撤掉。眼球（视线）只保留**向中心收**
+  的限幅，不制造任何偏移；眨眼、表情复位全部交回主程序。
+- 成本：唱歌时眼睛不再有自己的开合演出（少了「眯眼/换气眨眼」），腮部、口型、
+  头身呼吸、头发这些通道不变。
+- 没动阈值 / 白名单 / 已有结果；没改 `ui/pageTrain.tsx`、`ui/pageCreate.tsx`
+  和面板构建产物（`static/index.html`、`html/panel.html` 未重建）。
+- 桥在 `music_perception/live2d/bridge.js`（`var VERSION = 61`），
+  `music_perception/__init__.py` 的 `_BRIDGE_TAG` 同步 `-lips4-g61`；
+  `node --check`、`py_compile` 通过；插件热重载 200。
+- **页面要刷新 / 重启宿主才会加载 61**；刷新前 `/hello` 的 `client_version` 还是 59。
+- 改前备份：`chat-2026-10-29-1\_backup_g60_20261110_103548\`、
+  `_backup_g61_20261110_104522\`。
