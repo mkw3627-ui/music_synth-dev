@@ -556,12 +556,12 @@ class MusicSynthPlugin(NekoPluginBase):
         with self._jobs_lock:
             if job_id in self._jobs:
                 self._jobs[job_id].update(fields)
-                if fields.get("state") == "failed":
-                    # 失败作业多半已经被业务代码接住并显示成「没成功」，不会抛异常；
-                    # 这里把它的说明也记下来，才能事后查到是哪一步失败。
-                    error_log.record_error(
-                        self._data_dir, f"job:{job_id}",
-                        detail=str(fields.get("detail") or self._jobs[job_id].get("detail") or ""))
+        # 日志不依赖作业是否还在 _jobs 里：_job_begin 只保留最近 8 个，
+        # 旧作业失败时若先判断「在不在表里」，错误会被静默丢掉。
+        if fields.get("state") == "failed":
+            error_log.record_error(
+                self._data_dir, f"job:{job_id}",
+                detail=str(fields.get("detail") or ""))
 
     # ── 真话口径：作业终态 / 对外说法（唯一口径见 claim_state.py）──────────
     # 反例（用户投诉「说假话」）：流水线因为录音只有 28 秒返回 blocked，但返回体
