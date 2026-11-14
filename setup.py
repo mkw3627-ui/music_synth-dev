@@ -1324,14 +1324,14 @@ def check_dependencies(paths: dict, probe: dict | None = None) -> dict:
 
     ff = runtime.ffmpeg_status(str((paths.get("raw") or {}).get("ffmpeg_path") or ""))
     # 分离（audio-separator）必须用系统 PATH 里的 ffmpeg；pip 装的 imageio-ffmpeg 它用不到，
-    # 所以不再给「pip 安装」按钮，而是明确告诉用户用 winget 装系统版。
+    # 所以不给「pip 安装」按钮，而是提供「用 winget 安装」——只在用户点按钮时执行。
     items.append(_item(
         "ffmpeg", "FFmpeg（人声分离必需）",
         "ready" if ff["available"] else "missing",
         ff.get("path") or "未安装：人声分离会失败",
-        required=True, installable=False,
-        fix="" if ff["available"] else "在终端运行 winget install Gyan.FFmpeg，装好后重启 N.E.K.O",
-        size_gb=0.0, action=""))
+        required=True, installable=not ff["available"],
+        fix="" if ff["available"] else "点「安装」用 winget 自动装；或手动运行 winget install Gyan.FFmpeg，装好后重启 N.E.K.O",
+        size_gb=0.0, action="" if ff["available"] else "ffmpeg:winget"))
 
     # GPU / driver ---------------------------------------------------------
     if gpu:
@@ -1795,6 +1795,58 @@ def browse_wait(seconds: float = 20.0) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# FFmpeg 系统安装（人声分离必需）
+# ---------------------------------------------------------------------------
+WINGET_FFMPEG_ID = "Gyan.FFmpeg"
+_WINGET_ARGS = [
+    "winget", "install", "--id", WINGET_FFMPEG_ID, "-e",
+    "--accept-package-agreements", "--accept-source-agreements",
+]
+WINGET_TIMEOUT_S = 900.0  # 约 80MB 下载 + 安装，给 15 分钟
+
+
+def install_ffmpeg_winget(progress=None, timeout: float = WINGET_TIMEOUT_S) -> dict:
+    """用 winget 装系统 FFmpeg（人声分离必需）。只在用户点按钮时调用，不在引导页自动跑。
+
+    返回 dict：
+    - detected=True / ok=True：装完立刻在当前进程找到 ffmpeg。
+    - need_restart=True：winget 装成功，但当前进程 PATH/Links 还没刷新，提示重启。
+    - ok=False：winget 不存在 / 安装失败 / 超时，带中文原因与手动命令回退。
+    """
+    if not shutil.which("winget"):
+        return {"ok": False, "detected": False, "need_restart": False,
+                "installed": False,
+                "error": "这台机器没有 winget，请到 gyan.dev 下载 full build 手动安装 FFmpeg 并加入 PATH",
+                "manual": "https://www.gyan.dev/ffmpeg/builds/", "output_summary": ""}
+
+    if progress:
+        progress("FFmpeg：用 winget 安装（会弹出安装进度，可能需要一点时间）…")
+
+    code, tail = _run_stream(
+        _WINGET_ARGS, progress, "用 winget 安装 FFmpeg",
+        timeout=timeout, head="FFmpeg（人声分离必需）")
+    summary = "\n".join(tail[-3:])
+
+    # winget 装完往往在当前进程还找不到（PATH/Links 没刷新），如实报告，不假装成功。
+    exe = runtime._find_ffmpeg()
+    if exe:
+        return {"ok": True, "detected": True, "need_restart": False, "installed": True,
+                "path": exe, "output_summary": summary, "error": ""}
+
+    if code == 0:
+        return {"ok": False, "detected": False, "need_restart": True, "installed": True,
+                "error": "FFmpeg 已安装，但要在重启 N.E.K.O 之后才能被识别，请重启后回来点「重新检测」",
+                "output_summary": summary}
+    if code == -1:
+        return {"ok": False, "detected": False, "need_restart": False, "installed": False,
+                "error": "winget 安装超时被终止，请改用 gyan.dev full build 手动安装",
+                "manual": "https://www.gyan.dev/ffmpeg/builds/", "output_summary": summary}
+    return {"ok": False, "detected": False, "need_restart": False, "installed": False,
+            "error": f"winget 安装失败（退出码 {code}），请改用 gyan.dev full build 手动安装",
+            "manual": "https://www.gyan.dev/ffmpeg/builds/", "output_summary": summary}
+
+
+# ---------------------------------------------------------------------------
 # Installer
 # ---------------------------------------------------------------------------
 def _item_map(report: dict) -> dict:
@@ -1908,13 +1960,19 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
             installed.append("capture_native")
         except Exception as exc:  # noqa: BLE001
             errors.append({"item": "capture_native", "error": str(exc)})
-    if "ffmpeg" in requested and synth_py.is_file():
+    if "ffmpeg" in requested:
+        # 人声分离（audio-separator）要用系统 PATH 里的 ffmpeg，pip 的 imageio-ffmpeg 它用不到，
+        # 所以这里改成调 winget 装系统版；只有用户点「安装」才走到这。
         try:
-            _pip(synth_py, ["imageio-ffmpeg"], progress, "安装 imageio-ffmpeg",
-                 head="FFmpeg（可选，用于视频导入/试听）")
-            installed.append("ffmpeg")
+            res = install_ffmpeg_winget(progress)
         except Exception as exc:  # noqa: BLE001
-            errors.append({"item": "ffmpeg", "error": str(exc)})
+            errors.append({"item": "ffmpeg", "error": f"{type(exc).__name__}: {exc}"})
+        else:
+            if res.get("detected"):
+                installed.append("ffmpeg")
+            else:
+                errors.append({"item": "ffmpeg", "error": res.get("error") or "FFmpeg 安装未成功",
+                               "need_restart": bool(res.get("need_restart"))})
 
     if sep_py.is_file() and ("sep_env" in requested or "audio_separator" in requested):
         try:

@@ -1717,3 +1717,31 @@ typing-extensions, sympy …` 这些 pip 内部的下载/安装没有进度，�
   不启动 worker。
 - 有 ffmpeg：引导页项 ready；分离越过检查继续。
 - CI 同参数 Ruff 通过，两个文件 compile 通过。
+
+---
+
+## 0.2.53 发布：引导页可用 winget 自动安装 FFmpeg（2026-11-15）
+
+用户反馈：0.2.52 只提示「请自己运行 winget install」，新用户仍要手动装系统
+FFmpeg。改成在引导页点「安装」即可自动执行。
+
+### 改法
+
+- `setup.py` 新增 `install_ffmpeg_winget()`：用
+  `winget install --id Gyan.FFmpeg -e --accept-package-agreements --accept-source-agreements`
+  安装，走已有的 `_run_stream`（逐行日志、15 分钟超时）。
+- 安装后用 `runtime._find_ffmpeg()` 复检：
+  - 找到 → ready；
+  - winget 成功但当前进程还看不到 → `need_restart=True`，提示重启，不假装成功；
+  - winget 不存在 / 失败 / 超时 → 中文错误 + gyan.dev 手动安装回退。
+- 引导页 FFmpeg 项恢复为可安装（`installable=True`，`action="ffmpeg:winget"`），
+  fix 文案改为「点『安装』用 winget 自动装」。
+- `install()` 里原来 pip 装 `imageio-ffmpeg` 的分支替换为调用 winget 安装。
+- 新增 `tests/ffmpeg_winget_stub.py`：桩掉 `shutil.which` / `_run_stream` /
+  `_find_ffmpeg`，覆盖 4 种返回路径，不执行真实 winget。
+
+### 披露
+
+- 只在用户点「安装」时执行；「一键安装全部」也会带上它（属于用户主动点击）。
+- 不静默提权、不指定 scope，UAC 由系统按需弹窗。
+- 真实 `winget install` 没有在本机执行；只有桩验证。
