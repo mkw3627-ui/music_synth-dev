@@ -999,6 +999,24 @@ _FFMPEG_HINTS = (
 )
 
 
+def _find_winget_package_ffmpeg() -> str:
+    """winget 装好但没建 Links 别名时，直接去 Packages 里找真正的 ffmpeg.exe。
+
+    包目录名带版本号（ffmpeg-9.0.2-full_build），没法写死路径，所以按 Gyan.FFmpeg* 扫描。
+    """
+    local = os.environ.get("LOCALAPPDATA") or ""
+    if not local:
+        return ""
+    packages = Path(local) / "Microsoft" / "WinGet" / "Packages"
+    if not packages.is_dir():
+        return ""
+    for pkg in sorted(packages.glob("Gyan.FFmpeg*")):
+        for exe in sorted(pkg.glob("ffmpeg-*/bin/ffmpeg.exe")):
+            if exe.is_file():
+                return str(exe)
+    return ""
+
+
 def _find_ffmpeg() -> str:
     """先看 PATH，再看 winget / chocolatey / 常见安装目录。
 
@@ -1011,7 +1029,7 @@ def _find_ffmpeg() -> str:
         candidate = Path(os.path.expandvars(raw))
         if candidate.is_file():
             return str(candidate)
-    return ""
+    return _find_winget_package_ffmpeg()
 
 
 def ffmpeg_status(configured: str = "") -> dict:

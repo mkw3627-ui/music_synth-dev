@@ -1831,3 +1831,32 @@ winget 输出的是 UTF-8，遇到多字节续字节 0x80 就抛 `UnicodeDecodeE
   `--force` 并成功；能找到 ffmpeg 时不重试；真实失败码不重试。
 - ffmpeg_winget_stub 4 用例全 PASS；CI Ruff 通过；compile 通过。
 - 真实 winget 安装未在本机执行。
+
+---
+
+## 0.2.57 发布：winget 没建别名时直接找包目录，且不再误导性提示重启（2026-11-15）
+
+用户反馈：点「安装」后提示「已安装，需重启」，但重启/重新检测仍显示未安装。
+
+### 根因
+
+winget 报告安装成功，但没有创建 `WinGet\Links\ffmpeg.exe` 别名，PATH 里也没有，
+于是 `_find_ffmpeg()` 返回空、检测一直「未安装」。而代码在「winget 成功但找不到」
+时提示「重启 N.E.K.O」——重启并不能补出别名，用户被卡在循环里。
+
+### 改法
+
+- `runtime._find_ffmpeg()` 增加兜底：直接扫描
+  `%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg*\ffmpeg-*\bin\ffmpeg.exe`。
+  包目录名带版本号，所以按模式匹配，不写死路径；PATH 与固定路径仍优先。
+- `setup.py`：强制重装成功但仍找不到时，不再提示重启，改为如实说明
+  「winget 显示已安装但找不到 ffmpeg.exe」，给 gyan.dev 手动安装方案
+  （`need_restart=False`）。
+- 更新 `tests/ffmpeg_winget_stub.py` 对应用例的期望。
+
+### 验证
+
+- 本机把 PATH 缩到 System32、清空固定路径后，`_find_ffmpeg()` 仍能从 Packages
+  目录找到 `ffmpeg-9.0.2-full_build\bin\ffmpeg.exe`，`ffmpeg_status` 返回 available
+  且版本正确；PATH 正常时仍优先用 PATH。
+- ffmpeg_winget_stub 4 用例全 PASS；CI Ruff 通过；compile 通过。

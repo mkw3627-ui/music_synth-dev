@@ -1858,9 +1858,11 @@ def install_ffmpeg_winget(progress=None, timeout: float = WINGET_TIMEOUT_S) -> d
             return {"ok": True, "detected": True, "need_restart": False, "installed": True,
                     "path": exe, "output_summary": summary, "error": ""}
         if code2 == 0:
-            return {"ok": False, "detected": False, "need_restart": True, "installed": True,
-                    "error": "FFmpeg 已安装，但要在重启 N.E.K.O 之后才能被识别，请重启后回来点「重新检测」",
-                    "output_summary": summary}
+            # winget 报告成功，但连包目录里的 ffmpeg.exe 都找不到：重启也没用，如实说。
+            return {"ok": False, "detected": False, "need_restart": False, "installed": True,
+                    "error": "winget 显示已安装，但找不到 ffmpeg.exe（可能是安装未落盘）。"
+                             "请改用 gyan.dev full build 手动安装，并把 bin 目录加入系统 PATH",
+                    "manual": "https://www.gyan.dev/ffmpeg/builds/", "output_summary": summary}
         if code2 == -1:
             return {"ok": False, "detected": False, "need_restart": False, "installed": False,
                     "error": "winget 安装超时被终止，请改用 gyan.dev full build 手动安装",

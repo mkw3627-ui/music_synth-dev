@@ -70,8 +70,9 @@ def main() -> int:
                  and r["path"] == r"C:\ffmpeg\bin\ffmpeg.exe", r)
 
     r, _ = _run(winget="winget.exe", run_code=0, found_after="")
-    ok &= _check("安装成功但未检测到（需重启）", r["installed"] is True
-                 and r["need_restart"] is True and "重启" in r["error"], r)
+    ok &= _check("安装成功但连包目录也找不到（重启无用，如实报错）", r["installed"] is True
+                 and r["need_restart"] is False and "找不到 ffmpeg.exe" in r["error"]
+                 and r["manual"].startswith("https://www.gyan.dev"), r)
 
     r, _ = _run(winget="winget.exe", run_code=1, found_after="")
     ok &= _check("安装失败退出码非 0", r["ok"] is False and r["installed"] is False
