@@ -1551,3 +1551,30 @@ typing-extensions, sympy …` 这些 pip 内部的下载/安装没有进度，�
   能用裸名 `ffmpeg` 启动（由执行侧验证）。
 - 本地安装目录已同步；宿主需重启才会加载。
 - 导入进度条（大包解压/复制阶段）这次没有做，仍只在分片上传阶段有进度。
+
+---
+
+## 0.2.47 发布：逐应用采集检测忽略缺失的随包 addon（2026-11-15）
+
+用户反馈：合成环境里 numpy 和 proc-tap 已经装好，引导页仍显示「逐应用声道采集组件
+缺失」，安装项一直不变。
+
+### 根因
+
+- `runtime._capture_own_paths` 只有在随包带的 proc-tap 目录（`addon`）存在时，才会
+  去用合成环境的 site-packages。用户机器上没有这个随包目录，于是跳过合成环境，
+  落到旧的 `data/capture/vendor`（不存在），检测判为缺失。
+- proc-tap 是 pip 装进合成环境的，本身不依赖随包 addon，所以这个前提是错的。
+
+### 改法
+
+- `_capture_own_paths`：合成环境存在且 site-packages 可定位即直接使用，不再要求
+  `addon` 存在；`addon` 为空时 `locate_app_capture_runtime` 已有兜底（用 `vendor`）。
+
+### 验证
+
+- 复现用户场景（去掉随包 addon）：修复前 `ok=False`，修复后 `ok=True`，来源 `self_synth`。
+- 正常场景（有随包 addon / 本机）：仍为 ready，无回归。
+- 缺失时 `capture_native` 为 `installable=True`，`install()` 会以
+  `proc-tap==1.1.1`、`winrt-Windows.Media.Control` 调用 pip（pip 为桩，未真装）。
+- 本地安装目录已同步；宿主需重启才会加载。

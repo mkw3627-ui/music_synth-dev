@@ -1265,7 +1265,9 @@ def _capture_own_paths(data_dir: Path, synth_python: str = "") -> dict:
     if synth_python:
         python = Path(synth_python)
         vendor = _venv_site_packages(python)
-        if python.is_file() and vendor is not None and addon is not None:
+        # proc-tap 由 pip 装进合成环境的 site-packages，不依赖随包带的 addon；
+        # addon 为空时 vendor 仍然可用（_capture_paths_ok 会检查它的 _native 扩展）。
+        if python.is_file() and vendor is not None:
             return {"root": own, "python": python, "vendor": vendor, "addon": addon}
     # legacy fully-copied runtime (kept for older installs)
     python = _newest((own / "managed-python").glob("*/python.exe"))         if (own / "managed-python").is_dir() else None
