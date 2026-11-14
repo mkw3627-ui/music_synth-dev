@@ -490,6 +490,7 @@ def resolve_paths(data_dir: Path, host_section: dict | None = None) -> dict:
         "models_dir": models_dir,
         "work_dir": work_dir,
         "base_python": Path(pick("base_python")) if pick("base_python") else "",
+        "data_dir": Path(data_dir),
         "synth_python": Path(pick("synth_python") or (envs_dir / "ddsp" / "Scripts" / "python.exe")),
         "sep_python": Path(pick("sep_python") or (envs_dir / "sep" / "Scripts" / "python.exe")),
         "ddsp_root": ddsp_root,
@@ -790,6 +791,11 @@ def _clean_env(extra: dict | None = None) -> dict:
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
     env.setdefault("PYTHONUNBUFFERED", "1")
+    # 宿主 PATH 里常没有 WinGet Links：vendor 代码直接调用裸名 ffmpeg 会报 WinError 2。
+    # 找到 ffmpeg 就把它的目录放到 PATH 最前面，所有 worker 都能解析到。
+    ffmpeg = _find_ffmpeg()
+    if ffmpeg:
+        env["PATH"] = os.path.dirname(ffmpeg) + os.pathsep + env.get("PATH", "")
     if extra:
         for key, value in extra.items():
             if value is None:
@@ -979,12 +985,11 @@ def module_available(python: Path, module: str) -> bool:
 
 
 _FFMPEG_HINTS = (
-    r"%LOCALAPPDATA%\Microsoft\WinGet\Linksfmpeg.exe",
-    r"%LOCALAPPDATA%\Microsoft\WinGet\Linksfmpeg.EXE",
-    r"%ProgramData%\chocolateyinfmpeg.exe",
-    r"%ProgramFiles%fmpeginfmpeg.exe",
-    r"%ProgramFiles(x86)%fmpeginfmpeg.exe",
-    r"C:fmpeginfmpeg.exe",
+    r"%LOCALAPPDATA%\Microsoft\WinGet\Links\ffmpeg.exe",
+    r"%ProgramData%\chocolatey\bin\ffmpeg.exe",
+    r"%ProgramFiles%\ffmpeg\bin\ffmpeg.exe",
+    r"%ProgramFiles(x86)%\ffmpeg\bin\ffmpeg.exe",
+    r"C:\ffmpeg\bin\ffmpeg.exe",
 )
 
 

@@ -5985,7 +5985,8 @@ class MusicSynthPlugin(NekoPluginBase):
             return Ok(await asyncio.to_thread(
                 model_package.import_model_zip, src,
                 str(rec.get("name") or "voice.zip"),
-                str(self._pipeline.paths.get("ddsp_root") or "")))
+                str(self._pipeline.paths.get("ddsp_root") or ""),
+                self._ace_paths()["root"] / "loras"))
         finally:
             try:
                 src.unlink(missing_ok=True)

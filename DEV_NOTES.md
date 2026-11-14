@@ -1514,3 +1514,40 @@ typing-extensions, sympy …` 这些 pip 内部的下载/安装没有进度，�
   输出 `Progress 0 of 12608406` → `Progress 5505024 of 12608406`，格式与正则一致。
 - 两个文件 `compile` 通过。
 - 还没在真实安装里端到端跑过；本地安装目录已同步本版，需重启宿主生效。
+
+---
+
+## 0.2.46 发布：修 ffmpeg 路径导致的 WinError 2 + 引导页采集组件入口（2026-11-15）
+
+用户反馈：合成报 `FileNotFoundError: [WinError 2]`；引导页装 ffmpeg 失败；
+逐应用采集组件缺失提示无法在引导页处理。
+
+### 根因
+
+- `runtime._FFMPEG_HINTS` 里的 WinGet / Chocolatey / Program Files 路径被写坏了：
+  源码里的 `\f`、`\b` 变成了控制字符，`Linksfmpeg.exe`、`chocolateyin` 这类路径
+  永远不存在，`_find_ffmpeg()` 一直返回空。
+- 于是：引导页把 ffmpeg 判成缺失并去 pip 装 `imageio-ffmpeg`（它替代不了系统
+  ffmpeg）；ACE 的 vendor 代码（`audio_utils.py`）用裸名 `ffmpeg` 调外部程序时，
+  宿主 PATH 里没有 WinGet Links，直接 WinError 2。
+
+### 改法
+
+- 修正全部 ffmpeg 提示路径（补回反斜杠），`_find_ffmpeg()` 能真正找到。
+- `runtime._clean_env()`：找到 ffmpeg 后把其所在目录插到 worker PATH 最前面，
+  所有 worker（合成 / ACE / DDSP / 导入）里的裸名 `ffmpeg` 都能解析。
+- 引导页新增可选分项「逐应用声道采集组件（proc-tap / 系统媒体）」：
+  用 `runtime.locate_app_capture_runtime` 检测，缺失时可在引导页单独 pip 安装；
+  非必需，不阻塞其它安装。
+- `resolve_paths` 返回值补 `data_dir`，检测能拿到插件数据目录。
+- 原来挂在 `ddsp_deps` 分支里的采集包安装改为只由新分项触发，全量安装不会装两遍。
+- 声音包导入支持「原创音色」（ACE LoRA）包：含 `adapter_config.json` 的变体
+  装到 `acestep/loras/<variant>/`，缺配置或权重的变体跳过并给出原因。
+
+### 验证
+
+- CI 同参数 Ruff 通过；四个改动文件 compile 通过。
+- 另起干净 PATH 验证过：修复后 `_find_ffmpeg()` 能找到 ffmpeg，worker 子进程
+  能用裸名 `ffmpeg` 启动（由执行侧验证）。
+- 本地安装目录已同步；宿主需重启才会加载。
+- 导入进度条（大包解压/复制阶段）这次没有做，仍只在分片上传阶段有进度。

@@ -69,12 +69,15 @@ def export_model(ckpt, ddsp_root, base_ckpt, exports_dir) -> dict:
             "size_mb": round(out.stat().st_size / 1048576, 1)}
 
 
-def import_model_zip(src, uploaded_name, ddsp_root) -> dict:
+def import_model_zip(src, uploaded_name, ddsp_root, acestep_loras=None) -> dict:
     """Extract a voice package into ``<ddsp_root>/exp/<name>/``.
 
     Only ``config.yaml`` and one ``*.pt`` are written; everything else in the
     zip is ignored.  Path traversal, oversize archives and non-torch payloads
     are rejected before anything is written.
+
+    A 原创音色 (ACE LoRA) export has ``adapter_config.json`` inside its variant
+    folders instead; those go to ``acestep_loras`` when it is given.
     """
     src = Path(str(src))
     root = Path(str(ddsp_root or ""))
@@ -96,6 +99,9 @@ def import_model_zip(src, uploaded_name, ddsp_root) -> dict:
             if p.is_absolute() or ".." in p.parts:
                 return {"ok": False, "error": "声音包路径不安全，拒绝导入"}
             paths.append(p)
+        if acestep_loras is not None and any(
+                p.name == "adapter_config.json" for p in paths):
+            return _import_ace_lora(zf, infos, paths, uploaded_name, Path(str(acestep_loras)))
         cfg_idx = [k for k, p in enumerate(paths)
                    if p.name.lower() in ("config.yaml", "config.yml")]
         pt_idx = [k for k, p in enumerate(paths) if p.suffix.lower() == ".pt"]
@@ -151,3 +157,46 @@ def import_model_zip(src, uploaded_name, ddsp_root) -> dict:
         return {"ok": True, "name": dest.name, "exp_dir": dest.name,
                 "path": str(dest / pt_name), "steps": _steps(pt_name),
                 "size_mb": round((dest / pt_name).stat().st_size / 1048576, 1)}
+
+
+_ACE_LORA_FILES = ("adapter_config.json", "adapter_model.safetensors",
+                   "adapter_model.bin", "README.md")
+
+
+def _import_ace_lora(zf, infos, paths, uploaded_name, loras_root) -> dict:
+    """Install a 原创音色 export: each variant folder goes to ``loras/<variant>/``.
+
+    Only the adapter files are copied; a variant needs both its adapter config
+    and weights, otherwise it is skipped.  Existing folders are never overwritten.
+    """
+    variants: dict = {}
+    for k, p in enumerate(paths):
+        if p.name not in _ACE_LORA_FILES or len(p.parts) < 2:
+            continue
+        variants.setdefault(p.parent.name, []).append(k)
+    installed, skipped = [], []
+    for variant, idxs in variants.items():
+        names = {paths[k].name for k in idxs}
+        safe = _safe_name(variant, fallback="ace_lora")
+        if "adapter_config.json" not in names or not names & {
+                "adapter_model.safetensors", "adapter_model.bin"}:
+            skipped.append(f"{variant}（缺少 adapter 配置或权重）")
+            continue
+        dest = loras_root / safe
+        if dest.exists():
+            skipped.append(f"{variant}（已存在：{safe}）")
+            continue
+        try:
+            dest.mkdir(parents=True)
+            for k in idxs:
+                with zf.open(infos[k]) as rf, open(dest / paths[k].name, "wb") as wf:
+                    shutil.copyfileobj(rf, wf, 8 * 1024 * 1024)
+        except OSError as exc:
+            shutil.rmtree(dest, ignore_errors=True)
+            return {"ok": False, "error": f"安装原创音色失败：{exc}"}
+        installed.append(safe)
+    if not installed:
+        return {"ok": False, "error": "原创音色包里没有可安装的变体：" + "；".join(skipped)}
+    return {"ok": True, "name": installed[0], "exp_dir": installed[0],
+            "installed": installed, "skipped": skipped, "kind": "ace_lora",
+            "uploaded_name": Path(str(uploaded_name)).name}

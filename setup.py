@@ -1406,6 +1406,19 @@ def check_dependencies(paths: dict, probe: dict | None = None) -> dict:
             fix="" if deps_ok else "重装 librosa/pyworld/parselmouth/torchcrepe/transformers 等（走 pip 镜像）",
             size_gb=0.6, action="" if deps_ok else "pip:synth:deps"))
 
+    # 逐应用声道采集（proc-tap）+ 系统媒体（winrt）：缺了只是这两个功能不可用，
+    # 所以不是 required；但要在引导页给出入口，否则用户只能看到「采集不可用」。
+    if ddsp_exists:
+        cap = runtime.locate_app_capture_runtime(paths["data_dir"], str(ddsp_py))
+        cap_ok = bool(cap.get("ok"))
+        items.append(_item(
+            "capture_native", "逐应用声道采集组件（proc-tap / 系统媒体）",
+            "ready" if cap_ok else "missing",
+            (cap.get("source") or "") if cap_ok else (cap.get("error") or "未安装"),
+            required=False, installable=not cap_ok,
+            fix="" if cap_ok else "pip 装进合成环境：proc-tap==1.1.1、winrt-Windows.Media.Control",
+            size_gb=0.02, action="" if cap_ok else "pip:synth:capture"))
+
     # separation env -------------------------------------------------------
     sep_py = Path(paths["sep_python"])
     sep_exists = sep_py.is_file()
@@ -1884,11 +1897,12 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
             invalidate_deps_cache(synth_py)
         except Exception as exc:  # noqa: BLE001
             errors.append({"item": "ddsp_deps", "error": str(exc)})
-        # 市场不允许插件包携带 .pyd/.exe/.dll，逐应用采集（proc-tap）和系统媒体
-        # 信息（winrt）改用 pip 装进合成环境；缺了只是这两个功能不可用，不阻塞安装。
+    if "capture_native" in requested and synth_py.is_file():
+        # 逐应用采集（proc-tap）+ 系统媒体（winrt）：独立引导项，缺了不阻塞安装。
+        # 市场不允许插件包携带 .pyd/.exe/.dll，所以改用 pip 装进合成环境。
         try:
             _pip(synth_py, CAPTURE_NATIVE_PACKAGES, progress, "安装采集 / 系统媒体组件",
-                 head="安装 DDSP-SVC 依赖")
+                 head="逐应用声道采集组件（proc-tap / 系统媒体）")
             installed.append("capture_native")
         except Exception as exc:  # noqa: BLE001
             errors.append({"item": "capture_native", "error": str(exc)})
