@@ -34,6 +34,7 @@ from plugin.sdk.plugin import (
 from . import (
     cache_cleanup,
     claim_state,
+    error_log,
     lips_server,
     lipsync,
     model_package,
@@ -531,7 +532,14 @@ class MusicSynthPlugin(NekoPluginBase):
         }
 
     def _thread(self, name: str, target, *args) -> threading.Thread:
-        thread = threading.Thread(target=target, args=args, name=name, daemon=True)
+        def guarded(*a):
+            # 后台线程里的异常原来没人接，线程静默死掉；这里记下来再照常结束。
+            try:
+                target(*a)
+            except Exception as exc:  # noqa: BLE001
+                error_log.record_error(self._data_dir, f"thread:{name}", exc)
+
+        thread = threading.Thread(target=guarded, args=args, name=name, daemon=True)
         thread.start()
         return thread
 
@@ -548,6 +556,12 @@ class MusicSynthPlugin(NekoPluginBase):
         with self._jobs_lock:
             if job_id in self._jobs:
                 self._jobs[job_id].update(fields)
+                if fields.get("state") == "failed":
+                    # 失败作业多半已经被业务代码接住并显示成「没成功」，不会抛异常；
+                    # 这里把它的说明也记下来，才能事后查到是哪一步失败。
+                    error_log.record_error(
+                        self._data_dir, f"job:{job_id}",
+                        detail=str(fields.get("detail") or self._jobs[job_id].get("detail") or ""))
 
     # ── 真话口径：作业终态 / 对外说法（唯一口径见 claim_state.py）──────────
     # 反例（用户投诉「说假话」）：流水线因为录音只有 28 秒返回 blocked，但返回体
@@ -702,6 +716,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_state", name="为她而唱 · 状态",
                   description="读取档位判定、计算环境、曲目列表与产物路径（只读）",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_state(self, **_):
         try:
             link = await self._link_status()
@@ -727,6 +742,7 @@ class MusicSynthPlugin(NekoPluginBase):
                   input_schema={"type": "object", "properties": {
                       "track_id": {"type": "string"},
                       "text": {"type": "string"}}})
+    @error_log.logged_entry
     async def ms_claim_check(self, track_id: str = "", text: str = "", **_):
         tracks = self._pipeline.store.all()
         track = self._pipeline.store.get(str(track_id)) if track_id else (
@@ -794,6 +810,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "model": {"type": "string", "description": "ACE 模型名；留空=当前模型"},
                       "duration_s": {"type": "number"},
                       "batch": {"type": "integer"}}})
+    @error_log.logged_entry
     async def ms_vram_plan(self, model: str = "", duration_s: float = 60.0,
                            batch: int = 1, **_):
         probe = await asyncio.to_thread(runtime.probe_hardware, True)
@@ -812,6 +829,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_probe", name="为她而唱 · 重新探测硬件",
                   description="立即重新读取显卡型号/显存总量与空闲/内存/CUDA 计算能力，并给出本次执行参数",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_probe(self, **_):
         probe = await asyncio.to_thread(runtime.probe_hardware, True)
         paths = self._pipeline.paths
@@ -825,6 +843,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_env_check", name="为她而唱 · 环境体检",
                   description="逐项检查 Python/ffmpeg/驱动/torch/audio-separator/DDSP-SVC 仓库与预训练权重，返回精确缺失项与安装大小",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_env_check(self, **_):
         paths = self._reload_paths()
         report = await asyncio.to_thread(setup_mod.check_dependencies, paths)
@@ -845,6 +864,7 @@ class MusicSynthPlugin(NekoPluginBase):
                   description=("只读探测：代理是否真的可用、国内镜像（gh-proxy / ghfast / hf-mirror / 清华 PyPI）"
                                "能不能连上、各源速度多少。遇到下载慢或下不动时用，不会下载模型。"),
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_dl_diag(self, **_):
         diag = await asyncio.to_thread(setup_mod.diagnose_download_sources)
         return Ok(dict(diag, ok=True))
@@ -852,6 +872,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_setup_check", name="为她而唱 · 首次使用检测",
                   description="首次使用向导第 1 步：检测依赖与模型，输出已就绪/缺失/可选清单、下载大小与建议安装目录",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_setup_check(self, **_):
         paths = self._reload_paths()
         report = await asyncio.to_thread(setup_mod.check_dependencies, paths)
@@ -872,6 +893,7 @@ class MusicSynthPlugin(NekoPluginBase):
                                   "description": "true 表示开始一次新的选择（重复调用传 false 只等结果）"},
                       "cancel": {"type": "boolean",
                                  "description": "true 表示关掉还没选完的系统对话框并把状态复位"}}})
+    @error_log.logged_entry
     async def ms_setup_browse(self, start_path: str = "", title: str = "",
                               wait: float = 20.0, restart: bool = False,
                               cancel: bool = False, **_):
@@ -895,6 +917,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "base_python": {"type": "string"},
                       "download_source": {"type": "string", "enum": ["huggingface", "mirror"]},
                       "precision": {"type": "string", "enum": ["auto", "fp32", "fp16", "bf16"]}}})
+    @error_log.logged_entry
     async def ms_setup_install(self, path: str = "", items=None, base_python: str = "",
                                download_source: str = "", precision: str = "", **_):
         updates: dict = {}
@@ -1004,6 +1027,7 @@ class MusicSynthPlugin(NekoPluginBase):
                                "用于修复被中断的残缺文件"),
                   input_schema={"type": "object", "properties": {
                       "model": {"type": "string", "enum": ["ddsp_contentvec", "sep_karaoke"]}}})
+    @error_log.logged_entry
     async def ms_setup_redownload(self, model: str = "", **_):
         key = str(model or "").strip()
         if key not in setup_mod.REDOWNLOAD_KEYS:
@@ -1030,6 +1054,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_setup_status", name="为她而唱 · 安装进度",
                   description="读取首次使用检测结果与安装任务进度（只读）",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_setup_status(self, **_):
         with self._jobs_lock:
             job = dict(self._jobs.get(self._setup_job) or {}) if self._setup_job else {}
@@ -1157,6 +1182,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "precision": {"type": "string", "enum": ["auto", "fp32", "fp16", "bf16"]},
                       "max_parallel": {"type": "integer", "minimum": 0, "maximum": 4},
                       "download_source": {"type": "string", "enum": ["huggingface", "mirror"]}}})
+    @error_log.logged_entry
     async def ms_set_config(self, tier: str = "", sep_backend: str = "",
                             compute_root=None, envs_dir=None, models_dir=None,
                             work_dir=None, sep_model_dir=None,
@@ -1387,6 +1413,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "path": {"type": "string"},
                       "audio_base64": {"type": "string"},
                       "filename": {"type": "string"}}})
+    @error_log.logged_entry
     async def ms_set_timbre(self, path: str = "", audio_base64: str = "",
                             filename: str = "timbre.wav", **_):
         try:
@@ -1918,6 +1945,7 @@ class MusicSynthPlugin(NekoPluginBase):
                                "description": "按质量档位取底模（path 为空时生效）"},
                       "convert": {"type": "boolean",
                                   "description": "转换并保存成普通 {global_step, model} 检查点"}}})
+    @error_log.logged_entry
     async def ms_base_inspect(self, path: str = "", tier: str = "mid",
                               convert=False, **_):
         python = self._train_python()
@@ -1945,6 +1973,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_base_status", name="为她而唱 · 训练底模状态",
                   description="只读：查看低/中/高三个训练底模是否已安装",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_base_status(self, **_):
         tiers = {}
         for tier in ("low", "mid", "high"):
@@ -1963,6 +1992,7 @@ class MusicSynthPlugin(NekoPluginBase):
                   input_schema={"type": "object", "properties": {
                       "tier": {"type": "string", "enum": ["low", "high"]},
                       "force": {"type": "boolean"}}})
+    @error_log.logged_entry
     async def ms_base_download(self, tier: str = "", force=False, **_):
         tier = str(tier or "").strip().lower()
         if tier not in ("low", "high"):
@@ -2063,6 +2093,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "ace_batch": {"type": "integer", "minimum": 0, "maximum": 8},
                       "ace_accum": {"type": "integer", "minimum": 0, "maximum": 32},
                       "ace_max_duration": {"type": "number"}}})
+    @error_log.logged_entry
     async def ms_train_start(self, inputs=None, audio_base64: str = "", name: str = "",
                              has_accompaniment=False, preview_src: str = "",
                              init_from: str = "", milestones=None, auto=False,
@@ -2303,6 +2334,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_train_runs", name="为她而唱 · 训练任务列表",
                   description="列出所有训练任务（正在训练 / 等你选择 / 已结束）",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_train_runs(self, **_):
         root = self._train_runs_root()
         runs = []
@@ -2328,6 +2360,7 @@ class MusicSynthPlugin(NekoPluginBase):
                   description="查看一次训练：阶段、步数、下一里程碑、试听列表、系统建议（只读）",
                   input_schema={"type": "object", "properties": {
                       "run_id": {"type": "string"}}})
+    @error_log.logged_entry
     async def ms_train_status(self, run_id: str = "", **_):
         if not run_id:
             listed = await self.ms_train_runs()
@@ -2359,6 +2392,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "action": {"type": "string", "enum": ["continue", "stop"]},
                       "steps": {"type": "integer", "minimum": 0, "maximum": 500000}},
                       "required": ["run_id", "action"]})
+    @error_log.logged_entry
     async def ms_train_control(self, run_id: str = "", action: str = "", steps: int = 0, **_):
         action = str(action or "").strip().lower()
         if action not in runtime.TRAIN_ACTIONS:
@@ -2392,6 +2426,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "step": {"type": "integer", "minimum": 1},
                       "name": {"type": "string"},
                       "set_current": {"type": "boolean"}}})
+    @error_log.logged_entry
     async def ms_train_keep(self, run_id: str = "", step: int = 0, name: str = "",
                             set_current=False, **_):
         try:
@@ -2466,6 +2501,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "run_id": {"type": "string"},
                       "step": {"type": "integer", "minimum": 1}},
                       "required": ["run_id"]})
+    @error_log.logged_entry
     async def ms_train_preview(self, run_id: str = "", step: int = 0, **_):
         demo = self._bundled_voice(run_id)
         if demo:
@@ -2552,6 +2588,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_cache_report", name="为她而唱 · 磁盘空间",
                   description="只读：统计回收站、训练特征、曲目中间产物、试听缓存各占多少空间",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_cache_report(self, **_):
         settings = self._cache_settings()
         usage = await asyncio.to_thread(cache_cleanup.usage, self._cache_root())
@@ -2564,6 +2601,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_empty_trash", name="为她而唱 · 清空回收站",
                   description="删除回收站（_trash_*）里的全部内容，不看保留天数、不可恢复",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_empty_trash(self, **_):
         job_id = self._job_begin("trash")
 
@@ -2599,6 +2637,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "include_experiments": {"type": "boolean"},
                       "include_splits": {"type": "boolean"},
                       "include_exp_checkpoints": {"type": "boolean"}}})
+    @error_log.logged_entry
     async def ms_cache_cleanup(self, days: int = -1, dry_run: bool = True,
                                include_trash: bool = False,
                                include_train_data: bool = True,
@@ -2955,6 +2994,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_capture_status", name="为她而唱 · 采集状态",
                   description="只读：独立采集组件是否就绪、当前是联动还是独立模式、正在录什么",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_capture_status(self, **_):
         return Ok({"ok": True, "listener": self._song_listener.status(),
                    "runtime": runtime.locate_app_capture_runtime(self._data_dir, str(self._pipeline.paths.get("synth_python") or "")),
@@ -2963,6 +3003,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_capture_targets", name="为她而唱 · 可录的应用",
                   description="只读：列出可以采集声道的音乐/视频应用（视频会被规则排除）",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_capture_targets(self, **_):
         rows = await asyncio.to_thread(self._song_listener._scan_targets)
         selected = await self._capture_target_async(0)
@@ -2976,6 +3017,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_capture_install", name="为她而唱 · 安装独立采集组件",
                   description="把逐应用声道隔离运行环境复制到本插件（优先硬链接，不占额外空间）",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_capture_install(self, **_):
         job_id = self._job_begin("capture")
 
@@ -2998,6 +3040,7 @@ class MusicSynthPlugin(NekoPluginBase):
                   input_schema={"type": "object", "properties": {
                       "pid": {"type": "integer", "minimum": 0},
                       "exe_name": {"type": "string"}}})
+    @error_log.logged_entry
     async def ms_song_listen_start(self, pid: int = 0, exe_name: str = "", **_):
         target = await self._capture_target_async(int(pid or 0))
         if not target:
@@ -3016,6 +3059,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_song_listen_stop", name="为她而唱 · 停止听歌录制",
                   description="停止听歌录制；已经录完的歌保留，正在录的会先收尾",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_song_listen_stop(self, **_):
         return Ok(await asyncio.to_thread(self._song_listener.stop))
 
@@ -3043,6 +3087,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "when_ready": {"type": "boolean"},
                       "force": {"type": "boolean",
                                 "description": "纯音乐/残缺录音也想硬唱时才用"}}})
+    @error_log.logged_entry
     async def ms_sing_anchor(self, anchor: str = "current", track_id: str = "",
                              when_ready: bool = True, force: bool = False, **_):
         kind = ""
@@ -3114,6 +3159,7 @@ class MusicSynthPlugin(NekoPluginBase):
                   input_schema={"type": "object", "properties": {
                       "path": {"type": "string"}, "title": {"type": "string"},
                       "split": {"type": "boolean"}}})
+    @error_log.logged_entry
     async def ms_import(self, path: str = "", title: str = "", split: bool = False, **_):
         src = Path(path or "").expanduser()
         if not src.is_file():
@@ -3133,6 +3179,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "path": {"type": "string"},
                       "min_song_s": {"type": "number", "minimum": 8, "maximum": 300},
                       "silence_s": {"type": "number", "minimum": 0.3, "maximum": 10}}})
+    @error_log.logged_entry
     async def ms_split(self, path: str = "", min_song_s: float = 25.0,
                        silence_s: float = 2.0, **_):
         src = Path(path or "").expanduser()
@@ -3244,6 +3291,7 @@ class MusicSynthPlugin(NekoPluginBase):
                                 "description": "true=从头重唱；false=复用已完成的步骤"},
                       "post_engine": {"type": "string", "enum": ["", "ddsp", "soulx", "soulx_ddsp"],
                                       "description": "本次变声引擎；留空沿用曲目记录"}}})
+    @error_log.logged_entry
     async def ms_process_track(self, track_id: str = "", force: bool = False,
                                post_engine: str = "", **_):
         track = self._pipeline.store.get(track_id)
@@ -3309,6 +3357,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_now_playing", name="为她而唱 · 现在在放什么",
                   description="只读：不依赖为她所听，读取 Windows 媒体会话，返回歌名/作者/是否音乐/是否视频",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_now_playing(self, **_):
         info = await asyncio.to_thread(self._now_playing)
         try:
@@ -3417,6 +3466,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_identify", name="为她而唱 · 识歌校准",
                   description="读取当前媒体标题（SMTC 优先）与官方/识别歌词，校准指定曲目的歌名与歌词",
                   input_schema={"type": "object", "properties": {"track_id": {"type": "string"}}})
+    @error_log.logged_entry
     async def ms_identify(self, track_id: str = "", **_):
         info = await self._identify_current()
         if track_id:
@@ -4032,6 +4082,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_play", name="为她而唱 · 播放成品",
                   description="在本机播放某首曲目的成品 WAV（ffplay/winsound，不依赖默认程序关联）",
                   input_schema={"type": "object", "properties": {"track_id": {"type": "string"}}})
+    @error_log.logged_entry
     async def ms_play(self, track_id: str = "", **kwargs):
         if not track_id:
             # hosted-ui 转发时参数可能落在单个 "payload"/"args"/"input" 里，兜底解包
@@ -4087,6 +4138,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_track_audio", name="为她而唱 · 取成品音频",
                   description="把某首曲目的成品 WAV 读成 base64 交给面板在界面内播放（不拉起任何外部播放器）",
                   input_schema={"type": "object", "properties": {"track_id": {"type": "string"}}})
+    @error_log.logged_entry
     async def ms_track_audio(self, track_id: str = "", **_):
         """参数从面板经 hosted-ui 转发（实测会丢参数，面板因此改读 /runs 导出结果）。
 
@@ -4116,6 +4168,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_stop_playback", name="为她而唱 · 停止播放",
                   description="停止当前正在播放的成品",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_stop_playback(self, **_):
         self._stop_playback()
         return Ok({"ok": True})
@@ -4126,6 +4179,7 @@ class MusicSynthPlugin(NekoPluginBase):
                   input_schema={"type": "object", "properties": {
                       "track_id": {"type": "string"},
                       "rebuild": {"type": "boolean"}}})
+    @error_log.logged_entry
     async def ms_lips_status(self, track_id: str = "", rebuild: bool = False, **_):
         info = {"server": lips_server.status()}
         if not track_id:
@@ -4170,6 +4224,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "text": {"type": "string"},
                       "seconds": {"type": "number"},
                       "track_id": {"type": "string"}}})
+    @error_log.logged_entry
     async def ms_lips_preview(self, text: str = "", seconds: float = 12.0,
                               track_id: str = "", **_):
         if track_id:
@@ -4204,6 +4259,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "seed": {"type": "integer"},
                       "force": {"type": "boolean"},
                       "preset": {"type": "string"}}})
+    @error_log.logged_entry
     async def ms_show_build(self, track_id: str = "", seed=None,
                             force: bool = False, preset: str = "", **_):
         track_id = str(track_id or "").strip()
@@ -4256,6 +4312,7 @@ class MusicSynthPlugin(NekoPluginBase):
                   input_schema={"type": "object", "properties": {
                       "title": {"type": "string"}, "track_id": {"type": "string"},
                       "limit": {"type": "integer", "minimum": 1, "maximum": 5}}})
+    @error_log.logged_entry
     async def ms_sing(self, title: str = "", track_id: str = "", limit: int = 1, **_):
         """唱出来。有成品就直接放；点了名但还没唱过的，先把处理跑起来。
 
@@ -4370,6 +4427,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "track_id": {"type": "string"},
                       "delete_files": {"type": "boolean"}},
                       "required": ["track_id"]})
+    @error_log.logged_entry
     async def ms_delete_track(self, track_id: str = "", delete_files: bool = False, **_):
         """删除一首成品。delete_files=True 时把磁盘上的产物也移进回收站。"""
         track = self._pipeline.store.get(track_id)
@@ -4408,6 +4466,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "run_id": {"type": "string"},
                       "delete_files": {"type": "boolean"}},
                       "required": ["run_id"]})
+    @error_log.logged_entry
     async def ms_delete_run(self, run_id: str = "", delete_files: bool = False, **_):
         run_id = str(run_id or "").strip()
         if not runtime.valid_run_id(run_id):
@@ -4440,6 +4499,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "path": {"type": "string"},
                       "delete_files": {"type": "boolean"}},
                       "required": ["path"]})
+    @error_log.logged_entry
     async def ms_delete_model(self, path: str = "", delete_files: bool = False, **_):
         target = Path(str(path or ""))
         repo = self._train_repo()
@@ -4495,6 +4555,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_hw_profile", name="为她而唱 · 训练硬件探测",
                   description="探测 GPU/显存/CPU/内存，按档位给出训练 batch/num_workers/精度与分离 batch",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_hw_profile(self, **_):
         probe = await asyncio.to_thread(runtime.probe_hardware, True)
         gpu = probe.get("gpu") or {}
@@ -4562,6 +4623,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "steps": {"type": "integer", "minimum": 4000, "maximum": 200000},
                       "valid_s": {"type": "number", "minimum": 0},
                       "files_s": {"type": "number", "minimum": 0}}})
+    @error_log.logged_entry
     async def ms_corpus_requirements(self, steps: int = 0, valid_s: float = -1,
                                      files_s: float = -1, **_):
         try:
@@ -5212,6 +5274,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "data_b64": {"type": "string"},
                       "filename": {"type": "string"}},
                       "required": ["slot"]})
+    @error_log.logged_entry
     async def ms_corpus_add(self, slot: str = "song", path: str = "",
                             data_b64: str = "", filename: str = "input.wav", **_):
         slot = str(slot or "song").strip()
@@ -5405,6 +5468,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "slot": {"type": "string", "enum": ["song", "dry_sing", "speech"]},
                       "filename": {"type": "string"}},
                       "required": ["slot"]})
+    @error_log.logged_entry
     async def ms_corpus_upload_begin(self, slot: str = "song", filename: str = "input.wav", **_):
         slot = str(slot or "song").strip()
         if slot not in ("song", "dry_sing", "speech"):
@@ -5425,6 +5489,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "seq": {"type": "integer"},
                       "data_b64": {"type": "string"}},
                       "required": ["upload_id", "data_b64"]})
+    @error_log.logged_entry
     async def ms_corpus_upload_chunk(self, upload_id: str = "", seq: int = 0,
                                      data_b64: str = "", **_):
         with self._uploads_lock:
@@ -5446,6 +5511,7 @@ class MusicSynthPlugin(NekoPluginBase):
                   description="收尾分片上传：文件已经完整落在磁盘上，登记成一条投递任务",
                   input_schema={"type": "object", "properties": {"upload_id": {"type": "string"}},
                                 "required": ["upload_id"]})
+    @error_log.logged_entry
     async def ms_corpus_upload_end(self, upload_id: str = "", **_):
         with self._uploads_lock:
             rec = self._uploads.pop(str(upload_id), None)
@@ -5476,6 +5542,7 @@ class MusicSynthPlugin(NekoPluginBase):
                   description="把语料库目录里还没登记过的音频重新收进来处理（插件中断/重启后恢复用）",
                   input_schema={"type": "object", "properties": {
                       "slot": {"type": "string", "enum": ["song", "dry_sing", "speech"]}}})
+    @error_log.logged_entry
     async def ms_corpus_recover(self, slot: str = "", **_):
         # 文件多时要逐个 ffprobe，放到线程里跑，别堵住事件循环
         return await asyncio.to_thread(self._corpus_recover_sync, slot)
@@ -5527,6 +5594,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_corpus_job", name="为她而唱 · 语料任务进度",
                   description="读取某次投递任务的阶段/进度/错误",
                   input_schema={"type": "object", "properties": {"job_id": {"type": "string"}}})
+    @error_log.logged_entry
     async def ms_corpus_job(self, job_id: str = "", **_):
         with self._jobs_lock:
             job = dict(self._jobs.get(job_id) or {})
@@ -5537,6 +5605,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_corpus_list", name="为她而唱 · 语料库",
                   description="列出三个槽位的素材/切片/有效时长与质检结果",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_corpus_list(self, **_):
         index = self._corpus_index()
         view = self._corpus_scan(index)
@@ -5548,6 +5617,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "clip_id": {"type": "string"},
                       "action": {"type": "string", "enum": ["reject", "restore", "delete", "preview"]}},
                       "required": ["clip_id", "action"]})
+    @error_log.logged_entry
     async def ms_corpus_clip(self, clip_id: str = "", action: str = "", **_):
         action = str(action or "").strip().lower()
         if action not in ("reject", "restore", "delete", "preview"):
@@ -5600,6 +5670,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "source_id": {"type": "string"},
                       "slot": {"type": "string"}},
                       "required": []})
+    @error_log.logged_entry
     async def ms_corpus_reprocess(self, source_id: str = "", slot: str = "", **_):
         """重跑已有素材，不用重新上传。
 
@@ -5806,6 +5877,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_corpus_remove", name="为她而唱 · 移除素材源",
                   description="把某个 source_id 的原始音频/切片移入回收站并记录清单",
                   input_schema={"type": "object", "properties": {"source_id": {"type": "string"}}})
+    @error_log.logged_entry
     async def ms_corpus_remove(self, source_id: str = "", **_):
         return await asyncio.to_thread(self._corpus_remove_source, str(source_id or ""))
 
@@ -5815,6 +5887,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "source_ids": {"type": "array", "items": {"type": "string"}},
                       "slot": {"type": "string", "enum": ["song", "dry_sing", "speech"]},
                       "all": {"type": "boolean"}}})
+    @error_log.logged_entry
     async def ms_corpus_delete_sources(self, source_ids=None, slot: str = "", all=False, **_):
         ids = [str(x) for x in source_ids] if isinstance(source_ids, (list, tuple)) else []
         if not ids and not _as_bool(all):
@@ -5828,6 +5901,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "source_id": {"type": "string"},
                       "action": {"type": "string", "enum": ["preview", "hide", "show", "delete"]}},
                       "required": ["source_id", "action"]})
+    @error_log.logged_entry
     async def ms_corpus_source(self, source_id: str = "", action: str = "", **_):
         action = str(action or "").strip().lower()
         if action not in ("preview", "hide", "show", "delete"):
@@ -5867,6 +5941,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_set_active_model", name="为她而唱 · 切换当前音色模型",
                   description="把某个已训练好的 model_*.pt 设为当前变声模型（单独按钮，用户点才切换）",
                   input_schema={"type": "object", "properties": {"ckpt": {"type": "string"}}})
+    @error_log.logged_entry
     async def ms_set_active_model(self, ckpt: str = "", **_):
         ckpt = str(ckpt or "").strip()
         if not ckpt:
@@ -5905,6 +5980,7 @@ class MusicSynthPlugin(NekoPluginBase):
                   input_schema={"type": "object", "properties": {
                       "path": {"type": "string", "description": "model_*.pt 路径"}},
                       "required": ["path"]})
+    @error_log.logged_entry
     async def ms_export_model(self, path: str = "", **_):
         return Ok(await asyncio.to_thread(
             model_package.export_model, path,
@@ -5915,6 +5991,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_open_export_dir", name="为她而唱 · 打开导出文件夹",
                   description="在资源管理器里打开声音包的导出目录",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_open_export_dir(self, **_):
         folder = self._exports_dir()
         try:
@@ -5927,6 +6004,7 @@ class MusicSynthPlugin(NekoPluginBase):
                   description="开一个声音包分片上传会话；只接受 .zip（内含 model_*.pt 和 config.yaml）",
                   input_schema={"type": "object", "properties": {
                       "filename": {"type": "string"}}})
+    @error_log.logged_entry
     async def ms_model_import_begin(self, filename: str = "voice.zip", **_):
         name = Path(str(filename or "voice.zip")).name
         if Path(name).suffix.lower() != ".zip":
@@ -5950,6 +6028,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "seq": {"type": "integer"},
                       "data_b64": {"type": "string"}},
                       "required": ["upload_id", "data_b64"]})
+    @error_log.logged_entry
     async def ms_model_import_chunk(self, upload_id: str = "", seq: int = 0,
                                     data_b64: str = "", **_):
         with self._uploads_lock:
@@ -5973,6 +6052,7 @@ class MusicSynthPlugin(NekoPluginBase):
                   description="收尾上传并安装声音包；成功后出现在「我的声音」列表里",
                   input_schema={"type": "object", "properties": {"upload_id": {"type": "string"}},
                                 "required": ["upload_id"]})
+    @error_log.logged_entry
     async def ms_model_import_end(self, upload_id: str = "", **_):
         with self._uploads_lock:
             rec = self._model_uploads.pop(str(upload_id), None)
@@ -6177,6 +6257,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_soulx_status", name="为她而唱 · SoulX 环境",
                   description="只读：检查 SoulX-Singer SVC 的代码、权重、音高模型和音色样本",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_soulx_status(self, **_):
         p = self._soulx_paths()
         problems = self._soulx_problems()
@@ -6187,6 +6268,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_soulx_install", name="为她而唱 · 安装 SoulX-Singer",
                   description="下载 SoulX-SVC 权重、RMVPE 与运行环境（后台；可断点续传）",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_soulx_install(self, **_):
         if not self._pipeline.paths.get("configured"):
             return Ok({"ok": False,
@@ -6499,6 +6581,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_ace_status", name="为她而唱 · 原创生成环境",
                   description="只读：检查 ACE 环境、模型与代码是否就绪",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_ace_status(self, **_):
         p = self._ace_paths()
         model = self._ace_selected_model()
@@ -6554,6 +6637,7 @@ class MusicSynthPlugin(NekoPluginBase):
                                 "description": "例如 acestep-v15-xl-turbo"},
                       "force": {"type": "boolean",
                                 "description": "配置不够时仍然安装"}}})
+    @error_log.logged_entry
     async def ms_ace_download(self, model: str = "", force=False, **_):
         if not self._pipeline.paths.get("configured"):
             return Ok({"ok": False,
@@ -6673,6 +6757,7 @@ class MusicSynthPlugin(NekoPluginBase):
                   input_schema={"type": "object", "properties": {
                       "model": {"type": "string",
                                 "description": "例如 acestep-v15-xl-sft"}}})
+    @error_log.logged_entry
     async def ms_ace_delete_model(self, model: str = "", **_):
         p = self._ace_paths()
         name = Path(str(model or "").strip()).name
@@ -6728,6 +6813,7 @@ class MusicSynthPlugin(NekoPluginBase):
                                                 "fp8_weight_only"],
                                        "description": "量化策略：auto=按显存自动（小卡自动 int8），off=不量化，int8=权重量化（显存减半）"},
                       "lora": {"type": "string", "description": "ACE 音色 LoRA 名字；留空=默认音色"}}})
+    @error_log.logged_entry
     async def ms_ace_generate(self, prompt: str = "", lyrics: str = "", name: str = "",
                               duration: int = 0, bpm: int = 0, language: str = "auto",
                               instrumental=False, auto_sing=False, post_sing=False,
@@ -7074,6 +7160,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_ace_job", name="为她而唱 · 原创生成进度",
                   description="查询一次原创生成任务的状态",
                   input_schema={"type": "object", "properties": {"job_id": {"type": "string"}}})
+    @error_log.logged_entry
     async def ms_ace_job(self, job_id: str = "", **_):
         with self._jobs_lock:
             job = dict(self._jobs.get(str(job_id)) or {})
@@ -7082,6 +7169,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_ace_loras", name="为她而唱 · ACE 音色列表",
                   description="列出已经训练好的 ACE 音色 LoRA",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_ace_loras(self, **_):
         return Ok({"ok": True, "loras": self._ace_loras()})
 
@@ -7089,6 +7177,7 @@ class MusicSynthPlugin(NekoPluginBase):
                   description="把某个原创歌曲音色设为默认；生成时按所选模型自动挑对应变体",
                   input_schema={"type": "object", "properties": {
                       "name": {"type": "string"}}})
+    @error_log.logged_entry
     async def ms_ace_set_lora(self, name: str = "", **_):
         group = self._ace_lora_group(name)
         if not group:
@@ -7103,6 +7192,7 @@ class MusicSynthPlugin(NekoPluginBase):
                   input_schema={"type": "object", "properties": {
                       "name": {"type": "string"},
                       "delete_files": {"type": "boolean"}}})
+    @error_log.logged_entry
     async def ms_ace_delete_lora(self, name: str = "", delete_files=True, **_):
         group = self._ace_lora_group(name)
         if not group:
@@ -7127,6 +7217,7 @@ class MusicSynthPlugin(NekoPluginBase):
                   description="把某个原创歌曲音色的所有底模变体打包成 zip，放到导出目录",
                   input_schema={"type": "object", "properties": {
                       "name": {"type": "string"}}})
+    @error_log.logged_entry
     async def ms_ace_export_lora(self, name: str = "", **_):
         group = self._ace_lora_group(name)
         if not group:
@@ -7157,6 +7248,7 @@ class MusicSynthPlugin(NekoPluginBase):
                   input_schema={"type": "object", "properties": {
                       "name": {"type": "string"},
                       "model": {"type": "string"}}})
+    @error_log.logged_entry
     async def ms_ace_preview(self, name: str = "", model: str = "", **_):
         demo = self._bundled_voice(name)
         if demo:
@@ -7269,6 +7361,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "max_duration": {"type": "number"},
                       "max_clips": {"type": "integer", "minimum": 0, "maximum": 2000,
                                     "description": "调试/快速试训：只用前 N 段素材；0=全部"}}})
+    @error_log.logged_entry
     async def ms_ace_train(self, name: str = "", models=None,
                            epochs: int = 0, rank: int = 0, alpha: int = 0,
                            batch: int = 0, gradient_accumulation: int = 0,
@@ -7428,6 +7521,7 @@ class MusicSynthPlugin(NekoPluginBase):
     @plugin_entry(id="ms_ace_install", name="为她而唱 · 安装 ACE 依赖",
                   description="把 ACE 需要的 Python 依赖装到计算根目录的 acestep\\pylibs（模型用 ms_ace_download 单独下载）",
                   input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
     async def ms_ace_install(self, **_):
         if not self._pipeline.paths.get("configured"):
             return Ok({"ok": False,

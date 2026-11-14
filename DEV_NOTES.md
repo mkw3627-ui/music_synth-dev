@@ -1578,3 +1578,29 @@ typing-extensions, sympy …` 这些 pip 内部的下载/安装没有进度，�
 - 缺失时 `capture_native` 为 `installable=True`，`install()` 会以
   `proc-tap==1.1.1`、`winrt-Windows.Media.Control` 调用 pip（pip 为桩，未真装）。
 - 本地安装目录已同步；宿主需重启才会加载。
+
+---
+
+## 0.2.48 发布：全量错误日志 data/errors.log（2026-11-15）
+
+用户反馈：合成报 `FileNotFoundError: [WinError 2]`，但日志里找不到这条记录，
+无法定位。
+
+### 改法
+
+- 新增 `error_log.py`：把错误追加到插件数据目录的 `data/errors.log`，
+  每条带时间、来源（入口 / 线程 / 作业）和完整堆栈；写日志失败静默跳过，
+  绝不影响原来的错误。
+- **80 个插件入口**统一加 `@error_log.logged_entry`：入口抛出的异常先记日志再
+  照常抛出，行为不变。
+- **后台线程**：`_thread()` 包一层，线程里的异常不再静默消失。
+- **失败作业**：`_job_update()` 在状态转 `failed` 时把 detail 记进日志
+  （很多失败被业务代码接住，不会抛异常，只能从这里拿说明）。
+- `__init__.py` 的导入顺序按 CI 的 Ruff 规则整理。
+
+### 披露
+
+- 代码里约 123 处 `except Exception` 会把异常吞掉，那些不会经过入口包装；
+  如果某个错误日志里没有，多半属于这一类。
+- `errors.log` 只追加、不轮转，长期运行会变大。
+- 本地安装目录已同步；需重启宿主加载。
