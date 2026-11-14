@@ -1342,3 +1342,36 @@ g39~g41 一直在修「人声驱动的全身」，但用户看到的**身体上�
   新版本不再出 3.10），所以这台机器上会装 3.11；插件的 `find_base_python`
   和依赖都接受 3.11，torch cu128 也有 cp311 轮子。
 - 没有在真实受限网络上复跑完整安装；镜像可用性用 Range 请求实测过（206）。
+
+---
+
+## 0.2.40 发布：修便携版 Python 的 IncompleteRead（2026-11-15）
+
+用户实测报错：
+`base_python: IncompleteRead: IncompleteRead(294912 bytes read)`，随后
+`synth_env` / `sep_env` / 三个底模转换全部连锁失败。
+
+### 根因
+
+`download_portable_python` 在下载前会去 `api.github.com` 查 python-build-standalone
+的最新 release。这个 JSON 有几百 KB，国内线路在 294912 字节处被截断，而那段
+`resp.read()` 的 except 只兜了 `OSError / ValueError / URLError`，没兜
+`http.client.IncompleteRead`（它是 `HTTPException` 的子类），异常直接冲出去，
+整个基础 Python 安装失败。
+
+### 改法
+
+- **删掉 api.github.com 查询**：那个请求最多只能换来「更新的版本号」，却引入
+  几百 KB 的下载和一类新故障。现在按「NJU 镜像目录 → 固定版本（走 gh 镜像链）」
+  两档走。
+- 镜像目录页读取改成 `except Exception` 兜底（它只是用来挑版本的，失败就退回固定版本）。
+- `_download_file` 增加**同源断点续传**：连接中断（IncompleteRead / 连接重置）时，
+  如果 `.part` 已经落了一部分，就同一个源带 Range 接着下，最多重试两次，再换源。
+  以前一断就换下一个源，等于从头再来。
+- 下载完整性仍按 Content-Length 对账，截断包不会被当成成品。
+
+### 验证
+
+- 本地起了个「首个连接只发一半就断」的 HTTP 服务做回归：第一轮检测到
+  512000/1024000，自动同源续传后拿到完整 1 MB，逐字节一致。
+- CI：Ruff、check --release 通过。

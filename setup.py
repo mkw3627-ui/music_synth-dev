@@ -464,10 +464,13 @@ def _download_file(url: str, target: Path, progress, label: str,
     """Resumable download with mirrors, dead-proxy bypass and slow-source failover."""
     errors: list[str] = []
     proxy_retried = False
+    part = target.with_name(target.name + ".part")
     for candidate in _mirror_urls(url):
         # 镜像只给一半的超时：某个镜像挂了别让用户等满 120 秒，快速换下一个。
         wait = timeout if candidate == url else min(timeout, 45.0)
+        resume_tries = 0
         while True:
+            before = part.stat().st_size if part.exists() else 0
             try:
                 _download_one(candidate, target, progress, label, expected_bytes, wait)
                 if candidate != url:
@@ -477,6 +480,13 @@ def _download_file(url: str, target: Path, progress, label: str,
                     http.client.HTTPException, RuntimeError) as exc:
                 errors.append(f"{urllib.parse.urlsplit(candidate).hostname}: {exc}")
                 _say(f"{label}: {errors[-1][:160]}，换源重试")
+                after = part.stat().st_size if part.exists() else 0
+                # 连接被掐断（IncompleteRead / 连接重置）时 .part 已经落了一部分，
+                # 同一个源接着下比从头换源快得多。最多续传两次，避免死循环。
+                if after > before and resume_tries < 2:
+                    resume_tries += 1
+                    _say(f"{label}: 连接中断，同源断点续传（已有 {after / 2**20:.1f} MB）")
+                    continue
                 if not proxy_retried and _dead_proxy_detected(exc):
                     # 插件启动时代理还活着、之后被关掉：清缓存直连，同一个源再试一次。
                     proxy_retried = True
@@ -553,7 +563,7 @@ def _standalone_mirror_url() -> str:
     try:
         with _opener().open(PYTHON_STANDALONE_MIRROR + "/LatestRelease/", timeout=10) as resp:
             html = resp.read().decode("utf-8", "replace")
-    except (OSError, urllib.error.URLError, http.client.HTTPException):
+    except Exception:  # noqa: BLE001 - 目录页只是「挑版本」用的，任何失败都退回固定版本
         return ""
     name_pat = re.compile(
         r"^cpython-3\.(?:10|11|12)\.\d+\+\d+-x86_64-pc-windows-msvc-"
@@ -592,25 +602,10 @@ def download_portable_python(paths: dict, progress) -> str:
     mirror = _standalone_mirror_url()
     if mirror:
         candidates.append(mirror)
-    url = ""
-    try:
-        api = urllib.request.Request(
-            "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest",
-            headers={"User-Agent": "NEKO-music-synth/0.2", "Accept": "application/vnd.github+json"})
-        # 国内 api.github.com 基本连不通：只等 6 秒就走固定版本号（下载走镜像链），
-        # 不让「查最新版」这一步拖住整个安装。
-        with _opener().open(api, timeout=6) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        pattern = re.compile(r"cpython-3\.(?:10|11|12)\.\d+\+.*x86_64-pc-windows-msvc-(?:shared-)?install_only\.tar\.gz$")
-        for asset in data.get("assets") or []:
-            if pattern.search(asset.get("name", "")):
-                url = asset.get("browser_download_url", "")
-                break
-    except (OSError, ValueError, urllib.error.URLError):
-        url = ""
-    if not url:
-        url = PYTHON_STANDALONE_PINNED
-    candidates.append(url)
+    # 不再去 api.github.com 查最新版：那个 JSON 有几百 KB，国内线路被截断时
+    # 会抛 IncompleteRead（2026-11-15 用户实测 294912 字节处断），而且最多只能
+    # 换来一个「更新的版本号」。镜像优先，失败就用固定版本走 gh 镜像链。
+    candidates.append(PYTHON_STANDALONE_PINNED)
 
     archive = Path(paths["compute_root"]) / "runtime" / "python-standalone.tar.gz"
     errors: list[str] = []
