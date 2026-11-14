@@ -258,6 +258,9 @@ def _dead_proxy_text(text: str) -> bool:
 # 但整个安装过程最多等这么久，避免离线时无限挂起。
 NET_WAIT_BUDGET_S = 15 * 60.0
 _NET_BUDGET = {"left": NET_WAIT_BUDGET_S}
+# 哪些源忽略 Range（不支持断点续传）：有 .part 续传需求时优先跳过它们，
+# 避免「已经下了一半」被一个 200 响应打回 0 重新下载。
+_NO_RANGE_HOSTS: set[str] = set()
 _NET_HINTS = (
     "timed out", "timeout", "connection", "reset", "ssl", "tls", "eof",
     "incompleteread", "broken pipe", "getaddrinfo", "name or service",
@@ -269,6 +272,8 @@ _NET_HINTS = (
 
 def reset_network_budget(seconds: float = NET_WAIT_BUDGET_S) -> None:
     _NET_BUDGET["left"] = float(seconds)
+    # 新一次安装重新给每个源一次机会（上次的「不支持续传」可能只是临时抽风）。
+    _NO_RANGE_HOSTS.clear()
 
 
 def _network_down_error(exc: BaseException | str) -> bool:
@@ -504,7 +509,18 @@ def _download_file(url: str, target: Path, progress, label: str,
     while True:
         round_no += 1
         network_only = True
-        for candidate in _mirror_urls(url):
+        candidates = _mirror_urls(url)
+        if part.exists() and part.stat().st_size > 0:
+            # 有已下载的部分：优先挑支持 Range 的源续传，别让「不支持续传」的源
+            # 用一个完整 200 响应把进度打回 0。
+            ranged = [c for c in candidates
+                      if (urllib.parse.urlsplit(c).hostname or "").lower() not in _NO_RANGE_HOSTS]
+            if ranged:
+                candidates = ranged
+            else:
+                part.unlink(missing_ok=True)
+                _NO_RANGE_HOSTS.clear()
+        for candidate in candidates:
             # 镜像只给一半的超时：某个镜像挂了别让用户等满 120 秒，快速换下一个。
             wait = timeout if candidate == url else min(timeout, 45.0)
             resume_tries = 0
@@ -572,8 +588,11 @@ def _download_one(url: str, target: Path, progress, label: str,
     with resp:
         status = getattr(resp, "status", 200)
         if status == 200 and pos:
-            pos = 0  # server ignored Range: restart cleanly
-            part.unlink(missing_ok=True)
+            # 这个源忽略了 Range：不能追加，否则文件会坏。保留 .part（已下的部分），
+            # 记下这个 host，让上层换一个支持断点续传的源，别把进度扔掉重下。
+            host = (urllib.parse.urlsplit(url).hostname or "").lower()
+            _NO_RANGE_HOSTS.add(host)
+            raise RuntimeError(f"{host} 不支持断点续传（忽略 Range）")
         total = int(resp.headers.get("Content-Length") or 0) + pos
         mode = "ab" if pos else "wb"
         done = pos
