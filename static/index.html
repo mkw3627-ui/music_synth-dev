@@ -441,7 +441,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     return h("button", p, kids);
   }
 
-  // ../../.neko-plugin-installations/plugins/music_synth/ui/api.ts
+  // ../../music_synth-dev/ui/api.ts
   var ORIGIN = "http://127.0.0.1:48916";
   var PLUGIN_ID = "music_synth";
   function sleep(ms) {
@@ -689,7 +689,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
   var jsx = withKey;
   var jsxs = withKey;
 
-  // ../../.neko-plugin-installations/plugins/music_synth/ui/ui.tsx
+  // ../../music_synth-dev/ui/ui.tsx
   var BRAND = "#e02d76";
   var BRAND_SOFT = "#ffe5ef";
   var BRAND_DEEP = "#9c204e";
@@ -1114,7 +1114,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     return (n / 3600).toFixed(1) + " 小时";
   }
 
-  // ../../.neko-plugin-installations/plugins/music_synth/ui/materials.ts
+  // ../../music_synth-dev/ui/materials.ts
   var MATERIALS = [
     {
       slot: "song",
@@ -1384,7 +1384,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     return s;
   }
 
-  // ../../.neko-plugin-installations/plugins/music_synth/ui/trainModel.ts
+  // ../../music_synth-dev/ui/trainModel.ts
   var SLOTS = [
     {
       key: "song",
@@ -1577,7 +1577,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     return p;
   }
 
-  // ../../.neko-plugin-installations/plugins/music_synth/ui/pageStart.tsx
+  // ../../music_synth-dev/ui/pageStart.tsx
   function greeting() {
     const h2 = (/* @__PURE__ */ new Date()).getHours();
     if (h2 < 5) return "这么晚还没睡呀";
@@ -1692,7 +1692,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
   }
 
-  // ../../.neko-plugin-installations/plugins/music_synth/ui/sourceList.tsx
+  // ../../music_synth-dev/ui/sourceList.tsx
   var DANGER = { color: "#c93c3c", borderColor: "rgba(201,60,60,0.28)" };
   function innerOf(f) {
     return f && Array.isArray(f.files) && f.files.length ? f.files[0] : f;
@@ -1921,7 +1921,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
   }
 
-  // ../../.neko-plugin-installations/plugins/music_synth/ui/pageMaterials.tsx
+  // ../../music_synth-dev/ui/pageMaterials.tsx
   var LANGS = ["中文", "日语", "英语", "其他语言"];
   function PageMaterials(props) {
     const { api, onGo } = props;
@@ -2168,7 +2168,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
   }
 
-  // ../../.neko-plugin-installations/plugins/music_synth/ui/pageTrain.tsx
+  // ../../music_synth-dev/ui/pageTrain.tsx
   var STEP_NAMES = ["放素材", "训练设置", "看着她唱", "保存声音"];
   var ENDED = ["finished", "failed", "stopped"];
   var ACTIVE_PHASES = ["training", "preparing", "preprocessing", "previewing"];
@@ -3228,7 +3228,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
   }
 
-  // ../../.neko-plugin-installations/plugins/music_synth/ui/pageModels.tsx
+  // ../../music_synth-dev/ui/pageModels.tsx
   function PageModels(props) {
     const { api, snap, onRefresh } = props;
     const s = snap || {};
@@ -3547,7 +3547,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
   }
 
-  // ../../.neko-plugin-installations/plugins/music_synth/ui/pageSing.tsx
+  // ../../music_synth-dev/ui/pageSing.tsx
   var PHASE = {
     pending: ["等下就处理", "neutral"],
     waiting: ["等下就处理", "neutral"],
@@ -3879,7 +3879,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
   }
 
-  // ../../.neko-plugin-installations/plugins/music_synth/ui/pageCreate.tsx
+  // ../../music_synth-dev/ui/pageCreate.tsx
   var TA_STYLE = {
     border: "1px solid transparent",
     borderRadius: 12,
@@ -4545,7 +4545,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
   }
 
-  // ../../.neko-plugin-installations/plugins/music_synth/ui/pageSettings.tsx
+  // ../../music_synth-dev/ui/pageSettings.tsx
   function tierWord(plan) {
     const t = String(plan && plan.tier || "");
     if (t === "high") return { text: "很好 · 又快又细", tone: "success" };
@@ -5283,7 +5283,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
   }
 
-  // ../../.neko-plugin-installations/plugins/music_synth/ui/onboarding.tsx
+  // ../../music_synth-dev/ui/onboarding.tsx
   var STEPS = ["体验", "功能", "用法", "环境", "开始"];
   var STEP_TITLES = ["先听听效果", "她能做什么", "怎么用", "准备运行环境", "准备完成"];
   var REDOWNLOAD_KEYS = ["ddsp_contentvec", "sep_karaoke"];
@@ -6035,7 +6035,11 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
             ))
           ] }) : null
         ] }) : null,
-        /* @__PURE__ */ jsx("div", { style: { display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }, children: !path.trim() ? /* @__PURE__ */ jsx(StatusBadge, { tone: "warning", children: "请先填写安装目录，否则不会开始下载" }) : freeGb !== null ? lack ? /* @__PURE__ */ jsxs(StatusBadge, { tone: "error", children: [
+        /* @__PURE__ */ jsx("div", { style: { display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }, children: !path.trim() ? /* @__PURE__ */ jsx(StatusBadge, { tone: "warning", children: "请先填写安装目录，否则不会开始下载" }) : needsPath ? freeGb !== null ? /* @__PURE__ */ jsxs(StatusBadge, { tone: "success", children: [
+          "这个盘还剩 ",
+          freeGb.toFixed(1),
+          " GB · 点下面的「用这个目录开始安装」"
+        ] }) : /* @__PURE__ */ jsx(StatusBadge, { tone: "neutral", children: "目录已填 · 点下面的「用这个目录开始安装」" }) : freeGb !== null ? lack ? /* @__PURE__ */ jsxs(StatusBadge, { tone: "error", children: [
           "这个盘只剩 ",
           freeGb.toFixed(1),
           " GB，还要约 ",
@@ -6176,13 +6180,13 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between", alignItems: "center" }, children: [
             /* @__PURE__ */ jsx(Btn, { style: ghostBtn, onClick: () => setStep(3), disabled: installing, children: "上一步" }),
             /* @__PURE__ */ jsxs(Row, { style: { gap: 10 }, children: [
-              !items.some((i) => i.installable && i.status !== "ready") ? null : /* @__PURE__ */ jsx(
+              !items.some((i) => i.installable && i.status !== "ready") && !(needsPath && !!path.trim()) ? null : /* @__PURE__ */ jsx(
                 Btn,
                 {
                   style: primaryBtn,
-                  disabled: !!busy || installing || !path.trim() || lack || !items.some((i) => i.installable && i.status !== "ready"),
+                  disabled: !!busy || installing || !path.trim() || lack,
                   onClick: () => startInstall(),
-                  children: installing ? "正在安装…" : busy === "all" ? "正在启动…" : needGb > 0 ? "一键安装全部" : "安装可选项"
+                  children: installing ? "正在安装…" : busy === "all" ? "正在启动…" : needsPath ? "用这个目录开始安装" : needGb > 0 ? "一键安装全部" : "安装可选项"
                 }
               ),
               /* @__PURE__ */ jsx(Btn, { style: canNext ? primaryBtn : ghostBtn, disabled: !canNext || installing, onClick: () => setStep(5), children: canNext ? "下一步：开始使用 →" : "装好后继续" })
@@ -6194,7 +6198,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
   }
 
-  // ../../.neko-plugin-installations/plugins/music_synth/ui/panel.tsx
+  // ../../music_synth-dev/ui/panel.tsx
   function wizardStartAt() {
     try {
       const q = String(window.location && window.location.search || "");

@@ -708,6 +708,10 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
           {!path.trim() ? (
             <StatusBadge tone="warning">请先填写安装目录，否则不会开始下载</StatusBadge>
+          ) : needsPath ? (
+            freeGb !== null
+              ? <StatusBadge tone="success">这个盘还剩 {freeGb.toFixed(1)} GB · 点下面的「用这个目录开始安装」</StatusBadge>
+              : <StatusBadge tone="neutral">目录已填 · 点下面的「用这个目录开始安装」</StatusBadge>
           ) : freeGb !== null ? (
             lack
               ? <StatusBadge tone="error">这个盘只剩 {freeGb.toFixed(1)} GB，还要约 {needGb} GB，换一个盘吧</StatusBadge>
@@ -875,11 +879,13 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
               <Row style={{ justifyContent: "space-between", alignItems: "center" }}>
                 <Btn style={ghostBtn} onClick={() => setStep(3)} disabled={installing}>上一步</Btn>
                 <Row style={{ gap: 10 }}>
-                  {/* 必需项齐了也能补装可选档位，所以这里只看「有没有可装的东西」，不看 allReady */}
-                  {!items.some((i: Item) => i.installable && i.status !== "ready") ? null : (
-                    <Btn style={primaryBtn} disabled={!!busy || installing || !path.trim() || lack || !items.some((i: Item) => i.installable && i.status !== "ready")}
+                  {/* 必需项齐了也能补装可选档位，所以这里只看「有没有可装的东西」，不看 allReady。
+                      还没保存安装目录时清单里只剩 install_path 一项（不可安装），
+                      这时也要给按钮：它会把目录写进配置再开始安装。 */}
+                  {!items.some((i: Item) => i.installable && i.status !== "ready") && !(needsPath && !!path.trim()) ? null : (
+                    <Btn style={primaryBtn} disabled={!!busy || installing || !path.trim() || lack}
                          onClick={() => startInstall()}>
-                      {installing ? "正在安装…" : busy === "all" ? "正在启动…" : needGb > 0 ? "一键安装全部" : "安装可选项"}
+                      {installing ? "正在安装…" : busy === "all" ? "正在启动…" : needsPath ? "用这个目录开始安装" : needGb > 0 ? "一键安装全部" : "安装可选项"}
                     </Btn>
                   )}
                   <Btn style={canNext ? primaryBtn : ghostBtn} disabled={!canNext || installing} onClick={() => setStep(5)}>
