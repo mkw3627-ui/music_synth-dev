@@ -76,6 +76,9 @@ _LAST_ERROR = ""
 _SHOWS: dict[str, str] = {}      # track_id -> show.json 绝对路径
 _SHOW_ROOT = ""                  # <work>；兜底找 <work>/tracks/<id>/show.json
 _STATIC_ROOTS: list[str] = []    # static/stage、static/fonts（绝对路径）
+# 试听缓存：放在插件数据目录的 preview/ 下，不放插件安装目录。
+# 插件目录里的文件在宿主升级替换时可能被占用，导致「替换文件」失败。
+_PREVIEW_ROOT = ""
 _TRACK_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _MIME = {
     ".js": "text/javascript; charset=utf-8",
@@ -360,6 +363,23 @@ def set_static_roots(*roots: str | os.PathLike) -> None:
         _STATIC_ROOTS[:] = cleaned
 
 
+def set_preview_root(path: str | os.PathLike) -> None:
+    """登记试听缓存目录（插件数据目录下的 preview/）。只读、只发单层文件名。"""
+    global _PREVIEW_ROOT
+    try:
+        text = str(Path(path).expanduser().resolve()) if str(path or "").strip() else ""
+    except (OSError, ValueError):
+        text = ""
+    with _LOCK:
+        _PREVIEW_ROOT = text
+
+
+def base_url() -> str:
+    """当前口型服务的根地址；没起来时返回空串。"""
+    port = _port()
+    return f"http://127.0.0.1:{port}" if port else ""
+
+
 def set_show(track_id: str, path: str | os.PathLike) -> dict:
     """登记某首歌的 show.json（换歌时调一次，/show.json 直接发它）。"""
     tid = str(track_id or "").strip()
@@ -510,6 +530,18 @@ class _Handler(BaseHTTPRequestHandler):
         if not path or size <= 0:
             self._send(404, b'{"ok": false, "error": "no audio"}')
             return
+        self._send_file(path, "audio/wav", size)
+
+    def _send_file(self, path: str, content_type: str, size: int | None = None) -> None:
+        """按 Range 分块发一个本地文件（成品/干声 WAV、试听缓存）。"""
+        if size is None:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+        if size <= 0:
+            self._send(404, b'{"ok": false, "error": "no audio"}')
+            return
         start, end = 0, size - 1
         rng = self.headers.get("Range") or ""
         if rng.startswith("bytes="):
@@ -528,7 +560,7 @@ class _Handler(BaseHTTPRequestHandler):
         length = end - start + 1
         partial = bool(rng)
         self.send_response(206 if partial else 200)
-        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Type", content_type)
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
         if partial:
@@ -548,6 +580,30 @@ class _Handler(BaseHTTPRequestHandler):
                     remaining -= len(chunk)
         except OSError:
             pass
+
+    def _serve_preview(self, rel: str) -> None:
+        """``/preview/<file>``：只发数据目录 preview/ 里的试听缓存（单层文件名）。"""
+        name = unquote(str(rel or ""))
+        if (not name or "/" in name or "\\" in name or "\x00" in name
+                or name in (".", "..") or re.match(r"^[A-Za-z]:", name)):
+            self._send(403, b'{"ok": false, "error": "bad path"}')
+            return
+        with _LOCK:
+            root = _PREVIEW_ROOT
+        if not root:
+            self._send(404, b'{"ok": false, "error": "no preview root"}')
+            return
+        try:
+            base = Path(root).resolve()
+            cand = (base / name).resolve()
+        except (OSError, ValueError):
+            self._send(404, b'{"ok": false, "error": "not found"}')
+            return
+        if cand.parent != base or not cand.is_file():
+            self._send(404, b'{"ok": false, "error": "not found"}')
+            return
+        ctype = _MIME.get(cand.suffix.lower(), "application/octet-stream")
+        self._send_file(str(cand), ctype)
 
     def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler contract
         parsed = urlparse(self.path)
@@ -628,6 +684,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if route.startswith("/stage/"):
             self._serve_stage(route[len("/stage/"):])
+            return
+        if route.startswith("/preview/"):
+            self._serve_preview(route[len("/preview/"):])
             return
         self._send(404, b'{"ok": false, "error": "not found"}')
 

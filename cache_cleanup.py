@@ -124,9 +124,11 @@ def scan(compute_root: Path, data_dir: Path, plugin_dir: Path,
                     categories["track_stages"]["items"].append(
                         {"path": str(stage_dir), "bytes": size})
 
-    # 4) 插件试听缓存
-    preview = Path(plugin_dir) / "static" / "_preview"
-    if preview.is_dir():
+    # 4) 插件试听缓存（新位置在数据目录；旧版本写在插件 static/_preview，一并扫）
+    for preview in (Path(data_dir) / "preview",
+                    Path(plugin_dir) / "static" / "_preview"):
+        if not preview.is_dir():
+            continue
         for item in preview.iterdir():
             if item.is_file() and _mtime(item) < cutoff:
                 size = _dir_size(item)

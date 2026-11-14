@@ -211,6 +211,10 @@ class MusicSynthPlugin(NekoPluginBase):
             lips_server.set_show_root(str(self._pipeline.work_dir))
             _static = self._plugin_dir / "static"
             lips_server.set_static_roots(_static / "stage", _static / "fonts")
+            # 试听缓存放数据目录（插件目录之外）：插件目录里的文件在宿主升级
+            # 替换文件时可能被占用，导致升级回滚。
+            lips_server.set_preview_root(self._preview_dir())
+            self._clean_legacy_preview_cache()
         except Exception as exc:  # noqa: BLE001 - 没有舞台页也能唱
             self.logger.warning("[show] 舞台资源根登记失败：%s", exc)
         self._show_lock = threading.Lock()
@@ -5764,13 +5768,35 @@ class MusicSynthPlugin(NekoPluginBase):
                 os.link(path, dest)          # 同盘硬链接：不复制、不占额外空间
             except OSError:
                 shutil.copy2(path, dest)     # 跨盘退化成复制
-        return {"mime": mime, "bytes": size,
-                "url": f"/plugin/{PLUGIN_ID}/ui/_preview/{dest.name}"}
+        base = lips_server.base_url()
+        if not base:
+            try:
+                lips_server.start()
+                base = lips_server.base_url()
+            except Exception:  # noqa: BLE001 - 服务没起来就退回插件静态目录（旧行为）
+                base = ""
+        url = (base + f"/preview/{dest.name}") if base else \
+            f"/plugin/{PLUGIN_ID}/ui/_preview/{dest.name}"
+        return {"mime": mime, "bytes": size, "url": url}
 
     def _preview_dir(self) -> Path:
-        cache = self._plugin_dir / "static" / "_preview"
+        """试听缓存目录：插件数据目录下（不放插件安装目录，避免升级时被占用）。"""
+        cache = self._data_dir / "preview"
         cache.mkdir(parents=True, exist_ok=True)
         return cache
+
+    def _clean_legacy_preview_cache(self) -> None:
+        """清掉旧版本写在插件目录里的 static/_preview（里面的文件都能重新生成）。"""
+        legacy = self._plugin_dir / "static" / "_preview"
+        if not legacy.is_dir():
+            return
+        try:
+            for item in legacy.iterdir():
+                if item.is_file():
+                    item.unlink(missing_ok=True)
+            legacy.rmdir()
+        except OSError as exc:
+            self.logger.warning("[preview] 旧试听缓存清理失败（不影响使用）：%s", exc)
 
     def _corpus_remove_source(self, source_id: str):
         return self._corpus_remove_sources([str(source_id or "")])
@@ -5844,7 +5870,7 @@ class MusicSynthPlugin(NekoPluginBase):
                     src_errors.append(r)
             # 试听缓存是硬链接，源文件进回收站后一起清掉
             try:
-                cache = self._plugin_dir / "static" / "_preview"
+                cache = self._preview_dir()
                 for key in preview_keys:
                     for old in cache.glob(key + "*"):
                         try:
