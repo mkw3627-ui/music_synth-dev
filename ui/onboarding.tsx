@@ -305,10 +305,21 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
             setInstalling(false)
             const fresh = await check()
             if (fresh && fresh.ready) setStep(5)
-            else setProg(null)
+            else {
+              // 别把进度条清空：用户会以为白装了。把还没就绪的必需项列出来。
+              const miss = ((fresh && fresh.items) || []).filter((i: Item) => i.required && !i.ok)
+              setErr("安装跑完了，但这些必需项还没就绪：" +
+                (miss.map((i: Item) => i.label).join("、") || "（检测结果里没有可显示的项）") +
+                "。可以再点一次安装补装。")
+              setProg(st.progress || null)
+            }
             return
           }
-          if (s === "failed") { setInstalling(false); return }
+          if (s === "failed") {
+            setInstalling(false)
+            setErr(String((st.progress && st.progress.detail) || "安装没有全部完成，看下面哪一项失败了。"))
+            return
+          }
         } catch (e: any) {
           // 单次失败不影响，下一秒再试；连续失败说明任务/插件已经没了。
           idle += 1

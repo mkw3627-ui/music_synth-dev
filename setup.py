@@ -88,6 +88,11 @@ PYTHON_STANDALONE_PINNED = (
     "https://github.com/astral-sh/python-build-standalone/releases/download/"
     "20250612/cpython-3.10.18+20250612-x86_64-pc-windows-msvc-shared-install_only.tar.gz"
 )
+# 国内可直连的 python-build-standalone 镜像（GitHub Release 镜像，免梯子）。
+# 2026-11 实测：NJU 可直接下；USTC 回 HTML、SJTU 回源 GitHub、TUNA 没有，故只列 NJU。
+PYTHON_STANDALONE_MIRROR = (
+    "https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone"
+)
 
 MODEL_ITEMS = {
     "ddsp_contentvec": {
@@ -543,12 +548,50 @@ def _download_one(url: str, target: Path, progress, label: str,
 
 
 
+def _standalone_mirror_url() -> str:
+    """从国内镜像目录里挑一个可用的 CPython 便携包（优先 3.11，其次 3.12/3.10）。"""
+    try:
+        with _opener().open(PYTHON_STANDALONE_MIRROR + "/LatestRelease/", timeout=10) as resp:
+            html = resp.read().decode("utf-8", "replace")
+    except (OSError, urllib.error.URLError, http.client.HTTPException):
+        return ""
+    name_pat = re.compile(
+        r"^cpython-3\.(?:10|11|12)\.\d+\+\d+-x86_64-pc-windows-msvc-"
+        r"(?:shared-)?install_only\.tar\.gz$")
+    names: list[str] = []
+    for raw in re.findall(r'href="([^"]+)"', html):
+        name = urllib.parse.unquote(raw)
+        if name_pat.match(name):
+            names.append(name)
+    if not names:
+        return ""
+
+    def rank(name: str) -> tuple:
+        # 3.11 与 DDSP/torch 的兼容性最稳；非 stripped 保留调试信息也没关系，
+        # 但优先 shared 构建（和原来固定的产物一致）。
+        version_rank = 0 if "3.11." in name else 1 if "3.12." in name else 2
+        return (version_rank, 1 if "stripped" in name else 0,
+                0 if "shared-" in name else 1)
+
+    names.sort(key=rank)
+    return PYTHON_STANDALONE_MIRROR + "/LatestRelease/" + urllib.parse.quote(names[0])
+
+
 def download_portable_python(paths: dict, progress) -> str:
-    """Fetch python-build-standalone 3.10 when the machine has no usable Python."""
+    """Fetch python-build-standalone when the machine has no usable Python.
+
+    国内优先走 NJU 的 GitHub Release 镜像（免梯子）；镜像挂了再回落 GitHub
+    官方（经 gh 镜像链）。镜像只有 3.11/3.12/3.13，没有 3.10，所以按
+    3.11 → 3.12 → 3.10 的优先级挑；插件本来就接受 3.10–3.12。
+    """
     root = Path(paths["compute_root"]) / "runtime" / "python"
     exe = root / "python.exe"
     if exe.is_file():
         return str(exe)
+    candidates: list[str] = []
+    mirror = _standalone_mirror_url()
+    if mirror:
+        candidates.append(mirror)
     url = ""
     try:
         api = urllib.request.Request(
@@ -558,7 +601,7 @@ def download_portable_python(paths: dict, progress) -> str:
         # 不让「查最新版」这一步拖住整个安装。
         with _opener().open(api, timeout=6) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        pattern = re.compile(r"cpython-3\.10\.\d+\+.*x86_64-pc-windows-msvc-shared-install_only\.tar\.gz$")
+        pattern = re.compile(r"cpython-3\.(?:10|11|12)\.\d+\+.*x86_64-pc-windows-msvc-(?:shared-)?install_only\.tar\.gz$")
         for asset in data.get("assets") or []:
             if pattern.search(asset.get("name", "")):
                 url = asset.get("browser_download_url", "")
@@ -567,23 +610,42 @@ def download_portable_python(paths: dict, progress) -> str:
         url = ""
     if not url:
         url = PYTHON_STANDALONE_PINNED
+    candidates.append(url)
+
     archive = Path(paths["compute_root"]) / "runtime" / "python-standalone.tar.gz"
-    progress("下载便携版 Python 3.10（约 25MB）…")
-    _download_file(url, archive, progress, "Python 3.10", expected_bytes=0)
-    with tempfile.TemporaryDirectory(dir=str(archive.parent)) as tmp:
-        tmp_path = Path(tmp)
-        with tarfile.open(archive, "r:gz") as tar:
-            tar.extractall(tmp_path)  # noqa: S202 - official standalone archive
-        source = tmp_path / "python"
-        if not source.is_dir():
-            raise RuntimeError("便携版 Python 压缩包结构异常")
-        if root.exists():
+    errors: list[str] = []
+    for candidate in candidates:
+        host = urllib.parse.urlsplit(candidate).hostname or candidate
+        progress(f"下载便携版 Python（约 25MB，来源 {host}）…")
+        try:
+            _download_file(candidate, archive, progress, "Python", expected_bytes=0)
+        except Exception as exc:  # noqa: BLE001 - 换下一个源
+            errors.append(f"{host}: {exc}")
+            continue
+        try:
+            with tempfile.TemporaryDirectory(dir=str(archive.parent)) as tmp:
+                tmp_path = Path(tmp)
+                with tarfile.open(archive, "r:gz") as tar:
+                    tar.extractall(tmp_path)  # noqa: S202 - official standalone archive
+                source = tmp_path / "python"
+                if not source.is_dir():
+                    raise RuntimeError("便携版 Python 压缩包结构异常")
+                if root.exists():
+                    shutil.rmtree(root, ignore_errors=True)
+                shutil.move(str(source), str(root))
+            archive.unlink(missing_ok=True)
+            if not exe.is_file():
+                raise RuntimeError("便携版 Python 解压后缺少 python.exe")
+            ok, version = _python_ok(exe)
+            if not ok:
+                raise RuntimeError(f"便携版 Python 版本不可用：{version}")
+            progress(f"便携版 Python {version} 就绪（{host}）")
+            return str(exe)
+        except Exception as exc:  # noqa: BLE001 - 包坏了就换源重试
+            errors.append(f"{host}: {exc}")
             shutil.rmtree(root, ignore_errors=True)
-        shutil.move(str(source), str(root))
-    archive.unlink(missing_ok=True)
-    if not exe.is_file():
-        raise RuntimeError("便携版 Python 解压后缺少 python.exe")
-    return str(exe)
+            archive.unlink(missing_ok=True)
+    raise RuntimeError("便携版 Python 下载失败：" + "; ".join(errors)[-600:])
 
 
 # ---------------------------------------------------------------------------

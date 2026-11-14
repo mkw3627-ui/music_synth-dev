@@ -1301,3 +1301,44 @@ g39~g41 一直在修「人声驱动的全身」，但用户看到的**身体上�
 `static/_preview/`（预览音频）。
 
 单文件均 < 2 MiB；字体为 woff2（每个 ≤1.7 MB）。
+
+---
+
+## 0.2.39 发布：基础 Python 国内可下 + 装完不静默清空（2026-11-15）
+
+用户反馈两件事：
+1. 别的用户机器上「基础 Python（建虚拟环境用）」装不上，报错全是
+   `SSL: UNEXPECTED_EOF_WHILE_READING (_ssl.c:1016)`——gh-proxy / ghfast /
+   hk.gh-proxy / ghproxy.net / github.com 全部同样错误，等于这台机器到
+   GitHub 及其加速站全被 TLS 掐断。
+2. 依赖都下完了，进度条却清空、没进「已完成」。
+
+### 根因
+
+- 便携版 Python 只有 `python-build-standalone` 的 GitHub Release 一条来源
+  （固定 20250612 的 3.10.18），镜像链也只是 GitHub 加速代理，机器连不上
+  GitHub 时全部失败。基础 Python 是必需项，装不上 → 后续 venv 也建不了。
+- 面板在安装任务 `done` 后会重新检测；只要还有必需项没就绪就执行
+  `setProg(null)` 把进度条清空、也不显示原因，看起来就是「装完了但不算完成」。
+  在上面那台机器上，缺的正是 base_python，所以必现。
+
+### 改法
+
+- **国内镜像**：新增 `PYTHON_STANDALONE_MIRROR = NJU github-release 镜像`
+  （`mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone`）。
+  先拉 `LatestRelease/` 目录，按 3.11 → 3.12 → 3.10、shared → 普通、
+  非 stripped 的优先级挑一个 Windows x64 zip，再下载解压。NJU 实测可直连
+  （206 断点续传）；USTC 返回 HTML、SJTU 回源 GitHub、TUNA 没有该仓库，都不采用。
+- 镜像优先，失败再走原来的 GitHub API/固定版本 + gh 镜像链；每个来源失败都会
+  清掉半成品再换下一个，错误汇总后一起报。
+- 解压后校验 `python.exe` 与版本（3.10–3.12 才接受），不再把坏包当成功。
+- 面板：`done` 但检测未就绪时不再清空进度条，改为明确列出还没就绪的必需项，
+  提示可以再点一次补装；`failed` 时把任务里的失败原因直接显示出来。
+- 面板按既有流程从 `ui/` 重建（`static/index.html` + `html/panel.html`）。
+
+### 披露
+
+- NJU 镜像的 LatestRelease 目前只有 3.11/3.12/3.13（python-build-standalone
+  新版本不再出 3.10），所以这台机器上会装 3.11；插件的 `find_base_python`
+  和依赖都接受 3.11，torch cu128 也有 cp311 轮子。
+- 没有在真实受限网络上复跑完整安装；镜像可用性用 Range 请求实测过（206）。

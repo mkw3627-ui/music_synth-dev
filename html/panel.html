@@ -5585,11 +5585,16 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
               setInstalling(false);
               const fresh = await check();
               if (fresh && fresh.ready) setStep(5);
-              else setProg(null);
+              else {
+                const miss = (fresh && fresh.items || []).filter((i) => i.required && !i.ok);
+                setErr("安装跑完了，但这些必需项还没就绪：" + (miss.map((i) => i.label).join("、") || "（检测结果里没有可显示的项）") + "。可以再点一次安装补装。");
+                setProg(st.progress || null);
+              }
               return;
             }
             if (s === "failed") {
               setInstalling(false);
+              setErr(String(st.progress && st.progress.detail || "安装没有全部完成，看下面哪一项失败了。"));
               return;
             }
           } catch (e) {
