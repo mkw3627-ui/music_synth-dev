@@ -87,7 +87,7 @@ _PROBE_TTL_S = 2.0
 def _run_quiet(cmd: list[str], timeout: float = 8.0) -> str:
     try:
         out = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
+            cmd, capture_output=True, text=True, errors="replace", timeout=timeout,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         return (out.stdout or "") + (out.stderr or "")
@@ -975,7 +975,7 @@ def python_version(python: Path) -> str:
         return "missing"
     try:
         out = subprocess.run([str(python), "-c", "import sys;print(sys.version.split()[0])"],
-                             capture_output=True, text=True, timeout=20)
+                             capture_output=True, text=True, errors="replace", timeout=20)
         return (out.stdout or "").strip() or "unknown"
     except (OSError, subprocess.SubprocessError):
         return "missing"
@@ -984,7 +984,7 @@ def python_version(python: Path) -> str:
 def module_available(python: Path, module: str) -> bool:
     try:
         out = subprocess.run([str(python), "-c", f"import {module};print('ok')"],
-                             capture_output=True, text=True, timeout=40)
+                             capture_output=True, text=True, errors="replace", timeout=40)
         return "ok" in (out.stdout or "")
     except (OSError, subprocess.SubprocessError):
         return False

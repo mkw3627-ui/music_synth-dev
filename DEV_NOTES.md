@@ -1745,3 +1745,32 @@ FFmpeg。改成在引导页点「安装」即可自动执行。
 - 只在用户点「安装」时执行；「一键安装全部」也会带上它（属于用户主动点击）。
 - 不静默提权、不指定 scope，UAC 由系统按需弹窗。
 - 真实 `winget install` 没有在本机执行；只有桩验证。
+
+---
+
+## 0.2.54 发布：修 winget 输出的 GBK 解码崩溃（2026-11-15）
+
+用户点引导页「安装 FFmpeg」时报
+`ffmpeg: UnicodeDecodeError: 'gbk' codec can't decode byte 0x80`。
+
+### 根因
+
+`_run_stream` 用 `text=True` 读子进程输出，中文 Windows 默认按 GBK 解码；
+winget 输出的是 UTF-8，遇到多字节续字节 0x80 就抛 `UnicodeDecodeError`，
+整个安装线程被打断。
+
+### 改法
+
+- `_run_stream`：显式 `encoding="utf-8", errors="replace"`（winget/pip 都是
+  UTF-8；坏字节替换，不再中断）。
+- 顺带把其余所有 `text=True` 的 subprocess 调用加 `errors="replace"`
+  （`setup.py` 5 处、`runtime.py` 3 处、`__init__.py` 2 处：ffprobe 取时长、
+  ACE pip、python/venv/deps 探测等），避免同类崩溃。
+- 这些调用没有改编码（仍按 locale 解码），中文输出可能显示成乱码，但不会崩。
+
+### 验证
+
+- 桩复现：0.2.53 的写法抛 `UnicodeDecodeError`；修复后 UTF-8、含 0x80、
+  纯非法字节、GBK 四种输出都不抛异常。
+- `tests/ffmpeg_winget_stub.py` 4 用例仍全 PASS；Ruff 无新增；三个文件 compile 通过。
+- 真实 winget install 未在本机执行。

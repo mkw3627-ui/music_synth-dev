@@ -4958,7 +4958,7 @@ class MusicSynthPlugin(NekoPluginBase):
             res = subprocess.run(
                 [exe, "-v", "error", "-show_entries", "format=duration",
                  "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
-                capture_output=True, text=True, timeout=20,
+                capture_output=True, text=True, errors="replace", timeout=20,
             )
             text = (res.stdout or "").strip().splitlines()
             value = float(text[0]) if text else 0.0
@@ -7594,7 +7594,7 @@ class MusicSynthPlugin(NekoPluginBase):
             cmd = [str(p["python"]), "-m", "pip", "install", "--no-deps",
                    "--upgrade", "--target", str(p["pylibs"]), *packages]
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800,
+                proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=1800,
                                       env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             except Exception as exc:  # noqa: BLE001
                 self._job_update(job_id, state="failed", progress=100,

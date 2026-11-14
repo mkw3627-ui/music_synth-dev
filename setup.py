@@ -231,7 +231,10 @@ def _run_stream(cmd: list[str], progress, label: str, env: dict | None = None,
     _say(f"{label}: {' '.join(str(c) for c in cmd[:4])} …")
     proc = subprocess.Popen(
         [str(c) for c in cmd], cwd=str(cwd) if cwd else None,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        # winget/pip 输出是 UTF-8；中文 Windows 默认 GBK，不指定就会 UnicodeDecodeError。
+        # errors="replace" 保证任何编码的输出都不会把安装线程打断。
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
         env=_proxy_free_env(env or runtime._clean_env()),
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
@@ -364,7 +367,7 @@ def _python_ok(exe: str | Path) -> tuple[bool, str]:
         return False, "missing"
     try:
         out = subprocess.run([exe, "-c", "import sys;print('%d.%d' % sys.version_info[:2])"],
-                             capture_output=True, text=True, timeout=15)
+                             capture_output=True, text=True, errors="replace", timeout=15)
         version = (out.stdout or "").strip()
         major, _, minor = version.partition(".")
         if major.isdigit() and minor.isdigit() and (int(major), int(minor)) in {(3, 10), (3, 11), (3, 12)}:
@@ -385,7 +388,7 @@ def find_base_python(paths: dict | None = None) -> tuple[str | None, str, str]:
     for minor in ("10", "11", "12"):
         try:
             out = subprocess.run(["py", f"-3.{minor}", "-c", "import sys;print(sys.executable)"],
-                                 capture_output=True, text=True, timeout=15,
+                                 capture_output=True, text=True, errors="replace", timeout=15,
                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             exe = (out.stdout or "").strip()
             if exe and Path(exe).is_file():
@@ -762,7 +765,7 @@ def _venv_ok(python: Path) -> bool:
     """venv 里的 python 能不能用（建到一半的 venv 常常连 pip 都没有）。"""
     try:
         out = subprocess.run([str(python), "-c", "import pip,sys;print('ok')"],
-                             capture_output=True, text=True, timeout=60,
+                             capture_output=True, text=True, errors="replace", timeout=60,
                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return out.returncode == 0 and "ok" in (out.stdout or "")
     except (OSError, subprocess.SubprocessError):
@@ -824,7 +827,7 @@ def ddsp_deps_status(python) -> tuple[bool, str]:
     try:
         proc = subprocess.run(
             [str(p), "-c", code, json.dumps(list(_DDSP_PROBE_MODULES))],
-            capture_output=True, text=True, timeout=180,
+            capture_output=True, text=True, errors="replace", timeout=180,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.SubprocessError) as exc:
         res = (False, f"检测失败：{type(exc).__name__}: {exc}")
@@ -1192,7 +1195,7 @@ def _install_dlc_model(paths: dict, spec: dict, progress, label: str, python) ->
     )
     try:
         proc = subprocess.run([str(py), "-c", code, str(dlc), str(target)],
-                              capture_output=True, text=True, timeout=900)
+                              capture_output=True, text=True, errors="replace", timeout=900)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("底模转换超时（15 分钟）：文件可能不完整，请重试") from exc
     if proc.returncode != 0:
