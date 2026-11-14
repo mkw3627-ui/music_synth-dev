@@ -1668,3 +1668,24 @@ typing-extensions, sympy …` 这些 pip 内部的下载/安装没有进度，�
 
 - 当前卡在 0.2.49 的用户仍需先完成一次更新（完全退出宿主后重试，或手动
   覆盖安装目录），0.2.50 生效后才会把缓存写到新位置。
+
+---
+
+## 0.2.51 发布：worker 启动失败时带上解释器和脚本（2026-11-15）
+
+用户机器上处理歌曲时报 `FileNotFoundError: [WinError 2]`，errors.log 里只有
+一行「系统找不到指定的文件」，看不出是哪个程序。
+
+### 改法
+
+- `runtime.run_worker`：`subprocess` 启动阶段抛 `OSError` 时，把解释器路径、
+  worker 脚本名和工作目录补进异常的 `strerror`；异常对象不重建，类型、
+  `winerror`、`errno`、`filename` 全部保留。
+- 不改任何启动参数或业务流程，只影响错误文本。
+
+### 验证
+
+- 模拟 `subprocess` 抛 `winerror=2` 的 `FileNotFoundError`：类型与
+  `winerror/errno/filename` 均保留，`strerror` 里包含解释器、脚本和 cwd。
+- CI 同参数 Ruff 无新增问题，文件 compile 通过。
+- 本地安装目录已同步；需重启宿主加载。

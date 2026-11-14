@@ -842,14 +842,20 @@ def run_worker(python: Path, script: Path, job: dict, *, cwd: Path,
             log_file = open(log_path, "a", encoding="utf-8", errors="backslashreplace")
             log_file.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} {script.name} =====\n")
             log_file.flush()
-        proc = subprocess.run(
-            cmd, cwd=str(cwd), timeout=timeout,
-            stdout=(log_file or subprocess.PIPE), stderr=subprocess.STDOUT,
-            env=_clean_env(env_extra),
-            # 离线渲染不需要抢桌面：降一档 CPU/IO 优先级，唱歌时系统仍能正常响应。
-            creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                           | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)),
-        )
+        try:
+            proc = subprocess.run(
+                cmd, cwd=str(cwd), timeout=timeout,
+                stdout=(log_file or subprocess.PIPE), stderr=subprocess.STDOUT,
+                env=_clean_env(env_extra),
+                # 离线渲染不需要抢桌面：降一档 CPU/IO 优先级，唱歌时系统仍能正常响应。
+                creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                               | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)),
+            )
+        except OSError as exc:
+            # 启动阶段就失败（解释器或 cwd 不存在）时，WinError 2 本身不带命令名；
+            # 把解释器和脚本补进 strerror，原异常对象不换，winerror/errno 都保留。
+            exc.strerror = f"{exc.strerror}（启动失败：{cmd[0]} {script.name}，cwd={cwd}）"
+            raise
         tail = ""
         if log_file is None:
             tail = (proc.stdout or b"").decode("utf-8", "replace")[-2000:]
