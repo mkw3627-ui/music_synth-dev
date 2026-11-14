@@ -552,6 +552,13 @@ class Pipeline:
         if not Path(python).is_file():
             return {"ok": False, "step": "separate",
                     "error": f"分离环境未安装（缺少 {python}）；请先运行首次使用向导 ms_setup_install"}
+        # audio-separator 启动时只认系统 PATH 里的 ffmpeg，缺了它会打一条误导的 ERROR 然后失败；
+        # 这里先查清楚，直接给出可操作的提示。
+        if not runtime.ffmpeg_status(
+                str((self.paths.get("raw") or {}).get("ffmpeg_path") or "")).get("available"):
+            return {"ok": False, "step": "separate",
+                    "error": "未检测到系统 FFmpeg（分离必需）。请在终端运行 winget install Gyan.FFmpeg，"
+                             "装好后重启 N.E.K.O 再试。"}
         attempts = [{"job": job, "note": f"设备 {job['device']}"}]
         if job["device"] != "cpu":
             attempts.append({

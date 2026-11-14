@@ -1689,3 +1689,31 @@ typing-extensions, sympy …` 这些 pip 内部的下载/安装没有进度，�
   `winerror/errno/filename` 均保留，`strerror` 里包含解释器、脚本和 cwd。
 - CI 同参数 Ruff 无新增问题，文件 compile 通过。
 - 本地安装目录已同步；需重启宿主加载。
+
+---
+
+## 0.2.52 发布：分离前检查系统 FFmpeg，引导页改成「必需」（2026-11-15）
+
+用户机器（干净环境）没有系统 ffmpeg，`where ffmpeg` 找不到；audio-separator
+启动时只认 PATH 里的裸名 `ffmpeg`，打一条误导性的 `FFmpeg is not installed`
+后分离失败。此前引导页给的是 pip 装 `imageio-ffmpeg`，它装在合成环境里、
+分离环境用不到，等于装了个没用的东西。
+
+### 改法
+
+- **分离前检查**（`pipeline.py`）：分离开始前用 `runtime.ffmpeg_status` 检查
+  （含用户配置的 `ffmpeg_path` 与 PATH）；不可用直接返回
+  「未检测到系统 FFmpeg（分离必需）。请运行 winget install Gyan.FFmpeg，
+  装好后重启 N.E.K.O 再试」，不再启动分离 worker。
+- **引导页**（`setup.py`）：FFmpeg 项从「可选、可 pip 安装」改为
+  「FFmpeg（人声分离必需）」：缺失时 `missing` + `required`，修法写
+  `winget install Gyan.FFmpeg`，不再给装不上的 pip 按钮。
+- `setup.py` 里 `install()` 的 `imageio-ffmpeg` 分支保留但 UI 不再触发
+  （其它入口可能还在用）。
+
+### 验证
+
+- 无 ffmpeg：引导页项 missing/required、整体不就绪；分离直接返回清楚错误，
+  不启动 worker。
+- 有 ffmpeg：引导页项 ready；分离越过检查继续。
+- CI 同参数 Ruff 通过，两个文件 compile 通过。

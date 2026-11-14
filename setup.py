@@ -1323,13 +1323,15 @@ def check_dependencies(paths: dict, probe: dict | None = None) -> dict:
                        fix="" if host_ok else "需要 Python 3.9+ 运行插件"))
 
     ff = runtime.ffmpeg_status(str((paths.get("raw") or {}).get("ffmpeg_path") or ""))
+    # 分离（audio-separator）必须用系统 PATH 里的 ffmpeg；pip 装的 imageio-ffmpeg 它用不到，
+    # 所以不再给「pip 安装」按钮，而是明确告诉用户用 winget 装系统版。
     items.append(_item(
-        "ffmpeg", "FFmpeg（可选，用于视频导入/试听）",
-        "ready" if ff["available"] else "optional",
-        ff.get("path") or "未找到；成品播放会自动回退 winsound/系统播放器",
-        required=False, installable=not ff["available"],
-        fix="可在计算环境安装 imageio-ffmpeg，或用 winget install Gyan.FFmpeg",
-        size_gb=0.07, action="" if ff["available"] else "pip:synth:ffmpeg"))
+        "ffmpeg", "FFmpeg（人声分离必需）",
+        "ready" if ff["available"] else "missing",
+        ff.get("path") or "未安装：人声分离会失败",
+        required=True, installable=False,
+        fix="" if ff["available"] else "在终端运行 winget install Gyan.FFmpeg，装好后重启 N.E.K.O",
+        size_gb=0.0, action=""))
 
     # GPU / driver ---------------------------------------------------------
     if gpu:
