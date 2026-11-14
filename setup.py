@@ -1801,15 +1801,25 @@ def browse_wait(seconds: float = 20.0) -> dict:
 # FFmpeg 系统安装（人声分离必需）
 # ---------------------------------------------------------------------------
 WINGET_FFMPEG_ID = "Gyan.FFmpeg"
-_WINGET_ARGS = [
-    "winget", "install", "--id", WINGET_FFMPEG_ID, "-e",
-    "--accept-package-agreements", "--accept-source-agreements",
-]
 WINGET_TIMEOUT_S = 900.0  # 约 80MB 下载 + 安装，给 15 分钟
+# winget 的退出码是 HRESULT：0x8A15002B = APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE。
+# Python 在 Windows 上可能按有符号或无符号报告，所以统一按低 32 位比较。
+_WINGET_UPDATE_NOT_APPLICABLE = 0x8A15002B
+
+
+def _winget_install_args(extra: list[str]) -> list[str]:
+    return ["winget", "install", "--id", WINGET_FFMPEG_ID, "-e", *extra,
+            "--accept-package-agreements", "--accept-source-agreements"]
 
 
 def install_ffmpeg_winget(progress=None, timeout: float = WINGET_TIMEOUT_S) -> dict:
     """用 winget 装系统 FFmpeg（人声分离必需）。只在用户点按钮时调用，不在引导页自动跑。
+
+    两段式：
+    1. ``--no-upgrade``：没装过就正常装；已装过（哪怕 ID 登记不标准）就跳过，
+       避免旧登记把 winget 带进「找升级 → 找不到 → 0x8A15002B」的失败路径。
+    2. 若跳过/升级不适用后当前进程仍找不到 ffmpeg，再用 ``--force`` 强制安装一次：
+       winget 会按标准 ID 重新登记并建 Links 别名，能修复「已登记但 PATH 里没有」的机器。
 
     返回 dict：
     - detected=True / ok=True：装完立刻在当前进程找到 ffmpeg。
@@ -1822,19 +1832,39 @@ def install_ffmpeg_winget(progress=None, timeout: float = WINGET_TIMEOUT_S) -> d
                 "error": "这台机器没有 winget，请到 gyan.dev 下载 full build 手动安装 FFmpeg 并加入 PATH",
                 "manual": "https://www.gyan.dev/ffmpeg/builds/", "output_summary": ""}
 
-    if progress:
-        progress("FFmpeg：用 winget 安装（会弹出安装进度，可能需要一点时间）…")
+    def _attempt(extra: list[str], label: str) -> tuple[int, str]:
+        if progress:
+            progress(f"FFmpeg：{label}…")
+        code, tail = _run_stream(
+            _winget_install_args(extra), progress, label,
+            timeout=timeout, head="FFmpeg（人声分离必需）")
+        return code, "\n".join(tail[-3:])
 
-    code, tail = _run_stream(
-        _WINGET_ARGS, progress, "用 winget 安装 FFmpeg",
-        timeout=timeout, head="FFmpeg（人声分离必需）")
-    summary = "\n".join(tail[-3:])
+    code, summary = _attempt(["--no-upgrade"], "用 winget 安装 FFmpeg")
 
     # winget 装完往往在当前进程还找不到（PATH/Links 没刷新），如实报告，不假装成功。
     exe = runtime._find_ffmpeg()
     if exe:
         return {"ok": True, "detected": True, "need_restart": False, "installed": True,
                 "path": exe, "output_summary": summary, "error": ""}
+
+    # 已登记但不可用 / 升级不适用：用 --force 强制重装一次，修好登记与 Links 别名。
+    if code == 0 or (code & 0xFFFFFFFF) == _WINGET_UPDATE_NOT_APPLICABLE:
+        code2, summary2 = _attempt(["--force"], "用 winget 强制安装 FFmpeg")
+        summary = summary2 or summary
+        exe = runtime._find_ffmpeg()
+        if exe:
+            return {"ok": True, "detected": True, "need_restart": False, "installed": True,
+                    "path": exe, "output_summary": summary, "error": ""}
+        if code2 == 0:
+            return {"ok": False, "detected": False, "need_restart": True, "installed": True,
+                    "error": "FFmpeg 已安装，但要在重启 N.E.K.O 之后才能被识别，请重启后回来点「重新检测」",
+                    "output_summary": summary}
+        if code2 == -1:
+            return {"ok": False, "detected": False, "need_restart": False, "installed": False,
+                    "error": "winget 安装超时被终止，请改用 gyan.dev full build 手动安装",
+                    "manual": "https://www.gyan.dev/ffmpeg/builds/", "output_summary": summary}
+        code = code2
 
     if code == 0:
         return {"ok": False, "detected": False, "need_restart": True, "installed": True,
@@ -1844,8 +1874,9 @@ def install_ffmpeg_winget(progress=None, timeout: float = WINGET_TIMEOUT_S) -> d
         return {"ok": False, "detected": False, "need_restart": False, "installed": False,
                 "error": "winget 安装超时被终止，请改用 gyan.dev full build 手动安装",
                 "manual": "https://www.gyan.dev/ffmpeg/builds/", "output_summary": summary}
+    hex_code = f"0x{code & 0xFFFFFFFF:08X}"
     return {"ok": False, "detected": False, "need_restart": False, "installed": False,
-            "error": f"winget 安装失败（退出码 {code}），请改用 gyan.dev full build 手动安装",
+            "error": f"winget 安装失败（退出码 {code} / {hex_code}），请改用 gyan.dev full build 手动安装",
             "manual": "https://www.gyan.dev/ffmpeg/builds/", "output_summary": summary}
 
 

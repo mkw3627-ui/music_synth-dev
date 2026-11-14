@@ -1774,3 +1774,35 @@ winget 输出的是 UTF-8，遇到多字节续字节 0x80 就抛 `UnicodeDecodeE
   纯非法字节、GBK 四种输出都不抛异常。
 - `tests/ffmpeg_winget_stub.py` 4 用例仍全 PASS；Ruff 无新增；三个文件 compile 通过。
 - 真实 winget install 未在本机执行。
+
+---
+
+## 0.2.55 发布：winget 已登记但不可用时自动 --force 重装（2026-11-15）
+
+用户点引导页「安装 FFmpeg」报
+`winget 安装失败（退出码 2316632107）`。
+
+### 根因
+
+2316632107 = 0x8A15002B = `APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE`
+（找不到适用的更新）。机器上 ffmpeg 已有**非标准 ID 的登记**
+（如 `ARP\User\X64\Gyan.FFmpeg_…`，版本 7.1.1），winget 默认走升级路径，
+`-e` 精确匹配又对不上，于是报「没有适用的更新」。
+
+### 改法（0.2.55）
+
+- 第一次用 `--no-upgrade`：没装过就正常装；已装过（含非标准登记）就跳过，
+  不再把「已装好」误判成失败。
+- 若跳过/升级不适用后当前进程仍找不到 ffmpeg，自动用 `--force` 再装一次：
+  winget 按标准 ID 重新登记并创建 WinGet Links 别名，能修好「已登记但 PATH
+  里没有」的机器。
+- 退出码同时兼容有符号/无符号表示（按低 32 位比较）；失败信息附带十六进制码。
+- 仅在 `--no-upgrade` 返回 0 或 UPDATE_NOT_APPLICABLE 时才重试，其它失败直接
+  报错，不白等。
+
+### 验证
+
+- 桩验证 UPDATE_NOT_APPLICABLE（`2316632107` 与 `-1978335189` 两种表示）
+  都会触发第二次 `--force` 安装并成功；普通失败不重试。
+- `tests/ffmpeg_winget_stub.py` 4 用例仍全 PASS；Ruff 无新增；compile 通过。
+- 真实 winget 安装未在本机执行（上一轮开发机已实际装过 9.0.2）。
