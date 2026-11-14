@@ -35,11 +35,14 @@ TORCH_CU128_INDEX = "https://download.pytorch.org/whl/cu128"
 TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 
 # 国内加速：GitHub 直连在不少宽带上只有几十 KB/s，先走镜像，镜像全挂再回落官方。
-GH_MIRRORS = ("https://gh-proxy.com/", "https://ghfast.top/")
+# hk.gh-proxy / ghproxy.net 是 2026-11 实测可用的备用镜像；前一个挂了自动换下一个。
+GH_MIRRORS = ("https://gh-proxy.com/", "https://ghfast.top/",
+              "https://hk.gh-proxy.com/", "https://ghproxy.net/")
 GH_HOSTS = {"github.com", "codeload.github.com", "objects.githubusercontent.com",
             "raw.githubusercontent.com"}
-# PyPI 走清华镜像；镜像连不上时 _pip 会自动退回官方源重试一次。
+# PyPI 先清华、再阿里云、最后官方：任何一个镜像挂了都还有下一档。
 PYPI_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"
+PYPI_MIRRORS = (PYPI_INDEX, "https://mirrors.aliyun.com/pypi/simple/")
 
 # DDSP-SVC 6.3 repo + pretrain assets (all release assets / codeload zips, so
 # no git binary is required on the target machine).
@@ -250,22 +253,33 @@ def _pip(python: Path, args: list[str], progress, label: str) -> None:
     base = [str(python), "-m", "pip", "install", "--disable-pip-version-check",
             "--no-input", "--retries", "5", "--timeout", "60"]
     has_index = any(str(a).startswith("--index-url") or str(a).startswith("-i") for a in args)
-    # 默认走清华 PyPI 镜像；镜像不通就退回官方源再试一次，避免安装卡死在网络上。
-    cmd = base + ([] if has_index else ["--index-url", PYPI_INDEX]) + list(args)
-    code, tail = _run_stream(cmd, progress, label)
-    if code != 0 and not has_index:
-        _say(f"{label}: 清华镜像失败，改用官方 PyPI 重试")
-        code, tail = _run_stream(base + list(args), progress, f"{label}（官方源）")
-    if code != 0 and _dead_proxy_text(tail):
-        # 代理在插件启动后退出：缓存里仍是「代理可用」，子进程环境还带着死代理。
-        # 重新探测一次，确认代理真的死了就用干净环境再试一回。
-        _reset_proxy_state()
-        if not runtime.proxy_alive():
-            _say(f"{label}: 代理已失效，去掉代理变量重试")
-            retry = base + list(args) if has_index else cmd
-            code, tail = _run_stream(retry, progress, f"{label}（直连）")
-    if code != 0:
-        raise RuntimeError(f"{label} 失败（退出码 {code}）：{tail[-1500:]}")
+    # 没指定源时：清华 → 阿里云 → 官方。任何一个连接失败就换下一档，
+    # 避免用户本地镜像挂了整条安装链路直接失败。
+    if has_index:
+        attempts: list[tuple[list[str], str]] = [([], "")]
+    else:
+        attempts = [(["--index-url", mirror],
+                     urllib.parse.urlsplit(mirror).hostname or mirror)
+                    for mirror in PYPI_MIRRORS]
+        attempts.append(([], "官方源"))
+    code, tail = 1, ""
+    for extra, tag in attempts:
+        cmd = base + extra + list(args)
+        shown = f"{label}（{tag}）" if tag else label
+        code, tail = _run_stream(cmd, progress, shown)
+        if code == 0:
+            return
+        _say(f"{label}: {tag or '指定源'} 失败（退出码 {code}），换源重试")
+        if _dead_proxy_text(tail):
+            # 代理在插件启动后退出：缓存里仍是「代理可用」，子进程环境还带着死代理。
+            # 重新探测一次，确认代理真的死了就用干净环境再试一回。
+            _reset_proxy_state()
+            if not runtime.proxy_alive():
+                _say(f"{label}: 代理已失效，去掉代理变量重试")
+                code, tail = _run_stream(cmd, progress, f"{label}（直连）")
+                if code == 0:
+                    return
+    raise RuntimeError(f"{label} 失败（退出码 {code}）：{tail[-1500:]}")
 
 
 
@@ -446,9 +460,11 @@ def _download_file(url: str, target: Path, progress, label: str,
     errors: list[str] = []
     proxy_retried = False
     for candidate in _mirror_urls(url):
+        # 镜像只给一半的超时：某个镜像挂了别让用户等满 120 秒，快速换下一个。
+        wait = timeout if candidate == url else min(timeout, 45.0)
         while True:
             try:
-                _download_one(candidate, target, progress, label, expected_bytes, timeout)
+                _download_one(candidate, target, progress, label, expected_bytes, wait)
                 if candidate != url:
                     _say(f"{label}: 已通过国内镜像 {urllib.parse.urlsplit(candidate).hostname} 下载")
                 return
@@ -538,7 +554,9 @@ def download_portable_python(paths: dict, progress) -> str:
         api = urllib.request.Request(
             "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest",
             headers={"User-Agent": "NEKO-music-synth/0.2", "Accept": "application/vnd.github+json"})
-        with _opener().open(api, timeout=15) as resp:
+        # 国内 api.github.com 基本连不通：只等 6 秒就走固定版本号（下载走镜像链），
+        # 不让「查最新版」这一步拖住整个安装。
+        with _opener().open(api, timeout=6) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         pattern = re.compile(r"cpython-3\.10\.\d+\+.*x86_64-pc-windows-msvc-shared-install_only\.tar\.gz$")
         for asset in data.get("assets") or []:
@@ -1696,15 +1714,16 @@ def diagnose_download_sources(probe_bytes: int = 65536, timeout: float = 8.0) ->
 
     面板「环境体检」里单独列出来，用户遇到下载慢/下不动时一眼能看出是哪一段断了。
     """
-    sources = [
-        ("GitHub 直连", DDSP_ZIP),
-        ("GitHub 镜像 gh-proxy", GH_MIRRORS[0] + VOCODER_ZIP),
-        ("GitHub 镜像 ghfast", GH_MIRRORS[1] + VOCODER_ZIP),
+    sources = [("GitHub 直连", DDSP_ZIP)]
+    sources += [(f"GitHub 镜像 {urllib.parse.urlsplit(m).hostname}", m + VOCODER_ZIP)
+                for m in GH_MIRRORS]
+    sources += [
         ("HF 镜像 hf-mirror", CONTENTVEC_URLS[0]),
         ("HuggingFace 官方", CONTENTVEC_URLS[1]),
-        ("PyPI 清华镜像", PYPI_INDEX + "/pip/"),
-        ("PyTorch 官方", TORCH_CU128_INDEX + "/"),
     ]
+    sources += [(f"PyPI 镜像 {urllib.parse.urlsplit(m).hostname}", m + "/pip/")
+                for m in PYPI_MIRRORS]
+    sources.append(("PyTorch 官方", TORCH_CU128_INDEX + "/"))
     rows: list[dict] = []
     opener = _opener()
     for label, url in sources:

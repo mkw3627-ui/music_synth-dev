@@ -1988,3 +1988,31 @@ sep_python/train_runs_dir` 置 `""` 让派生路径重算）。
 - **页面要刷新 / 重启宿主才会加载 61**；刷新前 `/hello` 的 `client_version` 还是 59。
 - 改前备份：`chat-2026-10-29-1\_backup_g60_20261110_103548\`、
   `_backup_g61_20261110_104522\`。
+
+---
+
+## 0.2.36 发布：国内下载源加固（2026-11-14）
+
+市场更新说明（用户口述，按原文写）：
+
+> 国内用户下载环境和模型的几个源都加固了一遍，镜像挂了会自动换下一个。
+
+本版只动下载链路，功能与 0.2.35 一致。改的是 `setup.py` 和 ACE 下载 worker：
+
+- **GitHub 镜像 2 个 → 4 个**：`gh-proxy.com` → `ghfast.top` → `hk.gh-proxy.com`
+  → `ghproxy.net`，前一个连不上自动换下一个（默认端口/Python 便携包/Vocoder/
+  RMVPE/分离权重都吃这条链）。
+- **镜像超时减半**：镜像源 45 秒、官方源保持 120 秒。以前一个挂掉的镜像会让用户
+  干等两分钟才换源。
+- **PyPI 三档**：清华 → 阿里云 → 官方。以前只有清华一档，镜像挂了直接安装失败。
+- **便携版 Python 查最新版只等 6 秒**：`api.github.com` 国内基本连不通，超时后
+  直接用固定版本号下载（走镜像链），不再卡 15 秒。
+- **ACE 下载走 HF 镜像**：`workers/ace_download_worker.py` 设
+  `HF_ENDPOINT=https://hf-mirror.com`（用户自己设过就不覆盖），ModelScope 源失败
+  回落到 HuggingFace 时不再撞墙。
+- **环境体检新增两行**：GitHub 镜像按 `GH_MIRRORS` 全量列出，PyPI 按
+  `PYPI_MIRRORS` 全量列出，用户一眼能看出是哪一段断了。
+
+没改的部分：模型文件名/大小、DDSP 版本、torch 仍走 `download.pytorch.org`
+（国内可直连，只是慢；没找到可靠的 cu128 镜像索引）。包内仍无二进制、单文件
+仍都小于 2 MiB。
