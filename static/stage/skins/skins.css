@@ -1,0 +1,70 @@
+/* =============================================================================
+ * 「为她而唱」舞台皮肤样式（T2-B）
+ * 只做「皮肤基线」：暗角、颗粒、浅色皮肤的深色文字、描边装饰。
+ * 颜色仍主要来自 show.style.palette；浅色皮肤用 !important 覆盖文字变量，
+ * 保证淡色背景上字能看清（inline style 设的 --ink 优先级低于 !important）。
+ * ========================================================================== */
+
+/* 浅色皮肤：文字转深色 */
+.ns-root.ns-light .ns-wrap {
+  --ink: #26222e !important;
+  --ink2: #6b5f86 !important;
+  --hot: #b4557f !important;
+}
+.ns-root.ns-skin-anime_ink.ns-light .ns-wrap {
+  --ink: #2f2a26 !important;
+  --ink2: #6d5f55 !important;
+  --hot: #a34a4a !important;
+}
+
+/* 暗角按皮肤调轻/调重 */
+.ns-root.ns-skin-anime_pastel .ns-vig {
+  background: radial-gradient(ellipse at 50% 45%, transparent 60%, rgba(120, 60, 110, .28) 100%);
+}
+.ns-root.ns-skin-anime_night .ns-vig {
+  background: radial-gradient(ellipse at 50% 45%, transparent 52%, rgba(2, 4, 18, .6) 100%);
+}
+.ns-root.ns-skin-anime_neon .ns-vig {
+  background: radial-gradient(ellipse at 50% 45%, transparent 56%, rgba(8, 0, 30, .52) 100%);
+}
+.ns-root.ns-skin-anime_ink .ns-vig {
+  background: radial-gradient(ellipse at 50% 45%, transparent 64%, rgba(90, 70, 60, .22) 100%);
+}
+
+/* 颗粒与发光：粉彩/淡墨更轻，霓虹更干净 */
+.ns-root.ns-skin-anime_pastel .ns-grain { opacity: .035; }
+.ns-root.ns-skin-anime_night .ns-grain { opacity: .06; }
+.ns-root.ns-skin-anime_neon .ns-grain { opacity: .03; }
+.ns-root.ns-skin-anime_ink .ns-grain { opacity: .05; mix-blend-mode: multiply; }
+
+/* 描边装饰（typeface.rules.decor 含 outline 时挂 .ns-deco-outline） */
+.ns-root.ns-deco-outline .ns-ch.m-solid {
+  -webkit-text-stroke: 1px rgba(255, 255, 255, .55);
+  paint-order: stroke fill;
+}
+.ns-root.ns-light.ns-deco-outline .ns-ch.m-solid {
+  -webkit-text-stroke: 1px rgba(40, 34, 46, .45);
+}
+
+/* 霓虹皮肤的发光字更亮一点（保持纯函数：只挂在根类上，不按帧改） */
+.ns-root.ns-skin-anime_neon .ns-ch.m-neon,
+.ns-root.ns-skin-anime_neon .ns-ch.m-solid.on {
+  text-shadow: 0 0 8px var(--ink2), 0 0 24px var(--ink2), 0 0 52px var(--ink2);
+}
+
+/* 歌词可读性：暗色皮肤给深色投影，浅色皮肤给浅色光晕；
+   霓虹皮肤的描边改成深色，不然白字白边贴着人物看不出形状 */
+.ns-root.ns-skin-anime_neon .ns-ch.m-solid {
+  text-shadow: 0 2px 9px rgba(6, 2, 18, .62), 0 0 2px rgba(6, 2, 18, .5);
+}
+.ns-root.ns-skin-anime_night .ns-ch.m-solid {
+  text-shadow: 0 1px 7px rgba(0, 0, 0, .5);
+}
+.ns-root.ns-skin-anime_pastel .ns-ch.m-solid,
+.ns-root.ns-skin-anime_ink .ns-ch.m-solid {
+  text-shadow: 0 1px 5px rgba(255, 255, 255, .65);
+}
+.ns-root.ns-skin-anime_neon.ns-deco-outline .ns-ch.m-solid {
+  -webkit-text-stroke: 1px rgba(16, 6, 34, .55);
+  paint-order: stroke fill;
+}

@@ -604,17 +604,21 @@ class Pipeline:
 
     # ---------------- 口型轨 ----------------
     def _build_lips(self, track: dict, out_dir: Path, stem: str,
-                    duration: float = 0.0) -> dict:
+                    duration: float = 0.0, stem_kind: str = "") -> dict:
         """逐字口型轨算一次、落盘成 ``<track>/lips.json``。
 
         唱的时候读进度条只要把这份数据直接发布出去就行，不用现场抓歌词、
         算包络、做对齐——这几个动作加起来就是几秒的「嘴不动」。
+
+        ``stem`` 必须是**干净人声**（变声后的干声 / 分离并清理过的人声）。
+        千万不要传成品混音：伴奏的鼓点会直接变成包络，嘴在间奏跟着鼓乱张。
         """
         from . import lipsync
 
         track_id = str(track.get("id") or "")
         payload = lipsync.build_track_payload(
             track, stem=stem, duration=duration, lrc_fetcher=self.lrc_fetcher)
+        payload["stem_kind"] = str(stem_kind or "")
         target = out_dir / "lips.json"
         tmp = target.with_suffix(".json.part")
         tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -795,26 +799,23 @@ class Pipeline:
                     self._log(f"[{track_id}] 清理失败，直接用分离结果：{cleaned.get('error')}")
             self._set(track_id, progress=45, artifacts={"vocal_clean": vocal_input})
 
-            # 1.5) 口型轨：不占 GPU，和后面的配调/变声/混音并行算 ------------
-            # 读整首干声的包络 + 逐行对齐是几秒纯 CPU，正好搭变声那段的便车。
-            # 算完落盘成 lips.json，唱的时候直接读，不再现场抓歌词/算包络。
+            # 1.5) 口型轨：等「干净人声」出来再算（启动点见第 3 步之前）------
+            # 早期版本在这里用「原曲分离人声」算包络。分离不干净时鼓/贝斯会漏进
+            # 人声轨，嘴就跟着伴奏一张一合——用户看到的「误张」。现在统一等变声
+            # 后的成品人声（只有人声、没有伴奏）出来再算，和混音并行。
             lips_holder: dict = {}
             lips_error = ""
+            lips_thread = None
 
-            def _lips_job() -> None:
+            def _lips_job(stem_path: str, stem_kind: str) -> None:
                 nonlocal lips_error
                 try:
                     lips_holder.update(self._build_lips(
-                        self.store.get(track_id) or track, out_dir, vocal_input,
-                        float(track.get("duration_s") or 0.0)))
+                        self.store.get(track_id) or track, out_dir, stem_path,
+                        float(track.get("duration_s") or 0.0), stem_kind=stem_kind))
                 except Exception as exc:  # noqa: BLE001 - 口型失败不能拖垮出歌
                     lips_error = f"{type(exc).__name__}: {exc}"
                     self._log(f"[{track_id}] 口型轨计算失败：{lips_error}")
-
-            self._step(track_id, "lips", "running")
-            lips_thread = threading.Thread(target=_lips_job,
-                                           name=f"ms-lips-{track_id}", daemon=True)
-            lips_thread.start()
 
             # 1.55) 混响跟随原曲：用原始分离人声估计原曲人声的混响量 --------
             reverb_raw = self.paths.get("raw") or {}
@@ -939,6 +940,16 @@ class Pipeline:
 
             if track_id in self._cancelled:
                 raise _TrackCancelled()
+            # 2.5) 口型轨：只喂「干净人声」（变声后的干声，不含伴奏）---------
+            # 包络是谁的，嘴就跟着谁动。成品混音里全是鼓点，拿它算包络会让嘴
+            # 在间奏/前奏乱张。变声失败或没有干声时才退回清理过的原唱人声。
+            lips_stem = str(converted_vocal or "") or str(vocal_input or "")
+            lips_stem_kind = "vocal_wav" if converted_vocal else "vocal_clean"
+            self._step(track_id, "lips", "running")
+            lips_thread = threading.Thread(
+                target=_lips_job, args=(lips_stem, lips_stem_kind),
+                name=f"ms-lips-{track_id}", daemon=True)
+            lips_thread.start()
             # 3) mix ----------------------------------------------------------
             self._step(track_id, "mix", "running")
             if estimated_wet is not None and auto_reverb:
@@ -969,16 +980,18 @@ class Pipeline:
                           error=mix.get("error") or "混音失败")
                 return {"ok": False, "step": "mix", "error": mix.get("error"),
                         "detail": mix}
-            # 口型轨一般早就跟变声一起跑完了；这里只是收个尾。
-            lips_thread.join(timeout=240)
+            # 口型轨和混音同时跑；混音是长活，这里一般只是收个尾。
+            if lips_thread is not None:
+                lips_thread.join(timeout=240)
             lips_info = dict(lips_holder)
             if lips_info.get("path"):
                 self._step(track_id, "lips", "done", mode=lips_info.get("mode"),
                            cues=lips_info.get("cues"), align=lips_info.get("align"),
-                           source=lips_info.get("source"))
-                self._log(f"[{track_id}] 口型轨就绪：{lips_info.get('mode')} "
-                          f"cues={lips_info.get('cues')} align={lips_info.get('align')} "
-                          f"source={lips_info.get('source')}")
+                           source=lips_info.get("source"),
+                           stem=str(lips_stem), stem_kind=lips_stem_kind)
+                self._log(f"[{track_id}] 口型轨就绪（stem={lips_stem_kind}）："
+                          f"{lips_info.get('mode')} cues={lips_info.get('cues')} "
+                          f"align={lips_info.get('align')} source={lips_info.get('source')}")
             else:
                 self._step(track_id, "lips", "skipped",
                            error=lips_error or "口型轨没算完，播放时再补")

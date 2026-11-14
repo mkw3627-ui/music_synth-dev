@@ -1,0 +1,214 @@
+/* =============================================================================
+ * 「为她而唱」插件内舞台运行时 · 样式
+ * 所有选择器都在 .ns-root 之下，不污染宿主页面。
+ * 颜色全部来自 show.json 的 style.palette，由运行时写到 CSS 变量上。
+ * ========================================================================== */
+
+.ns-root {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  background: #000;
+  color: #fff;
+  font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+  --ink: #f2f6ff;
+  --ink2: #8fb8ff;
+  --hot: #ffd89a;
+  --bgA: #040817;
+  --bgB: #0f1d44;
+  --c1: #3f63ff;
+  --c2: #8fd0ff;
+  --c3: #ffcf8a;
+}
+
+.ns-root * { box-sizing: border-box; }
+
+.ns-world {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  will-change: transform;
+}
+.ns-bg {
+  position: absolute;
+  left: -6%;
+  top: -6%;
+  width: 112%;
+  height: 112%;
+  z-index: 1;
+  will-change: filter, transform;
+  image-rendering: auto;
+}
+.ns-fx {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 2;
+  mix-blend-mode: screen;
+  pointer-events: none;
+}
+.ns-ly {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  contain: layout style;
+}
+.ns-lyback { z-index: 3; }
+.ns-l2d {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 4;
+  pointer-events: none;
+}
+.ns-lyfront { z-index: 5; }
+.ns-bars { position: absolute; inset: 0; z-index: 6; pointer-events: none; }
+.ns-bars i {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 0;
+  background: #000;
+}
+.ns-bars i:first-child { top: 0; }
+.ns-bars i:last-child { bottom: 0; }
+
+.ns-vig {
+  position: absolute;
+  inset: 0;
+  z-index: 7;
+  pointer-events: none;
+  background: radial-gradient(ellipse at 50% 45%, transparent 50%, rgba(0, 0, 0, .62) 100%);
+}
+.ns-grain {
+  position: absolute;
+  inset: -50%;
+  z-index: 7;
+  pointer-events: none;
+  opacity: .06;
+  mix-blend-mode: overlay;
+  will-change: transform;
+}
+.ns-flash {
+  position: absolute;
+  inset: 0;
+  z-index: 9;
+  background: #fff;
+  opacity: 0;
+  pointer-events: none;
+  mix-blend-mode: screen;
+}
+.ns-black {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  background: #000;
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* ------------------------------- 歌词字 ------------------------------- */
+.ns-line { position: absolute; inset: 0; display: none; }
+.ns-ch {
+  position: absolute;
+  left: 0;
+  top: 0;
+  white-space: pre;
+  line-height: 1;
+  transform-origin: 50% 55%;
+  will-change: transform, opacity, filter;
+}
+.ns-ch.m-solid { color: var(--ink); text-shadow: 0 2px 14px rgba(0, 0, 0, .35); }
+.ns-ch.m-solid.kw { color: var(--hot); }
+.ns-ch.m-outline { color: transparent; -webkit-text-stroke: 2px var(--ink); }
+.ns-ch.m-outline.kw { -webkit-text-stroke-color: var(--hot); }
+.ns-ch.m-neon { color: #fff; text-shadow: 0 0 6px var(--ink2), 0 0 18px var(--ink2), 0 0 42px var(--ink2); }
+.ns-ch.m-grad {
+  background: linear-gradient(180deg, var(--ink) 20%, var(--ink2) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.ns-ch.m-solid.on { text-shadow: 0 0 10px var(--hot), 0 0 30px var(--hot); }
+.ns-ch.m-outline.on { color: var(--hot); -webkit-text-stroke-color: #fff; text-shadow: 0 0 22px var(--hot); }
+.ns-ch.m-neon.on { text-shadow: 0 0 6px #fff, 0 0 16px var(--hot), 0 0 40px var(--hot), 0 0 80px var(--hot); }
+.ns-ch.gl { text-shadow: -4px 0 rgba(255, 40, 90, .9), 4px 0 rgba(40, 240, 255, .9) !important; }
+
+/* ------------------------------- 字幕条 ------------------------------- */
+.ns-sub {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 5% 0 4.5%;
+  z-index: 8;
+  text-align: center;
+  pointer-events: none;
+  transition: opacity .4s;
+  background: linear-gradient(180deg, transparent, rgba(0, 0, 0, .55));
+  opacity: 0;
+}
+.ns-sub .row {
+  position: relative;
+  display: inline-block;
+  font-size: 3.1vh;
+  font-weight: 700;
+  letter-spacing: .12em;
+  line-height: 1.3;
+}
+.ns-sub .base { color: rgba(255, 255, 255, .55); -webkit-text-stroke: .5px rgba(0, 0, 0, .6); }
+.ns-sub .fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  white-space: pre;
+  color: var(--hot);
+  text-shadow: 0 0 8px var(--hot);
+  clip-path: inset(0 100% 0 0);
+}
+.ns-sub .nxt {
+  display: block;
+  font-size: 2.1vh;
+  font-weight: 400;
+  color: rgba(255, 255, 255, .35);
+  margin-top: .4vh;
+  letter-spacing: .1em;
+}
+
+/* ------------------------------- 编排面板 ------------------------------- */
+.ns-hud {
+  position: absolute;
+  left: 16px;
+  top: 14px;
+  z-index: 20;
+  display: none;
+  font: 12px/1.65 "Consolas", "Microsoft YaHei", monospace;
+  background: rgba(8, 8, 16, .55);
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: 10px;
+  padding: 10px 14px;
+  min-width: 270px;
+  backdrop-filter: blur(6px);
+  color: #dfe6ff;
+  pointer-events: none;
+}
+.ns-hud b { color: #fff; font-weight: 700; }
+.ns-hud .k { color: #8a93b8; display: inline-block; width: 5.5em; }
+.ns-hud .bar { display: inline-block; height: 6px; border-radius: 3px; background: linear-gradient(90deg, #4cf, #f4a); vertical-align: middle; }
+.ns-hud .t { color: #ffd77a; }
+
+/* 预览页外壳（只在 preview.html 用） */
+.ns-preview-ui { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); z-index: 30;
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: center;
+  background: rgba(8, 8, 16, .72); border: 1px solid rgba(255, 255, 255, .14); border-radius: 14px;
+  padding: 8px 12px; backdrop-filter: blur(8px); max-width: 94vw; font: 13px "Microsoft YaHei", sans-serif; color: #fff; }
+.ns-preview-ui button { background: rgba(255, 255, 255, .08); color: #fff; border: 1px solid rgba(255, 255, 255, .18);
+  border-radius: 8px; padding: 5px 10px; font-size: 13px; cursor: pointer; }
+.ns-preview-ui button:hover { background: rgba(255, 255, 255, .18); }
+.ns-preview-ui button.act { background: #fff; color: #111; }
+.ns-preview-ui input[type=range] { width: 240px; }
+.ns-preview-ui .tm { font: 12px Consolas, monospace; color: #ccd; min-width: 92px; text-align: center; }
+.ns-preview-ui.hide { display: none; }

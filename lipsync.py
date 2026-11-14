@@ -31,6 +31,34 @@ _LATIN_WORD = re.compile(r"[A-Za-z][A-Za-z'’]*")
 _VOWEL_GROUP = re.compile(r"[aeiouy]+", re.IGNORECASE)
 
 _LATIN_VISEME = {"a": "A", "i": "I", "u": "U", "e": "E", "o": "O", "y": "I"}
+# 英语拼写和发音对不上的高频词：整词直接给口型，别让「按字母找元音」去猜。
+# 这些词在歌词里出现得极密（the / you / love / one / are），错一个就整句错位。
+_WORD_VIS = {
+    # v14：the/a/an/of 的元音是弱读的 schwa，用 Z（半张、不咧嘴）；
+    # 原来借 S（声母式中性口型）会让英文整句的虚词都「不张嘴」。and 实际是 [æ]。
+    "the": "Z", "a": "Z", "an": "Z", "of": "Z", "and": "A", "to": "U",
+    "you": "U", "youre": "U", "youve": "U", "youll": "U", "youd": "U",
+    "your": "O", "yours": "O",
+    "one": "A", "once": "A", "love": "A", "come": "A", "some": "A",
+    "done": "A", "gone": "O", "have": "A", "give": "I", "live": "I",
+    "are": "A", "were": "E", "where": "E", "there": "E", "here": "I",
+    "more": "O", "before": "O", "sure": "O", "eye": "I", "eyes": "I",
+    "my": "I", "by": "I", "why": "I", "sky": "I", "fly": "I", "try": "I",
+    "say": "E", "day": "E", "way": "E", "away": "E", "okay": "E",
+    "now": "A", "how": "A", "down": "A", "out": "A", "about": "A",
+    "without": "A", "around": "A", "shout": "A", "loud": "A",
+    "know": "O", "low": "O", "show": "O", "slow": "O", "snow": "O",
+    "grow": "O", "blow": "O", "tomorrow": "O",
+    "would": "U", "could": "U", "should": "U", "good": "U",
+    "book": "U", "look": "U", "heart": "A", "break": "E", "great": "E",
+}
+# 元音组合 → 口型。英语的双字母组合（oo/ea/ai/ou…）如果按第一个字母读，
+# 「moon」会变成 O、「heart」会变成 E——这两个错得很显眼。
+_GROUP_VIS = {
+    "oo": "U", "ou": "A", "ow": "A", "oa": "O", "oe": "O", "oi": "O", "oy": "O",
+    "au": "O", "aw": "O", "ee": "E", "ea": "E", "ie": "I", "ei": "E", "ey": "E",
+    "ai": "A", "ay": "E", "ui": "U", "ue": "U", "ew": "U", "iu": "U",
+}
 # 假名直接按行段判口型（五十音每行一个主元音）。片假名单独列：
 # 日文歌词里 ア/イ/ウ 比汉字还多，漏了它整句就只剩「rest」。
 _KANA_VISEME = {
@@ -59,20 +87,120 @@ def _table() -> dict:
     chars = str(raw.get("chars") or "")
     vis = str(raw.get("vis") or "")
     index = {}
+    sylmap = {}
     if chars and vis and len(chars) == len(vis):
         for pos, ch in enumerate(chars):
             index[ch] = vis[pos]
-    _TABLE = {"index": index, "syllables": syllables}
+    # ``idx`` 是和 ``chars`` 一一对应的十六进制音节序号（"0,1,2,…"）。
+    # 有了它才算得出「这个字唱的是哪个韵母」——拼音表里同一类口型（E）
+    # 其实混着 [e] 和 [ɤ]/[ɨ] 两种完全不同的嘴形，详见 _is_schwa。
+    codes = str(raw.get("idx") or "")
+    if codes and syllables and chars:
+        parts = codes.split(",")
+        if len(parts) == len(chars):
+            for pos, ch in enumerate(chars):
+                code = parts[pos]
+                if not code:
+                    continue
+                try:
+                    sylmap[ch] = syllables[int(code, 16)]
+                except (ValueError, IndexError):
+                    pass
+    _TABLE = {"index": index, "syllables": syllables, "syl": sylmap}
     return _TABLE
 
 
+# 舌尖元音：zhi/chi/shi/ri/zi/ci/si 的 i 不是 [i]，是 [ɨ]——嘴唇基本不咧，
+# 只把牙露出来。按 I（form +0.95）去写，满篇「是/时/只」都变成咧嘴笑。
+_APICAL = frozenset(("zhi", "chi", "shi", "ri", "zi", "ci", "si"))
+
+# ---------------- v12：音节内部的口型相位（声母 → 韵母 → 韵尾） ----------------
+# 以前一个 cue 只有一个元音口型，整个字从开唱到唱完都是同一个嘴形。
+# 可「妈」和「怕」和「他」在画面上的区别，一半在开口那一下：b/p/m 是真的闭唇，
+# f 是唇齿，d/t/l 微张，z/c/s/zh/ch/sh 嘴唇中性略收；字尾的 n/ng 和 ai/ao 这类
+# 韵尾也是嘴形的收势。把这几段按比例放进同一个 cue 里，桥上按时间插值，
+# 嘴就会在字内「动起来」，而不是一个字一张定格的图。
+# 值 = (口型, 占整个字时长的比例)。比例按音节长度走，字唱得越慢这段越长。
+_ZH_ONSET = {
+    "b": ("M", 0.11), "p": ("M", 0.10), "m": ("M", 0.12),
+    "f": ("F", 0.14),
+    "d": ("L", 0.10), "t": ("L", 0.10), "n": ("L", 0.11), "l": ("L", 0.11),
+    "g": ("S", 0.10), "k": ("S", 0.10), "h": ("S", 0.13),
+    "j": ("S", 0.13), "q": ("S", 0.13), "x": ("S", 0.13),
+    "zh": ("S", 0.15), "ch": ("S", 0.15), "sh": ("S", 0.15), "r": ("L", 0.13),
+    "z": ("S", 0.14), "c": ("S", 0.14), "s": ("S", 0.14),
+}
+_ZH_INITIAL = re.compile(r"^(zh|ch|sh|[bpmfdtnlgkhjqxrzcsyw])")
+
+
+def _zh_coda(fin: str) -> tuple[str, float]:
+    """韵母的收势：n/ng 收到闭口，ai/ao 这类复韵母往滑音收。"""
+    if fin.endswith("ng"):
+        return ("S", 0.18)     # 后鼻音：嘴回到中性，不像 n 那样闭死
+    if fin.endswith("n"):
+        return ("N", 0.18)     # 前鼻音：舌尖抵住，嘴基本合上
+    if fin.endswith(("ai", "ei", "ui", "uai", "uei")):
+        return ("I", 0.20)
+    if fin.endswith(("ao", "ou", "iu", "iao", "iou", "uo")):
+        return ("U", 0.18)
+    return ("", 0.0)
+
+
+# 英语同样分两段：词首辅音（唇音闭上、唇齿、圆唇的 w）和词尾辅音
+# （home 的 m、time 的 m、hold 的 d…）。只给词的最后一个音节加韵尾——
+# 词中间那些辅音本来就连着下一个音节的起头，硬拆反而更假。
+_EN_ONSET = {
+    "b": ("M", 0.12), "p": ("M", 0.11), "m": ("M", 0.13),
+    "f": ("F", 0.14), "v": ("F", 0.13),
+    "w": ("U", 0.13),
+    "l": ("L", 0.11), "n": ("L", 0.11), "r": ("L", 0.11),
+    "s": ("S", 0.13), "z": ("S", 0.12), "c": ("S", 0.12), "j": ("S", 0.13),
+    "t": ("S", 0.10), "d": ("S", 0.10), "k": ("S", 0.10), "g": ("S", 0.10),
+    "h": ("S", 0.11), "x": ("S", 0.12), "q": ("S", 0.12),
+}
+_EN_CODA = {
+    "m": ("M", 0.16), "n": ("N", 0.16),
+    "f": ("F", 0.14), "v": ("F", 0.14),
+    "l": ("L", 0.14), "r": ("L", 0.12),
+    "s": ("S", 0.14), "z": ("S", 0.14),
+    "t": ("S", 0.12), "d": ("S", 0.12), "k": ("S", 0.12), "g": ("S", 0.12),
+    "p": ("M", 0.12), "b": ("M", 0.12), "c": ("S", 0.12), "x": ("S", 0.12),
+    "j": ("S", 0.12), "h": ("S", 0.12), "q": ("S", 0.12),
+}
+
+
+def _is_schwa(syl: str) -> bool:
+    """这个音节是不是「中性口型」：[ɤ]（的/了/着/和/个/这）或舌尖元音。
+
+    普通话歌词里「的」这种字一出现就是每行一个，按 E 的咧嘴笑去演，
+    整首歌看起来都在假笑；英语的 the / a / of 同理，统一用中性元音 Z
+    （嘴半张、不咧嘴）。
+    """
+    if syl in _APICAL:
+        return True
+    if not syl.endswith("e"):
+        return False
+    if syl.startswith("y"):          # ye / yue：前元音
+        return False
+    if syl.endswith(("ie", "ue", "ve")):   # jie / qie / xie / xue / jue
+        return False
+    return True
+
+
 def viseme_of_char(ch: str) -> str:
-    """One character → viseme letter (A/I/U/E/O/M/N/F/L/rest)."""
+    """One character → viseme letter (A/I/U/E/O/S/Z/M/N/F/L/rest)."""
     if not ch or _PUNCT.match(ch):
         return "rest"
     table = _table()
     hit = table["index"].get(ch)
     if hit:
+        syl = table.get("syl", {}).get(ch) or ""
+        if syl and _is_schwa(syl):
+            # v14：中性元音另立 Z。[ɤ]/[ɨ] 是「嘴半张、嘴唇不咧」的元音，
+            # 之前借用 S（= 声母的中性口型，张口度只有 0.34），
+            # 「的/是/实/时」这类字唱起来嘴几乎不动，就是用户说的「嘴巴不张」。
+            # S 仍然是声母/韵尾的中性收口，不能跟着抬高，否则 g/k/h/zh 起手就张。
+            return "Z"
         return hit
     for row, vis in _KANA_VISEME.items():
         if ch in row:
@@ -89,6 +217,36 @@ def viseme_of_char(ch: str) -> str:
     return "rest"
 
 
+def _cell_of_char(ch: str) -> tuple[str, str, str, float, str, float]:
+    """一个字 → (字, 元音口型, 声母口型, 声母占比, 韵尾口型, 韵尾占比)。
+
+    元音口型就是 v11 的 ``viseme_of_char``；多出来的是同一音节里
+    「开口那一下」和「收尾那一下」。韵尾和元音同形时不写——嘴形一样，
+    写了也只是多一次无变化的插值。表外字（假名、没拼音的汉字）只给元音。
+    """
+    vis = viseme_of_char(ch)
+    if vis == "rest":
+        return (ch, vis, "", 0.0, "", 0.0)
+    syl = _table().get("syl", {}).get(ch) or ""
+    if not syl:
+        return (ch, vis, "", 0.0, "", 0.0)
+    m = _ZH_INITIAL.match(syl)
+    on, of = _ZH_ONSET.get(m.group(1), ("", 0.0)) if m else ("", 0.0)
+    coda, cf = _zh_coda(syl[m.end():] if m else syl)
+    if on == vis:
+        on, of = "", 0.0
+    if coda == vis:
+        coda, cf = "", 0.0
+    return (ch, vis, on, of, coda, cf)
+
+
+def _phase_tag(on: str, of: float, coda: str, cf: float) -> str:
+    """cue 第 7 位（可选）的相位串：``声母:占比:韵尾:占比``，缺的写 ``-``。"""
+    if not on and not coda:
+        return ""
+    return "%s:%.2f:%s:%.2f" % (on or "-", of, coda or "-", cf)
+
+
 def split_lines(text: str) -> list[str]:
     """Lyrics → non-empty singable lines (section tags and blanks dropped)."""
     out = []
@@ -100,22 +258,73 @@ def split_lines(text: str) -> list[str]:
     return out
 
 
-def _latin_units(word: str) -> list[tuple[str, str]]:
-    """Latin word → one unit per vowel group (a syllable's mouth shape)."""
-    groups = _VOWEL_GROUP.findall(word)
-    if not groups:
-        return [(word, viseme_of_char(word[0]) if word else "rest")]
+def _latin_units(word: str) -> list[tuple]:
+    """Latin word → one unit per sung syllable (a syllable's mouth shape).
+
+    以前是「一个元音组一个口型」，但英语里有两类结构会让字数算多：
+      · 词尾不发音的 e：love / take / shine / time / please / dance
+        全都被拆成两拍，一行歌词的口型位比真实音节多出 1~3 个，
+        时间被摊薄之后，嘴就整体跑在声音前面（用户说的「英文口型不对」）；
+      · 词首的 y 是辅音：your / yes / young 被当成元音，your 变成 I。
+    现在先按拼写规则去掉不发音的 e、把词首 y 当辅音，再用双字母组合表
+    （oo→U、ea→E、ai→A…）取口型，最后才按元音组切分。
+
+    v12 起每个音节多带两段：本音节的起手辅音（b/p/m 闭唇、f 唇齿、w 圆唇）
+    和词尾辅音（home 的 m、hold 的 d）。词中间的辅音不加韵尾——它本来就连着
+    下一个音节的起头。返回的是 6 元组（同 ``_cell_of_char``）。
+    """
+    low = word.lower().replace("’", "'")
+    key = re.sub(r"[^a-z]", "", low)
+    if not key:
+        return [(word, "rest", "", 0.0, "", 0.0)]
+    if key in _WORD_VIS:
+        return [(word, _WORD_VIS[key], "", 0.0, "", 0.0)]
+    w = key
+    # 词尾不发音的 e（但 wanted / needed、makes / watches 里的 e 要发音）
+    if len(w) >= 3 and w.endswith("e") and w[-2] not in "aeiouy":
+        keep = False
+        if w.endswith("ed") and len(w) >= 4 and w[-3] in "td":
+            keep = True
+        elif w.endswith("es") and len(w) >= 4 and (
+                w[-3] in "sxz" or w.endswith(("ches", "shes"))):
+            keep = True
+        if not keep and any(c in "aeiouy" for c in w[:-1]):
+            w = w[:-1]
+    # 词首 y 在元音前是辅音（your / yes / you）
+    if len(w) >= 2 and w[0] == "y" and w[1] in "aeiou":
+        w = "j" + w[1:]
+    matches = list(_VOWEL_GROUP.finditer(w))
+    if not matches:
+        return [(word, viseme_of_char(word[0]) if word else "rest",
+                 "", 0.0, "", 0.0)]
+    last = len(matches) - 1
     units = []
-    for group in groups:
-        # 双元音取开口更大的那个：ai→A、ou→O、ei→E、iu→I
-        pick = group[0].lower()
-        if len(group) > 1 and group[0].lower() in "iu" and group[1].lower() in "aoe":
-            pick = group[1].lower()
-        units.append((group, _LATIN_VISEME.get(pick, "A")))
+    for pos, match in enumerate(matches):
+        g = match.group(0).lower()
+        if g in _GROUP_VIS:
+            vis = _GROUP_VIS[g]
+        elif len(g) >= 2 and g[:2] in _GROUP_VIS:
+            vis = _GROUP_VIS[g[:2]]
+        else:
+            vis = _LATIN_VISEME.get(g[0], "A")
+        # 词首 / 两个元音之间的那串辅音，取第一个字母当起手口型。
+        pre = w[(matches[pos - 1].end() if pos else 0):match.start()]
+        on, of = _EN_ONSET.get(pre[:1], ("", 0.0))
+        # 韵尾只给词的最后一个音节。
+        coda, cf = ("", 0.0)
+        if pos == last:
+            post = w[match.end():]
+            if post.endswith("ng"):
+                coda, cf = ("N", 0.16)
+            elif post:
+                coda, cf = _EN_CODA.get(post[-1], ("", 0.0))
+        if on == vis:
+            on, of = "", 0.0
+        units.append((match.group(0), vis, on, of, coda, cf))
     return units
 
 
-def _carry_visemes(units: list[tuple[str, str]]) -> list[tuple[str, str]]:
+def _carry_visemes(units: list[tuple]) -> list[tuple]:
     """让「占时值但不发音」的字沿用邻字的口型，别在句子中间闭嘴。
 
     ``line_units`` 会把长音符「ー」、重复记号「々」、促音「っ」以及
@@ -124,36 +333,42 @@ def _carry_visemes(units: list[tuple[str, str]]) -> list[tuple[str, str]]:
     演唱时长音符是把上一个元音延长、促音只是把音顿一下马上接下去，
     表外字至少也该沿用邻字的口型。所以行内所有 rest 都接到最近的有效口型
     （行首的 rest 借后面第一个），只有整行都没有口型时才保持 rest。
+    借来的口型不带相位：声母/韵尾是那个字自己的一次发音，不该重复。
     """
     if not units:
         return units
     out = list(units)
-    fill = next((vis for _, vis in out if vis != "rest"), "")
+    fill = next((unit[1] for unit in out if unit[1] != "rest"), "")
     if not fill:
         return out
     last = fill
-    for pos, (ch, vis) in enumerate(out):
-        if vis == "rest":
-            out[pos] = (ch, last)
+    for pos, unit in enumerate(out):
+        if unit[1] == "rest":
+            out[pos] = (unit[0], last, "", 0.0, "", 0.0)
         else:
-            last = vis
+            last = unit[1]
     return out
 
 
-def line_units(line: str) -> list[tuple[str, str]]:
-    """A lyric line → [(text, viseme)] in singing order."""
-    units: list[tuple[str, str]] = []
+def _line_cells(line: str) -> list[tuple]:
+    """A lyric line → [(text, viseme, onset, onset_frac, coda, coda_frac)]."""
+    cells: list[tuple] = []
     pos = 0
     for match in _LATIN_WORD.finditer(line):
         for ch in line[pos:match.start()]:
             if not _PUNCT.match(ch):
-                units.append((ch, viseme_of_char(ch)))
-        units.extend(_latin_units(match.group(0)))
+                cells.append(_cell_of_char(ch))
+        cells.extend(_latin_units(match.group(0)))
         pos = match.end()
     for ch in line[pos:]:
         if not _PUNCT.match(ch):
-            units.append((ch, viseme_of_char(ch)))
-    return _carry_visemes(units)
+            cells.append(_cell_of_char(ch))
+    return _carry_visemes(cells)
+
+
+def line_units(line: str) -> list[tuple[str, str]]:
+    """A lyric line → [(text, viseme)] in singing order."""
+    return [(cell[0], cell[1]) for cell in _line_cells(line)]
 
 
 def song_duration(path) -> float:
@@ -587,7 +802,9 @@ def _breath_marks(cues: list[list], env: dict) -> list[list]:
             low = min(amp[i0:i1]) if i1 > i0 else 0.0
             # 包络在这一段是 0（例如分离人声前段是静音）时无法判断，宁可不标。
             if ref <= 0.05 or low > 0.55 * ref:
-                cue = cue[:4]
+                # 只清句尾标记；v12 的相位串在第 7 位，不能跟着被截掉。
+                cue = [cue[0], cue[1], cue[2], cue[3], 0] \
+                    + [x for x in cue[5:] if isinstance(x, str)]
         out.append(cue)
     return out
 
@@ -679,9 +896,11 @@ def _apply_stress(cues: list[list], env) -> list[list]:
     out: list[list] = []
     for i, cue in enumerate(cues):
         flag = 1 if len(cue) > 4 and cue[4] else 0
+        # v12：第 7 位的音内相位串原样带过去（重音要占第 6 位）。
+        extra = [x for x in cue[5:] if isinstance(x, str)]
         if span <= 0:
             # 没有包络就没有依据，别把整首歌压成轻音：保持中性。
-            out.append([cue[0], cue[1], cue[2], cue[3], flag, 0.5])
+            out.append([cue[0], cue[1], cue[2], cue[3], flag, 0.5] + extra)
             continue
         t = min(1.0, max(0.0, (raw[i] - lo2) / spread))
         t = t ** 1.15
@@ -690,7 +909,7 @@ def _apply_stress(cues: list[list], env) -> list[list]:
         # 名次，轻音和重音挨在一起也分得开。0.4 是实测既不来回跳、又能
         # 把相邻字的差拉开一半的位置（0.5 以上就会一重一轻地抖）。
         t = 0.6 * t + 0.4 * _local_rank(i)
-        out.append([cue[0], cue[1], cue[2], cue[3], flag, round(t, 2)])
+        out.append([cue[0], cue[1], cue[2], cue[3], flag, round(t, 2)] + extra)
     return out
 
 
@@ -725,15 +944,74 @@ def _vocal_span_end(env, start: float, limit: float, *,
     return min(limit, (last + 1) * hop)
 
 
+def _line_segments(count: int, start: float, end: float,
+                   onsets: list[float]) -> list[tuple[float, float]]:
+    """一行里的 ``count`` 个字 → ``count`` 段时间，尽量对齐干声的音节起音。
+
+    旧版把整行按字数均分，再把边界吸附到最近的起音上。均分只在「每个字
+    一样长」时成立；真实演唱里常有长音——副歌最后一句可能有一半时间都在
+    拖同一个字。均分会把长音摊给后面的字，结果声音还在「啊——」的时候，
+    嘴已经换成了别的元音，听起来就是「长音发音不标准」。
+
+    这里把起音当音节边界直接切分：
+      · 起音比字多（装饰音/颤音也被算成起音）→ 合并最短的相邻段，
+        长音那一整段保持完整，不会被切碎；
+      · 起音比字少（连音/滑音）→ 切分最长的段；
+      · 一个起音都没有 → 均分，行为退回旧版。
+    """
+    if count <= 0:
+        return []
+    if end <= start:
+        end = start + max(0.2, 0.25 * count)
+    cand = [float(start)]
+    for value in onsets or ():
+        try:
+            at = float(value)
+        except (TypeError, ValueError):
+            continue
+        # 边界太密会让同一个字被切成一闪而过的口型；离行尾太近的起音
+        # 多半是这一句最后一个字本身，留给收尾段。
+        if at < cand[-1] + 0.07 or at > end - 0.05:
+            continue
+        cand.append(at)
+    cand.append(float(end))
+    segs = [[cand[i], cand[i + 1]]
+            for i in range(len(cand) - 1) if cand[i + 1] > cand[i]]
+    if not segs:
+        segs = [[float(start), float(end)]]
+    # 合并最短的相邻段：被合并掉的是最不像音节边界的那个起音。
+    while len(segs) > count:
+        best = min(
+            range(len(segs) - 1),
+            key=lambda i: (segs[i][1] - segs[i][0]) + (segs[i + 1][1] - segs[i + 1][0]))
+        segs[best][1] = segs[best + 1][1]
+        del segs[best + 1]
+    # 起音不够：切最长的那段（通常是漏检的连音），仍然保持时间顺序。
+    while len(segs) < count:
+        best = max(range(len(segs)), key=lambda i: segs[i][1] - segs[i][0])
+        a, b = segs[best]
+        if b - a < 0.09:
+            break
+        parts = min(count - len(segs) + 1, max(2, int(round((b - a) / 0.35))))
+        if parts < 2:
+            break
+        edges = [a + (b - a) * k / parts for k in range(parts + 1)]
+        segs[best:best + 1] = [[edges[k], edges[k + 1]] for k in range(parts)]
+    if len(segs) != count:
+        step = (end - start) / count
+        segs = [[start + i * step, start + (i + 1) * step] for i in range(count)]
+    return [(round(a, 3), round(b, 3)) for a, b in segs]
+
+
 def build_timed_cues(lines, duration: float, *, onsets=None,
                      env=None) -> list[list]:
     """``[{"at_s": 12.0, "text": "…"}]`` → cues using the real line timestamps.
 
     「为她所听」识别出的歌词带每行的起唱时间，比按字数铺满整首准得多：
-    行与行的边界是真时间，行内仍然按字数均分；传了 ``onsets``（干声的起音
-    时刻）时再把这些均分边界吸到最近的起音上，就细化到「每个音节」了。
-    传了 ``env``（干声响度包络）时，行尾拖长音会用它量出真实收声点，
-    用同一个元音把这段补成延续段——否则嘴会先闭上、声音还在唱。
+    行与行的边界是真时间。行内不再均分，而是用干声的音节起音切段
+    （见 ``_line_segments``），长音会被完整地留给它真正的那个字。
+    传了 ``env``（干声响度包络）时，还会量出这一行真正唱到哪一秒，
+    拖长音的尾段不会被下一行的行首时间截断。
     """
     timed: list[tuple[float, str]] = []
     for row in lines or []:
@@ -752,59 +1030,57 @@ def build_timed_cues(lines, duration: float, *, onsets=None,
     timed.sort(key=lambda item: item[0])
     onset_list = sorted(float(x) for x in (onsets or []) if x is not None)
     total = float(duration or 0.0)
+    # 感知转写偶尔会把尾奏/和声又拆成一行，时间戳落在曲长之外（本例：144.09s 的歌
+    # 有一行 at_s=152.0）。这些字根本不会被唱到，却会被当成「最后一行」硬塞进
+    # at+2s——十几个字挤进 0.6s，桥上一秒抖十几次。直接丢掉，不参与排布。
+    if total > 0:
+        timed = [(at, text) for at, text in timed if at < total]
+        if not timed:
+            return []
     cues: list[list] = []
     for index, (at, text) in enumerate(timed):
         if index + 1 < len(timed):
-            end = timed[index + 1][0]
+            limit = timed[index + 1][0]
         elif total > at:
-            end = total
+            limit = total
         else:
-            end = at + max(2.0, len(text) * 0.35)
-        if end <= at:
-            end = at + max(1.0, len(text) * 0.3)
-        units = line_units(text)
+            limit = at + max(2.0, len(text) * 0.35)
+        if limit <= at:
+            limit = at + max(1.0, len(text) * 0.3)
+        units = _line_cells(text)
         if not units:
             continue
         # 行与行之间常有几秒间奏。真按「唱到下一行」算，这一行最后一个字会被拉长
-        # 成好几秒的长音，口型和歌词就彻底对不上了——所以按字数给一个上限。
+        # 成好几秒的长音，口型和歌词就彻底对不上了——所以先按字数给一个上限。
         cap = max(1.2, len(units) * 0.42)
-        end = min(end, at + cap)
-        step = (end - at) / len(units)
-        bounds = [at + pos * step for pos in range(len(units) + 1)]
-        if onset_list and len(units) >= 2:
-            # 均分只是估计；真正唱出来的音节起点在干声的起音上。
-            bounds, _moved = _snap_bounds(bounds, onset_list, tol=step * 0.6)
-        line_start = len(cues)
-        for pos, (ch, viseme) in enumerate(units):
-            begin = bounds[pos]
-            stop = bounds[pos + 1]
+        sung_end = min(limit, at + cap)
+        if env and limit > at + 0.10:
+            # 干声量到的真实收声点。它通常比「按字均分」长（长音），
+            # 但不会越过下一行；量不出来（整句静音）才退回上限。
+            hold_to = _vocal_span_end(env, at, limit)
+            if hold_to > at + 0.30:
+                sung_end = min(limit, hold_to)
+        if env and onset_list:
+            segs = _line_segments(len(units), at, sung_end, onset_list)
+        else:
+            step = (sung_end - at) / len(units)
+            segs = [(round(at + pos * step, 3), round(at + (pos + 1) * step, 3))
+                    for pos in range(len(units))]
+        for pos, cell in enumerate(units):
+            begin, stop = segs[pos]
             if stop <= begin:
                 stop = begin + 0.05
-            row = [ch, viseme, round(begin, 3), round(stop, 3)]
+            row = [cell[0], cell[1], round(begin, 3), round(stop, 3)]
             # v4：句尾标记。LRC 的行与行往往首尾相接（间隙为 0），
             # 光看时间轴永远没有换气口；这里显式标出每行最后一个字，
             # 由桥在句尾做一次短暂收口。标记不影响唱字本身。
-            if pos == len(units) - 1:
-                row.append(1)
+            row.append(1 if pos == len(units) - 1 else 0)
+            # v12：第 7 位是可选的音内相位串（声母:占比:韵尾:占比）。
+            # 位置固定在最后，句尾标记/重音仍然按老位置读。
+            tag = _phase_tag(cell[2], cell[3], cell[4], cell[5])
+            if tag:
+                row.append(tag)
             cues.append(row)
-        # v5：行尾拖长音。按字数铺完的时间只是估计，录音里最后一个字常常
-        # 还在拖（或者接着 ラララ、副歌延长），到这里嘴就提前闭上了——听感
-        # 正是「这几个词没有口型」。用干声包络量出这一行真正唱到什么时刻，
-        # 再用最后一个字的元音补一段延续段，把嘴一直唱到真正收声为止。
-        limit = timed[index + 1][0] if index + 1 < len(timed) else max(total, end)
-        hold_from = bounds[-1]
-        if env and limit > hold_from + 0.25:
-            hold_to = _vocal_span_end(env, hold_from, limit)
-            if hold_to > hold_from + 0.22 and len(cues) > line_start:
-                if len(cues[-1]) > 4:
-                    # 这是长音的中段，不是换气口：别让桥在这里收嘴。
-                    cues[-1] = cues[-1][:4]
-                viseme = units[-1][1]
-                cursor = hold_from
-                while cursor < hold_to - 0.06:
-                    stop = min(hold_to, cursor + 0.45)
-                    cues.append(["ー", viseme, round(cursor, 3), round(stop, 3)])
-                    cursor = stop
     return cues
 
 
@@ -831,7 +1107,7 @@ def build_cues(lyrics: str, duration: float, *, lead_in: float | None = None,
     lines = split_lines(lyrics)
     if not lines:
         return []
-    units_per_line = [line_units(line) for line in lines]
+    units_per_line = [_line_cells(line) for line in lines]
     weights = [max(1, len(units)) for units in units_per_line]
     total = float(sum(weights))
     start_at = _lead_in(duration) if lead_in is None else float(lead_in)
@@ -849,11 +1125,13 @@ def build_cues(lyrics: str, duration: float, *, lead_in: float | None = None,
         # 行尾留 4% 给换气，避免上一行最后一个字延长到下一行第一个字。
         usable = line_span * 0.96
         step = usable / len(units)
-        for index, (text, viseme) in enumerate(units):
+        for index, cell in enumerate(units):
             begin = cursor + index * step
-            row = [text, viseme, round(begin, 3), round(begin + step, 3)]
-            if index == len(units) - 1:
-                row.append(1)   # 句尾：桥在这里收一下嘴
+            row = [cell[0], cell[1], round(begin, 3), round(begin + step, 3)]
+            row.append(1 if index == len(units) - 1 else 0)   # 句尾：桥在这里收一下嘴
+            tag = _phase_tag(cell[2], cell[3], cell[4], cell[5])
+            if tag:
+                row.append(tag)
             cues.append(row)
         cursor += line_span
     return cues
@@ -875,7 +1153,10 @@ def payload_for(wav, lyrics: str, *, lang: str = "", duration: float | None = No
     duration_seen = float(duration or 0.0) or song_duration(wav)
     cues = build_cues(lyrics, duration_seen)
     return {
-        "v": 1,
+        # v13：曲长之外的行（转写把尾奏/和声又拆成一句）不再塞进排布——
+        # 那会把十几个字压进 0.6s，桥上一秒抖十几次。旧缓存整批作废。
+        # v14：中性元音 / schwa 从 S 改判 Z（嘴半张），旧缓存口型偏闭，重算。
+        "v": 14,
         "wav": str(wav),
         "duration": round(duration_seen, 3),
         "lang": str(lang or ""),
@@ -911,7 +1192,8 @@ def get_or_build(wav, lyrics: str, *, lang: str = "", duration: float | None = N
     if not refresh:
         cached = read_sidecar(wav)
         if cached and cached.get("cues") is not None \
-                and cached.get("lhash") == lyrics_key(lyrics):
+                and cached.get("lhash") == lyrics_key(lyrics) \
+                and cached.get("v") == 14:
             return cached
     payload = payload_for(wav, lyrics, lang=lang, duration=duration)
     write_sidecar(payload, wav)
@@ -949,6 +1231,98 @@ def track_lyrics(track: dict) -> tuple[str, list, str]:
         lyrics = "\n".join(str(row.get("text") or "") for row in timed
                            if isinstance(row, dict))
     return lyrics, timed, source
+
+
+# ---------------- 歌词情绪（每行的「意思」→ VAD） ----------------
+# 口型轨只回答「这个字怎么张嘴」；表情还需要「这一句在说什么」。
+# 这里用一个双语词表给每行打分：正负（valence）、唤醒（arousal）、掌控
+# （dominance）。不是语义模型，但歌词的情绪词密度很高（爱/泪/笑/孤独…），
+# 词表够用；置信度低的行（没命中任何词）交给音频特征去决定。
+_MOOD_POS = ("笑", "开心", "快乐", "甜", "美", "幸", "温暖", "拥抱", "希望", "梦",
+             "爱", "喜欢", "阳光", "彩虹", "星", "飞", "自由", "一起", "永远", "勇",
+             "相信", "好", "光", "花", "春", "心跳", "温柔")
+_MOOD_NEG = ("哭", "泪", "痛", "伤", "别离", "孤独", "寂寞", "遗忘", "再见", "碎",
+             "冷", "雨", "错", "空", "失去", "后悔", "恨", "怕", "黑暗", "逃", "谎",
+             "累", "等", "远", "走", "死", "苦")
+_MOOD_HI = ("喊", "燃", "烧", "冲", "狂", "爆", "跳", "奔跑", "大声", "高", "一起",
+            "不停", "疯", "尖叫")
+_MOOD_LO = ("轻轻", "安静", "慢慢", "温柔", "静静", "悄悄", "沉默", "缓缓")
+_MOOD_POS_EN = ("love", "smile", "happy", "joy", "dream", "light", "sunshine",
+                "beautiful", "together", "forever", "shine", "sky", "fly", "free",
+                "sweet", "warm", "heart", "hope", "laugh", "dance", "sing", "young",
+                "gold", "star", "bright")
+_MOOD_NEG_EN = ("cry", "tear", "pain", "hurt", "lonely", "alone", "goodbye", "cold",
+                "rain", "broken", "sorry", "lose", "lost", "empty", "sad", "miss",
+                "far", "never", "die", "lie", "tired", "wait", "dark", "fear", "scared")
+_MOOD_HI_EN = ("scream", "shout", "burn", "fire", "run", "fight", "loud", "louder",
+               "jump", "tonight", "party", "wild", "crazy", "alive")
+_MOOD_LO_EN = ("quiet", "softly", "slow", "calm", "gentle", "whisper", "slowly",
+               "still")
+
+
+def _mood_hits(low: str, words) -> int:
+    total = 0
+    for word in words:
+        if word.isascii():
+            total += len(re.findall(r"\b" + re.escape(word) + r"\b", low))
+        else:
+            total += low.count(word)
+    return total
+
+
+def _unit(x: float) -> float:
+    return max(-1.0, min(1.0, float(x)))
+
+
+def line_mood(text: str) -> tuple[float, float, float, float]:
+    """一行歌词 → ``(v, a, d, conf)``，全部在 -1..1，conf 是 0..1 的置信度。"""
+    low = str(text or "").lower()
+    if not low.strip():
+        return (0.0, 0.0, 0.0, 0.0)
+    pos = _mood_hits(low, _MOOD_POS) + _mood_hits(low, _MOOD_POS_EN)
+    neg = _mood_hits(low, _MOOD_NEG) + _mood_hits(low, _MOOD_NEG_EN)
+    hi = _mood_hits(low, _MOOD_HI) + _mood_hits(low, _MOOD_HI_EN)
+    lo = _mood_hits(low, _MOOD_LO) + _mood_hits(low, _MOOD_LO_EN)
+    ex = low.count("!") + low.count("！")
+    ell = low.count("…") + low.count("...")
+    q = low.count("?") + low.count("？")
+    hits = pos + neg + hi + lo + ex + ell + q
+    if hits <= 0:
+        return (0.0, 0.0, 0.0, 0.0)
+    v = (pos - neg) * 1.6 / (pos + neg + 2.0)
+    a = (0.30 + 0.45 * hi - 0.30 * lo + 0.12 * ex - 0.10 * ell + 0.08 * q)
+    d = (0.25 + 0.35 * hi + 0.30 * max(v, 0.0) - 0.25 * max(-v, 0.0))
+    conf = min(1.0, 0.35 + 0.30 * hits)
+    return (round(_unit(v), 3), round(_unit(a), 3), round(_unit(d), 3),
+            round(min(1.0, conf), 2))
+
+
+def line_moods(timed: list, duration: float) -> list[list]:
+    """带时间戳的歌词行 → ``[[start, end, v, a, d, conf], ...]``（给桥用）。"""
+    rows: list[list] = []
+    for index, row in enumerate(timed or []):
+        if not isinstance(row, dict):
+            continue
+        try:
+            at = float(row.get("at_s"))
+        except (TypeError, ValueError):
+            continue
+        if at < 0:
+            continue
+        if index + 1 < len(timed):
+            try:
+                stop = float(timed[index + 1].get("at_s"))
+            except (TypeError, ValueError, AttributeError):
+                stop = at + 4.0
+        else:
+            stop = float(duration or 0.0) if duration and duration > at else at + 4.0
+        if stop <= at:
+            stop = at + 1.0
+        v, a, d, conf = line_mood(str(row.get("text") or ""))
+        if conf <= 0:
+            continue
+        rows.append([round(at, 3), round(stop, 3), v, a, d, conf])
+    return rows
 
 
 def build_track_payload(track: dict, *, stem: str = "", duration: float | None = None,
@@ -1035,7 +1409,20 @@ def build_track_payload(track: dict, *, stem: str = "", duration: float | None =
         # v8：重音掺入「这一句里谁更响」的局部名次。
         # v9：包络/对齐只允许来自干净人声（payload 里带 stem_kind）；
         #     用成品混音算出来的旧缓存全部作废重算——伴奏鼓点会让嘴乱张。
-        "v": 9,
+        # v10：行内改用干声音节起音切段（长音不再被均分给后面的字），
+        #      行尾拖长音直接由最后一个字撑满；桥同时用干声的实时音高/
+        #      颤音给长音做微开合。旧缓存（均分轨）全部作废重算。
+        # v11：每一行的情绪（v/a/d + 置信度）随口型轨一起发出去，桥用它把
+        #      「这句在唱什么」掺进表情；英文口型位按拼写规则重新计数
+        #      （去词尾哑 e、词首 y 当辅音、双字母组合取口型），中文 e/舌尖
+        #      元音改判 S（中性口型）。旧缓存全部作废重算。
+        # v12：每个 cue 多带一段音内相位（第 7 位，可选）——声母的口型
+        #      （b/p/m 闭唇、f 唇齿、w 圆唇）和韵尾的收势（n/ng、ai/ao），
+        #      桥按占比在字内插值。旧缓存（整字一个口型）全部作废重算。
+        # v13：曲长之外的行（转写把尾奏/和声又拆成一句）直接丢掉——以前会被
+        #      当成「最后一行」压进 0.6s，十几个字挤在一起，桥一秒抖十几次。
+        # v14：中性元音 / schwa 从 S 改判 Z（嘴半张），旧缓存口型偏闭，重算。
+        "v": 14,
         "track_id": str(track.get("id") or ""),
         "song": str(track.get("title") or ""),
         "duration": round(dur, 3),
@@ -1046,6 +1433,7 @@ def build_track_payload(track: dict, *, stem: str = "", duration: float | None =
         "lyrics_key": lyrics_key(lyrics) if lyrics.strip() else "",
         "stem": stem if stem_ok else "",
         "cues": cues,
+        "moods": line_moods(timed, dur),
         # 有歌词时包络也带上：不再是「没歌词才用」，而是作为张口度的调制信号。
         "hop": float((env or {}).get("hop") or 0.05),
         "env": list((env or {}).get("amp") or []),

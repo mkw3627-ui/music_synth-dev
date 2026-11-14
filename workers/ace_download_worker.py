@@ -12,6 +12,8 @@ import sys
 import traceback
 from pathlib import Path
 
+_MIN_WEIGHT_BYTES = 1024 * 1024  # 真正的分片都是百 MB 级；1MB 以下只可能是残片
+
 # HuggingFace 官方在国内容易连不上；ModelScope 源失败时会回落到 HF，
 # 这里把 HF 端点指到镜像（用户自己设过就不覆盖）。
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
@@ -19,19 +21,22 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 def _complete(model_dir: Path) -> bool:
     """True when every shard referenced by the index is present and non-empty."""
+    if not (model_dir / "config.json").is_file():
+        return False
     idx = model_dir / "model.safetensors.index.json"
     if idx.is_file():
         try:
             data = json.loads(idx.read_text(encoding="utf-8"))
             shards = set((data.get("weight_map") or {}).values())
             return bool(shards) and all(
-                (model_dir / s).is_file() and (model_dir / s).stat().st_size > 0
+                (model_dir / s).is_file()
+                and (model_dir / s).stat().st_size >= _MIN_WEIGHT_BYTES
                 for s in shards)
         except (OSError, ValueError):
             return False
     weights = model_dir / "model.safetensors"
     try:
-        return weights.is_file() and weights.stat().st_size > 0
+        return weights.is_file() and weights.stat().st_size >= _MIN_WEIGHT_BYTES
     except OSError:
         return False
 

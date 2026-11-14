@@ -206,6 +206,12 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
   const [picking, setPicking] = useState(false)
   const [pickErr, setPickErr] = useState("")
   const [pickNote, setPickNote] = useState("")
+  // 系统对话框彻底用不了时，把「手填 data\config.json」的说明摊开给人看
+  const [pickManual, setPickManual] = useState(false)
+  const [pathErr, setPathErr] = useState("")
+  // 每次点「选择文件夹」/点「取消」都 +1；迟到的轮询看到代号变了就闭嘴，
+  // 不会再把「选择中…」写回来。
+  const pickRun = useRef(0)
   const [job, setJob] = useState<any>(null)
   const [prog, setProg] = useState<any>(null)
   const [installing, setInstalling] = useState(false)
@@ -319,11 +325,19 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
   }, [installing, mockMode])
 
   const startInstall = async (only?: string) => {
+    const target = normalizePath(path)
+    const bad = pathProblem(target)
+    if (bad) {
+      setPathErr(bad)
+      setMustInstall(false)
+      setStep(4)
+      return
+    }
     setBusy(only || "all")
     setErr("")
     setMustInstall(false)
     try {
-      const r: any = await callEntry(props.api, "ms_setup_install", only ? { path: path.trim(), items: [only] } : { path: path.trim() }, 60000)
+      const r: any = await callEntry(props.api, "ms_setup_install", only ? { path: target, items: [only] } : { path: target }, 60000)
       if (r && r.already_ready) {
         setProg({ job_state: "done", items: {}, detail: "环境已就绪" })
         setMockDone(true)
@@ -373,44 +387,168 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
     setBusy("")
   }
 
+  // 选目录要填的路径：只收盘符开头的绝对路径（后端也是这么校验的），
+  // 先在这里说清楚，别等人点了安装才收到「请先选择安装位置」。
+  const pathProblem = (raw: string): string => {
+    const p = String(raw || "").trim()
+    if (!p) return ""
+    // 只写「D」或「D:」也行：会自动补成 D:\NEKOMusicSynth
+    if (/^[A-Za-z]$/.test(p) || /^[A-Za-z]:$/.test(p)) return ""
+    if (!/^[A-Za-z]:[\\/]/.test(p) && !/^\\\\[^\\]/.test(p)) {
+      return "要填完整路径：盘符开头，例如 D:\\NEKOMusicSynth（只写 D 或 D: 也可以，会自动补成 D:\\NEKOMusicSynth）"
+    }
+    if (/[<>:"|?*]/.test(p.slice(2))) return "路径里不能有 < > : \" | ? * 这些字符"
+    if (p.length > 180) return "路径太长了，换个短一点的位置"
+    return ""
+  }
+
+  const normalizePath = (raw: string): string => {
+    let p = String(raw || "").trim().replace(/[\\/]+$/, "")
+    if (/^[A-Za-z]$/.test(p)) p += ":\\NEKOMusicSynth"
+    if (/^[A-Za-z]:$/.test(p)) p += "\\NEKOMusicSynth"
+    return p
+  }
+
+  // 宿主的目录框（Electron dialog）在某些窗口状态下会永远不 resolve，
+  // 插件进程的对话框线程也可能卡住。任何等待都必须有上限——
+  // 用户看到的「一直显示选择中…」就是没有上限造成的。
+  const withTimeout = (p: any, ms: number, msg: string): Promise<any> =>
+    new Promise((resolve, reject) => {
+      let done = false
+      const timer = setTimeout(() => { if (!done) { done = true; reject(Error(msg)) } }, ms)
+      Promise.resolve(p).then(
+        (v: any) => { if (!done) { done = true; clearTimeout(timer); resolve(v) } },
+        (e: any) => { if (!done) { done = true; clearTimeout(timer); reject(e) } })
+    })
+
   // 选择安装目录：优先用宿主注入的系统目录框（Electron 原生，父子窗口关系正常）；
-  // 没有这个桥时改由插件进程弹（后台线程 + 轮询），两种都拿不到才让用户手输。
+  // 拿不到就由插件进程弹（后台线程 + 轮询）；两条都不行才让用户手填/写配置。
   const pickFolder = async () => {
     if (picking || installing) return
+    const run = ++pickRun.current
     setPicking(true)
     setPickErr("")
     setPickNote("")
+    setPickManual(false)
+    setPathErr("")
+    const alive = () => pickRun.current === run
+    let got = false
+    const apply = (raw: any): boolean => {
+      const v = normalizePath(String(raw || ""))
+      if (!v) return false
+      setPath(v)
+      setPickErr("")
+      setPickNote("")
+      setPickManual(false)
+      got = true
+      return true
+    }
     try {
       const host: any = (window as any).nekoHost
       if (host && typeof host.pickDirectory === "function") {
-        const r: any = await host.pickDirectory({ startPath: path.trim(), title: "选择安装文件夹" })
-        if (r && r.cancelled !== true && r.selected_root) setPath(String(r.selected_root))
-        setPicking(false)
-        return
+        setPickNote("正在打开系统选择窗口…（90 秒没有反应会自动换一种方式，也可以点「取消」）")
+        try {
+          const r: any = await withTimeout(
+            host.pickDirectory({ startPath: path.trim(), title: "选择安装文件夹" }),
+            90000, "宿主的目录框 90 秒没有返回")
+          if (!alive()) return
+          if (r && r.cancelled === true) {
+            setPickNote("已取消。")
+            return
+          }
+          if (r && r.selected_root && apply(r.selected_root)) return
+          setPickNote("宿主窗口没返回路径，改用插件自己的窗口…")
+        } catch (e: any) {
+          if (!alive()) return
+          setPickNote("宿主窗口没打开，改用插件自己的窗口…")
+        }
       }
-      const deadline = Date.now() + 10 * 60 * 1000
+      const deadline = Date.now() + 3 * 60 * 1000
       let first = true
-      while (Date.now() < deadline) {
+      while (Date.now() < deadline && alive()) {
         const r: any = await callEntry(props.api, "ms_setup_browse",
-          { start_path: path.trim(), title: "选择安装文件夹", wait: first ? 2 : 20, restart: first }, 40000)
+          { start_path: path.trim(), title: "选择安装文件夹", wait: first ? 3 : 10, restart: first }, 40000)
+        if (!alive()) return
         first = false
         const st = String((r && r.state) || "")
         if (st === "picked") {
-          if (r.path) setPath(String(r.path))
+          if (r.path) apply(r.path)
           setPickNote("")
-          setPicking(false)
           return
         }
-        if (st === "cancelled") { setPickNote(""); setPicking(false); return }
+        if (st === "cancelled") {
+          setPickNote("已取消。")
+          return
+        }
         if (st === "error") throw Error(String(r.error || "系统目录选择框打不开"))
-        setPickNote("已弹出系统选择窗口，在里面选好目录后会自动填进来。")
+        setPickNote("在系统窗口里选好目录就会自动填入（最多等 3 分钟）。")
       }
-      setPicking(false)
-      setPickErr("等了 10 分钟还没选好；也可以直接在下面的输入框里填路径。")
+      if (!alive()) return
+      setPickErr("等了 3 分钟没选好，直接填路径吧。")
     } catch (e: any) {
-      setPickNote("")
-      setPicking(false)
-      setPickErr("打不开系统目录选择框（" + String((e && e.message) || e) + "）；可以直接在下面的输入框里填路径。")
+      if (!alive()) return
+      setPickErr("打不开系统目录选择框。直接填路径点「保存并使用这个位置」，或看下面的手填说明。")
+      setPickManual(true)
+    } finally {
+      if (alive()) setPicking(false)
+      if (!got) {
+        // 后端可能还挂着一个看不见的框：复位掉，下次点还能重新弹
+        try { await callEntry(props.api, "ms_setup_browse", { cancel: true }, 8000) } catch (e) {}
+      }
+    }
+  }
+
+  const cancelPick = async () => {
+    pickRun.current += 1
+    setPicking(false)
+    setPickErr("")
+    setPickNote("已取消。")
+    try { await callEntry(props.api, "ms_setup_browse", { cancel: true }, 8000) } catch (e) {}
+  }
+
+  // 不开任何对话框，直接把路径写进插件配置（ms_set_config 会同时清掉旧盘上的
+  // 派生目录），这条路径不依赖系统对话框，是「选择中…」卡死时的保底方案。
+  const savePath = async () => {
+    const p = normalizePath(path)
+    const bad = pathProblem(p)
+    setPathErr(bad)
+    if (bad || !p) return
+    setBusy("savepath")
+    setErr("")
+    try {
+      const r: any = await callEntry(props.api, "ms_set_config", { compute_root: p }, 60000)
+      if (!r || r.ok === false) throw Error(String((r && r.error) || "没能保存安装位置"))
+      const stored = String((r.paths && r.paths.compute_root) || p)
+      setPath(stored)
+      setPickErr("")
+      setPickManual(false)
+      setPickNote("安装位置已保存：" + stored + "。可以点下面的安装按钮了。")
+      await check()
+    } catch (e: any) {
+      setPickErr("保存安装位置失败：" + String((e && e.message) || e)
+        + "。可以按下面的说明手动改 data\\config.json。")
+      setPickManual(true)
+    }
+    setBusy("")
+  }
+
+  const configJson = () => {
+    const p = path.trim() && !pathProblem(path) ? normalizePath(path) : "D:\\NEKOMusicSynth"
+    return JSON.stringify({
+      compute_root: p,
+      envs_dir: "", models_dir: "", work_dir: "", sep_model_dir: "",
+      ddsp_root: "", ddsp_ckpt: "", synth_python: "", sep_python: "", train_runs_dir: "",
+    }, null, 2)
+  }
+
+  const copyConfig = async () => {
+    try {
+      const nav: any = (window as any).navigator
+      if (!nav || !nav.clipboard || !nav.clipboard.writeText) throw Error("no clipboard")
+      await nav.clipboard.writeText(configJson())
+      setPickNote("配置内容已复制。粘到 data\\config.json 保存后，重启插件再回到这一页。")
+    } catch (e: any) {
+      setPickNote("复制失败，请照着下面的内容手写。")
     }
   }
 
@@ -424,6 +562,7 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
   const needsPath = !!report && (report.needs_path === true
     || (Array.isArray(report.missing) && report.missing.indexOf("install_path") >= 0))
   const lack = freeGb !== null && needGb > 0 && freeGb < Math.max(0.5, needGb * 1.15)
+  const pathIssue = pathProblem(path)
   const allReady = !!report && report.ready === true
   const canNext = allReady || mockDone
   // 只有在「还能在本页装好」的时候才拦着不让跳过；装不了的项目拦着也没用
@@ -608,9 +747,12 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
   const rank = (i: Item) => (i.required ? (i.status === "ready" ? 2 : 0) : (i.status === "ready" ? 3 : 1))
   const showing = [...items].sort((a: Item, b: Item) => rank(a) - rank(b))
   const firstOptIdx = showing.findIndex((i: Item) => i.required === false)
-  const driveTips = (((report && report.hardware && report.hardware.drives) || []) as any[])
-    .map((d: any) => String(d.drive || ""))
-    .filter((s: string) => /^[A-Za-z]:/.test(s))
+  // 推荐位置：盘符 + 剩余空间。这里刻意用普通 button 手绘（不是 <select>）——
+  // 下拉在面板的 iframe 里点不中，而按钮组不会。
+  const driveOptions = (((report && report.hardware && report.hardware.drives) || []) as any[])
+    .map((d: any) => ({ drive: String(d.drive || ""), free: Number(d.free_gib) }))
+    .filter((d: any) => /^[A-Za-z]:$/.test(d.drive))
+    .sort((a: any, b: any) => (isFinite(b.free) ? b.free : -1) - (isFinite(a.free) ? a.free : -1))
     .slice(0, 4)
   const overall = (() => {
     if (!prog) return 0
@@ -645,7 +787,7 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
       <div style={{ textAlign: "center" }}>
         <div style={{ fontSize: 19, fontWeight: 800, color: INK }}>准备运行环境</div>
         <div style={{ fontSize: 12.5, color: INK_2, marginTop: 6, lineHeight: 1.8 }}>
-          欢迎使用「为她而唱」。第一次打开需要先准备好她会用到的程序、模型和音频处理工具，之后就不用再装了。
+          第一次打开要先装好程序、模型和音频工具，只需一次。
         </div>
       </div>
 
@@ -669,56 +811,96 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
       {/* 安装位置（旧向导第 2 步） */}
       <div style={{ padding: 16, borderRadius: 18, background: "rgba(255,255,255,0.72)", border: "1px solid " + LINE, display: "flex", flexDirection: "column", gap: 10 }}>
         <div style={{ fontSize: 12.5, color: INK, lineHeight: 1.8 }}>
-          程序、模型和临时文件都会放在这里。选一个空间充足的盘就行，装在 D 盘、E 盘都可以。
+          程序、模型都装到这里，选个空间够的盘就行。
         </div>
         <label style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12, color: INK_2 }}>
           <span>安装到哪里</span>
-          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
             <input value={path} placeholder="例如 D:\\NEKOMusicSynth" disabled={installing}
-                   onChange={(e: any) => setPath(e.target.value)} style={{
-                     flex: 1, minWidth: 0,
-                     border: "1px solid " + (lack ? "#e8a3a3" : "transparent"), borderRadius: 12, padding: "10px 14px", fontSize: 13,
-                     background: lack ? "#fff6f6" : "rgba(248,250,252,0.95)", color: INK, outline: "none",
+                   aria-invalid={!!pathIssue}
+                   onChange={(e: any) => { setPath(e.target.value); setPathErr("") }} style={{
+                     flex: "1 1 220px", minWidth: 0,
+                     border: "1px solid " + (pathIssue || lack ? "#e8a3a3" : "transparent"), borderRadius: 12, padding: "10px 14px", fontSize: 13,
+                     background: pathIssue || lack ? "#fff6f6" : "rgba(248,250,252,0.95)", color: INK, outline: "none",
                    }} />
             <Btn style={{ ...ghostBtn, padding: "9px 14px", fontSize: 12.5, whiteSpace: "nowrap", flex: "0 0 auto" }}
                  disabled={installing || picking} onClick={pickFolder}>
               {picking ? "选择中…" : "选择文件夹"}
             </Btn>
-          </div>
-        </label>
-        <Muted>点「选择文件夹」在系统窗口里挑一个位置；模型和程序只装到这个目录，不会改动系统设置。</Muted>
-        {pickNote ? <Muted>{pickNote}</Muted> : null}
-        {pickErr ? (
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            <Alert tone="warning">{pickErr}</Alert>
-            {driveTips.length ? (
-              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-                <Muted style={{ fontSize: 11.5 }}>快捷填入：</Muted>
-                {driveTips.map((d: string) => (
-                  <button key={d} type="button" disabled={installing}
-                          onClick={() => setPath(d + "\\NEKOMusicSynth")}
-                          style={{ border: "1px solid rgba(224,45,118,0.16)", background: "#fff", color: BRAND_DEEP, borderRadius: 9, padding: "5px 10px", fontSize: 11.5, cursor: "pointer", fontFamily: "inherit" }}>
-                    {d}\NEKOMusicSynth
-                  </button>
-                ))}
-              </div>
+            {picking ? (
+              <Btn style={{ ...ghostBtn, padding: "9px 14px", fontSize: 12.5, flex: "0 0 auto" }} onClick={cancelPick}>取消</Btn>
             ) : null}
           </div>
+        </label>
+        {pathErr || pathIssue ? <Muted style={{ color: "#c93c3c", fontSize: 11.5 }}>{pathErr || pathIssue}</Muted> : null}
+        <Muted style={{ fontSize: 11.5 }}>填完整路径，如 D:\NEKOMusicSynth；只写 D: 也行。</Muted>
+
+        {/* 推荐位置：普通按钮组（手绘，不用 <select>——下拉在面板 iframe 里点不中） */}
+        {driveOptions.length ? (
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+            <Muted style={{ fontSize: 11.5 }}>推荐位置：</Muted>
+            {driveOptions.map((d: any) => {
+              const target = d.drive + "\\NEKOMusicSynth"
+              const on = path.trim().toUpperCase() === target.toUpperCase()
+              return (
+                <button key={d.drive} type="button" disabled={installing}
+                        onClick={() => { setPath(target); setPathErr(""); setPickErr(""); setPickNote("") }}
+                        style={{ border: "1px solid " + (on ? BRAND : "rgba(224,45,118,0.16)"),
+                                 background: on ? "rgba(255,229,239,0.75)" : "#fff",
+                                 color: BRAND_DEEP, borderRadius: 9, padding: "6px 10px", fontSize: 11.5,
+                                 cursor: installing ? "default" : "pointer", fontFamily: "inherit" }}>
+                  {target}{isFinite(d.free) ? " · 剩 " + Math.round(d.free) + " GB" : ""}
+                </button>
+              )
+            })}
+          </div>
         ) : null}
+
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+          <Btn style={{ ...ghostBtn, padding: "9px 14px", fontSize: 12.5 }}
+               disabled={installing || !!busy || !!pathIssue || !path.trim()} onClick={savePath}>
+            {busy === "savepath" ? "保存中…" : "保存并使用这个位置"}
+          </Btn>
+          {!pickManual ? (
+            <button type="button" onClick={() => setPickManual(true)}
+                    style={{ border: 0, background: "transparent", color: INK_3, fontSize: 11.5, cursor: "pointer", padding: 0, textDecoration: "underline", fontFamily: "inherit" }}>
+              打不开选择窗口？手填配置
+            </button>
+          ) : null}
+        </div>
+
+        <Muted style={{ fontSize: 11.5 }}>只装到这个目录，不改系统设置。</Muted>
+        {pickNote ? <Muted>{pickNote}</Muted> : null}
+        {pickErr ? <Alert tone="warning">{pickErr}</Alert> : null}
+
+        {/* 对话框彻底不可用时：把手填 data\config.json 的步骤摊开（用户已验证可行） */}
+        {pickManual ? (
+          <div style={{ padding: 12, borderRadius: 12, background: "rgba(248,250,252,0.95)", border: "1px solid " + LINE, display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ fontSize: 12, color: INK, fontWeight: 700 }}>打不开系统窗口时：手填配置</div>
+            <div style={{ fontSize: 11.5, color: INK_2, lineHeight: 1.8 }}>
+              1. 打开插件数据目录里的 <b>data\config.json</b>（没有就新建）<br />
+              2. 粘贴下面的内容，保存后重载插件<br />
+              3. 空字符串行别删，它们让各目录按新盘重算
+            </div>
+            <pre style={{ margin: 0, padding: 10, borderRadius: 10, background: "#fff", border: "1px solid " + LINE, fontSize: 11, color: INK, overflowX: "auto", fontFamily: "Consolas, monospace", lineHeight: 1.55 }}>{configJson()}</pre>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <Btn style={{ ...ghostBtn, padding: "6px 12px", fontSize: 11.5 }} onClick={copyConfig}>复制配置</Btn>
+            </div>
+          </div>
+        ) : null}
+
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
           {!path.trim() ? (
-            <StatusBadge tone="warning">请先填写安装目录，否则不会开始下载</StatusBadge>
-          ) : needsPath ? (
-            freeGb !== null
-              ? <StatusBadge tone="success">这个盘还剩 {freeGb.toFixed(1)} GB · 点下面的「用这个目录开始安装」</StatusBadge>
-              : <StatusBadge tone="neutral">目录已填 · 点下面的「用这个目录开始安装」</StatusBadge>
+            <StatusBadge tone="warning">先填安装目录</StatusBadge>
+          ) : pathIssue ? (
+            <StatusBadge tone="error">路径不能用：{pathIssue}</StatusBadge>
           ) : freeGb !== null ? (
             lack
-              ? <StatusBadge tone="error">这个盘只剩 {freeGb.toFixed(1)} GB，还要约 {needGb} GB，换一个盘吧</StatusBadge>
+              ? <StatusBadge tone="error">只剩 {freeGb.toFixed(1)} GB，需要约 {needGb} GB，换个盘</StatusBadge>
               : needGb > 0
-                ? <StatusBadge tone="success">这个盘还剩 {freeGb.toFixed(1)} GB · 需要约 {needGb} GB</StatusBadge>
-                : <StatusBadge tone="success">这个盘还剩 {freeGb.toFixed(1)} GB · 必需项已齐</StatusBadge>
-          ) : <Muted>（无法读取剩余空间，也可以继续）</Muted>}
+                ? <StatusBadge tone="success">剩 {freeGb.toFixed(1)} GB · 需要约 {needGb} GB</StatusBadge>
+                : <StatusBadge tone="success">剩 {freeGb.toFixed(1)} GB · 已齐</StatusBadge>
+          ) : <Muted>读不到剩余空间，也可以继续</Muted>}
         </div>
         {mockMode ? <Muted>安装向导暂时读不到检测结果。</Muted> : null}
       </div>
@@ -879,13 +1061,11 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
               <Row style={{ justifyContent: "space-between", alignItems: "center" }}>
                 <Btn style={ghostBtn} onClick={() => setStep(3)} disabled={installing}>上一步</Btn>
                 <Row style={{ gap: 10 }}>
-                  {/* 必需项齐了也能补装可选档位，所以这里只看「有没有可装的东西」，不看 allReady。
-                      还没保存安装目录时清单里只剩 install_path 一项（不可安装），
-                      这时也要给按钮：它会把目录写进配置再开始安装。 */}
-                  {!items.some((i: Item) => i.installable && i.status !== "ready") && !(needsPath && !!path.trim()) ? null : (
-                    <Btn style={primaryBtn} disabled={!!busy || installing || !path.trim() || lack}
+                  {/* 必需项齐了也能补装可选档位，所以这里只看「有没有可装的东西」，不看 allReady */}
+                  {!items.some((i: Item) => i.installable && i.status !== "ready") ? null : (
+                    <Btn style={primaryBtn} disabled={!!busy || installing || !path.trim() || !!pathIssue || lack || !items.some((i: Item) => i.installable && i.status !== "ready")}
                          onClick={() => startInstall()}>
-                      {installing ? "正在安装…" : busy === "all" ? "正在启动…" : needsPath ? "用这个目录开始安装" : needGb > 0 ? "一键安装全部" : "安装可选项"}
+                      {installing ? "正在安装…" : busy === "all" ? "正在启动…" : needGb > 0 ? "一键安装全部" : "安装可选项"}
                     </Btn>
                   )}
                   <Btn style={canNext ? primaryBtn : ghostBtn} disabled={!canNext || installing} onClick={() => setStep(5)}>

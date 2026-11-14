@@ -33,6 +33,7 @@ from plugin.sdk.plugin import (
 
 from . import (
     cache_cleanup,
+    claim_state,
     lips_server,
     lipsync,
     model_package,
@@ -41,6 +42,13 @@ from . import (
     vram_release,
 )
 from . import setup as setup_mod
+
+# 离线编排（show.json）：schema/director/presets 都只用标准库，进程内直接 import
+# 不影响启动耗时；真正的重活（librosa 分析）在 choreo_worker 子进程里跑。
+from .choreo import director as choreo_director
+from .choreo import presets as choreo_presets
+from .choreo import schema as choreo_schema
+from .choreo import semantics as choreo_semantics
 from .pipeline import STEP_ORDER as STEP_ORDER
 from .pipeline import Pipeline
 from .song_listener import SongListener
@@ -197,6 +205,15 @@ class MusicSynthPlugin(NekoPluginBase):
             lips_server.start()
         except Exception as exc:  # noqa: BLE001 - 起不来只是没有口型
             self.logger.warning("[lips] 口型服务启动失败：%s", exc)
+        # 全景舞台的资源根：show.json 在 work/tracks/<id>/ 下，舞台页/字体只读。
+        try:
+            lips_server.set_show_root(str(self._pipeline.work_dir))
+            _static = self._plugin_dir / "static"
+            lips_server.set_static_roots(_static / "stage", _static / "fonts")
+        except Exception as exc:  # noqa: BLE001 - 没有舞台页也能唱
+            self.logger.warning("[show] 舞台资源根登记失败：%s", exc)
+        self._show_lock = threading.Lock()
+        self._show_workers: dict[str, threading.Thread] = {}
         # 插件重启会把处理线程带走：上次遗留的 running/queued 标记为中断，
         # 否则列表里会永远停在一个不动的「正在处理 5%」。
         resume_ids: list[str] = []
@@ -532,6 +549,23 @@ class MusicSynthPlugin(NekoPluginBase):
             if job_id in self._jobs:
                 self._jobs[job_id].update(fields)
 
+    # ── 真话口径：作业终态 / 对外说法（唯一口径见 claim_state.py）──────────
+    # 反例（用户投诉「说假话」）：流水线因为录音只有 28 秒返回 blocked，但返回体
+    # 里 ok=True，作业被记成 done + 「完成」。模型拿到「完成」就当唱好了。
+
+    def _job_outcome(self, result: dict, track_id: str = "") -> tuple[str, str]:
+        """流水线返回值 → (作业终态, 说明)。只有真出成品才算 done。"""
+        track = self._pipeline.store.get(track_id) if track_id else None
+        finished = None if track is None else self._finished(track)
+        state, detail = claim_state.job_outcome(result, finished=finished)
+        if state == "blocked" and track is not None:
+            detail = str(track.get("check_reason") or detail)
+        return state, detail
+
+    def _speech(self, state: str, detail: str = "", track: dict | None = None) -> dict:
+        """给模型看的真状态块：能说什么、不能说什么，写在返回值里。"""
+        return claim_state.speech_for(state, detail, track)
+
     # 真正占用显存的训练阶段；awaiting_choice 只是等用户选检查点，不占 GPU。
     _TRAIN_GPU_PHASES = ("preparing", "preprocessing", "training", "previewing")
 
@@ -675,6 +709,71 @@ class MusicSynthPlugin(NekoPluginBase):
             link = {}
         return Ok(self._snapshot(link=link))
 
+    @llm_tool(
+        name="music_synth_claim_check",
+        description=("出声前核对：某首歌 / 最近一次作业现在到底做完没有。"
+                     "准备说「唱完了 / 做好了 / 成品出来了 / 可以听了」之前必须先调用，"
+                     "并且以返回的 can_claim_done 为准：false 时只能说还在做 / 没做成，"
+                     "绝对不能说已经完成。text 传入你准备说的那句话，便于核对有没有完成类断言。"),
+        parameters={"type": "object", "properties": {
+            "track_id": {"type": "string", "description": "曲目 id，可不填"},
+            "text": {"type": "string", "description": "准备说出口的话，可不填"}}},
+        timeout=15.0,
+    )
+    @plugin_entry(id="ms_claim_check", name="为她而唱 · 出声前核对",
+                  description=("只读：返回某首歌/最近一次作业的真实状态与证据"
+                               "（track 状态、成品文件是否真的存在、作业终态），"
+                               "并给出 can_claim_done / say / forbid_claims"),
+                  input_schema={"type": "object", "properties": {
+                      "track_id": {"type": "string"},
+                      "text": {"type": "string"}}})
+    async def ms_claim_check(self, track_id: str = "", text: str = "", **_):
+        tracks = self._pipeline.store.all()
+        track = self._pipeline.store.get(str(track_id)) if track_id else (
+            tracks[-1] if tracks else None)
+        with self._jobs_lock:
+            jobs = list(self._jobs.items())
+        job_id, job = ("", {})
+        for candidate_id, candidate in reversed(jobs):
+            candidate = candidate if isinstance(candidate, dict) else {}
+            if not track_id or str(candidate.get("track_id") or "") == str(track_id):
+                job_id, job = candidate_id, candidate
+                break
+        status = str((track or {}).get("status") or "")
+        final = str(((track or {}).get("artifacts") or {}).get("final") or "")
+        try:
+            final_exists = bool(final) and Path(final).is_file()
+        except OSError:
+            final_exists = False
+        job_state = str(job.get("state") or "")
+        detail = str(job.get("detail") or (track or {}).get("check_reason")
+                     or (track or {}).get("error") or "")
+        state = claim_state.claim_state(
+            job_state=job_state, track_status=status,
+            final_exists=final_exists, has_track=track is not None)
+        can_claim_done = state == "done" and final_exists
+        speech = claim_state.speech_for(state, detail, track)
+        speech["can_claim_done"] = can_claim_done
+        claims = claim_state.claims_in_text(text)
+        if not str(text or "").strip():
+            verdict = "no_claim"
+        elif can_claim_done:
+            verdict = "supported"
+        elif claims:
+            verdict = "contradicted"
+        else:
+            verdict = "no_claim"
+        return Ok({"ok": True, "checked": True, "state": state,
+                   "can_claim_done": can_claim_done, "verdict": verdict,
+                   "claims_in_text": claims, "detail": detail[:160],
+                   "track_id": str((track or {}).get("id") or ""),
+                   "title": str((track or {}).get("title") or ""),
+                   "track_status": status, "final_exists": final_exists,
+                   "job_id": job_id, "job_state": job_state,
+                   "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                   "speech": speech,
+                   "note": "只读核对：can_claim_done=false 时只能说还在做/没做成。"})
+
     def _reload_paths(self) -> dict:
         self._pipeline.paths = runtime.resolve_paths(
             self._data_dir, getattr(self, "_host_section", {}))
@@ -770,9 +869,14 @@ class MusicSynthPlugin(NekoPluginBase):
                       "wait": {"type": "number",
                                "description": "本次最多等待秒数（默认 20，上限 30）"},
                       "restart": {"type": "boolean",
-                                  "description": "true 表示开始一次新的选择（重复调用传 false 只等结果）"}}})
+                                  "description": "true 表示开始一次新的选择（重复调用传 false 只等结果）"},
+                      "cancel": {"type": "boolean",
+                                 "description": "true 表示关掉还没选完的系统对话框并把状态复位"}}})
     async def ms_setup_browse(self, start_path: str = "", title: str = "",
-                              wait: float = 20.0, restart: bool = False, **_):
+                              wait: float = 20.0, restart: bool = False,
+                              cancel: bool = False, **_):
+        if cancel:
+            return Ok(dict(await asyncio.to_thread(setup_mod.browse_cancel), ok=True))
         try:
             wait_s = max(0.0, min(float(wait or 20.0), 30.0))
         except (TypeError, ValueError):
@@ -2915,7 +3019,10 @@ class MusicSynthPlugin(NekoPluginBase):
                      "anchor=current 表示当前这首（还在录就排队，录完自动开唱）；"
                      "anchor=previous 表示上一首。开始处理后用 music_synth_sing 播放成品。"
                      "唱歌处理期间会让她所听暂停分离/歌词识别以腾显存，录音继续；"
-                     "如果返回 lyrics_from_perception，可以自然地说给用户听。"),
+                     "如果返回 lyrics_from_perception，可以自然地说给用户听。"
+                     "返回里的 speech.can_claim_done=false（started / queued / processing）时，"
+                     "只能说「已经交给后台在做，还没好」，绝对不能说唱完了或做好了；"
+                     "不确定就先调用 music_synth_claim_check 核对。"),
         parameters={"type": "object", "properties": {
             "anchor": {"type": "string", "enum": ["current", "previous"]},
             "track_id": {"type": "string", "description": "指定曲目 id，可不填"}},
@@ -2954,16 +3061,20 @@ class MusicSynthPlugin(NekoPluginBase):
             if when_ready and self._song_listener.status().get("running"):
                 self._pending_sing = {"kind": kind or "current"}
                 return Ok({"ok": True, "queued": True, "pending": dict(self._pending_sing),
+                           "speech": self._speech("queued", "正在录这首歌，录完才开唱"),
                            "note": "正在录这首歌，录完就自动开唱"})
-            return Ok({"ok": False, "error": "没有可唱的录音（先开听歌录制）"})
+            return Ok({"ok": False, "speech": self._speech("blocked", "没有可唱的录音"),
+                       "error": "没有可唱的录音（先开听歌录制）"})
         status = str(target.get("status") or "")
         if status in ("running", "queued"):
             return Ok({"ok": True, "already": True, "track": target,
+                       "speech": self._speech("processing", "这首正在处理", target),
                        "note": "这首歌正在处理"})
         if status in ("instrumental", "incomplete", "silent"):
             reason = str(target.get("check_reason") or "")
             if not force:
                 return Ok({"ok": False, "status": status, "track": target,
+                           "speech": self._speech("blocked", reason or "这首歌不能翻唱", target),
                            "error": reason or "这首歌不能翻唱",
                            "note": ("纯音乐没有人声、或者这段录音没放完整。"
                                     "确实想硬唱可以带 force=true，但不建议")})
@@ -2974,6 +3085,7 @@ class MusicSynthPlugin(NekoPluginBase):
             target = self._pipeline.store.get(str(target["id"])) or target
         if status == "done":
             return Ok({"ok": True, "already_done": True, "track": target,
+                       "speech": self._speech("done", "已有成品", target),
                        "note": "这首已经唱好了，可在列表里试听或重新唱"})
         lp = await self._perception_lyrics()
         lyrics = lp.get("songs") or []
@@ -2985,6 +3097,7 @@ class MusicSynthPlugin(NekoPluginBase):
         job_id = self._background_process(str(target["id"]), kind="anchor",
                                           perception_priority=True)
         return Ok({"ok": True, "started": True, "job_id": job_id, "track": target,
+                   "speech": self._speech("submitted", "已提交后台处理", target),
                    "lyrics_from_perception": lyrics,
                    "official_lyrics": official,
                    "note": ("唱歌处理时会让她所听暂停分离和歌词识别，录音继续"
@@ -3035,6 +3148,7 @@ class MusicSynthPlugin(NekoPluginBase):
         separation (used by 「重新唱一遍」).
         """
         job_id = self._job_begin(kind)
+        self._job_update(job_id, track_id=str(track_id))
         probe = runtime.probe_hardware(force=True)
         paths = self._pipeline.paths
         plan = runtime.plan_for(probe, paths.get("tier_override", ""),
@@ -3074,8 +3188,9 @@ class MusicSynthPlugin(NekoPluginBase):
                 try:
                     result = self._pipeline.process_track(
                         track_id, plan_used, resume=not force)
-                    self._job_update(job_id, state="done" if result.get("ok") else "failed",
-                                     progress=100, detail=result.get("error") or "完成")
+                    job_state, job_detail = self._job_outcome(result, track_id)
+                    self._job_update(job_id, state=job_state,
+                                     progress=100, detail=job_detail)
                 except Exception as exc:  # noqa: BLE001
                     self._job_update(job_id, state="failed", detail=f"{type(exc).__name__}: {exc}")
                 finally:
@@ -3142,6 +3257,7 @@ class MusicSynthPlugin(NekoPluginBase):
                                           perception_priority=True)
         return Ok({"ok": True, "started": True, "job_id": job_id, "track_id": track_id,
                    "resumed": not _as_bool(force), "tier": self._pipeline.last_plan,
+                   "speech": self._speech("submitted", "已提交后台处理", track),
                    "lyrics_from_perception": lyrics,
                    "official_lyrics": official})
 
@@ -3365,7 +3481,14 @@ class MusicSynthPlugin(NekoPluginBase):
         return {"mode": "browser", "clock": "audio"}
 
     def _arm_playback_fallback(self, target: str, seq: int) -> None:
-        """1.8 秒内网页没确认播放就退回 ffplay（后台线程，不挡主流程）。"""
+        """1.8 秒内网页没确认播放就退回 ffplay，但**保留音频地址**。
+
+        以前这里会 ``drop_audio()``：网页稍微慢一点（页面刚加载、自动播放要等
+        一次点击）就永久失去接管机会，成品只能由 ffplay 播；而身体律动和表情
+        都靠主窗口那条 ``<audio>`` 的频谱——声音一交给 ffplay，整条链就只剩嘴。
+        现在改成「先出声、继续等」：网页晚到并确认播放时，把 ffplay 停掉，
+        动作/表情跟着活过来，最多重叠不到一秒。
+        """
         def wait() -> None:
             deadline = time.monotonic() + 1.8
             while time.monotonic() < deadline:
@@ -3378,17 +3501,29 @@ class MusicSynthPlugin(NekoPluginBase):
                 time.sleep(0.1)
             if self._last_play_target != target:
                 return
-            if not lips_server.status().get("active"):
-                # 没有口型轨（连包络都没有）也别让人干等：直接出声。
-                pass
-            else:
-                self.logger.warning("[playback] 主窗口没有接管音频，退回 ffplay")
-            # 撤掉音频地址：避免网页那头稍后又把声音拉起来，两路一起响。
-            lips_server.drop_audio()
+            if lips_server.status().get("active"):
+                self.logger.warning("[playback] 主窗口 1.8 秒内没接管，先由 ffplay 出声（仍等网页晚到）")
             try:
                 self._spawn_player(target)
             except OSError as exc:
                 self.logger.warning("[playback] 退回 ffplay 失败：%s", exc)
+                return
+            # 网页晚到：它一旦确认开始播，就只停 ffplay 进程，不碰口型轨。
+            end = time.monotonic() + 45.0
+            while time.monotonic() < end:
+                if self._last_play_target != target or not self._playback_proc:
+                    return
+                if lips_server.audio_state(seq) == "playing":
+                    proc = getattr(self, "_playback_proc", None)
+                    self._playback_proc = None
+                    if proc is not None and proc.poll() is None:
+                        try:
+                            proc.terminate()
+                        except OSError:
+                            pass
+                    self.logger.info("[playback] 网页晚到并接管，已停掉 ffplay")
+                    return
+                time.sleep(0.15)
 
         threading.Thread(target=wait, daemon=True,
                          name="music_synth-play-fallback").start()
@@ -3450,13 +3585,23 @@ class MusicSynthPlugin(NekoPluginBase):
         # audio=True：把成品 WAV 也挂到口型服务上，主窗口的 <audio> 拉起它边下边播，
         # 嘴直接读 audio.currentTime。预演（ms_lips_preview）传 False，保持静音。
         audio_path = str(target or "") if audio else ""
+        # 干声也挂到口型服务（/stem.wav）：桥拿它做实时 F0/音色分析，
+        # 长音时按真实音高和颤音做细微开合，表情也跟着人声的亮暗走。
+        stem_path = str(payload.get("stem") or "")
         if cues:
             # v6：随 cue 轨一起发干声包络，桥用它调制张口度——只有五个元音
             # 固定张度的话，嘴在字与字之间是"定格"的，看起来像木偶。
             state = lips_server.set_playing(cues=cues, song=song, track_id=track_id,
                                             duration=duration, audio_path=audio_path,
+                                            stem_path=stem_path,
+                                            moods=payload.get("moods") or [],
                                             env=payload.get("env") or [],
                                             hop=float(payload.get("hop") or 0.05))
+            # 舞台编排：后台生成/复用 show.json，唱起来之后才用得到。
+            try:
+                self._ensure_show_async(track, payload, target)
+            except Exception as exc:  # noqa: BLE001 - 编排不能挡住唱歌
+                self.logger.warning("[show] 后台排期失败：%s", exc)
             return {**state, "source": payload.get("source"),
                     "align": payload.get("align"),
                     "lang": payload.get("lang") or str(track.get("vocal_language") or "")}
@@ -3472,7 +3617,7 @@ class MusicSynthPlugin(NekoPluginBase):
                 cues=lipsync.envelope_cues({"amp": env_amp, "hop": hop}),
                 env=env_amp, hop=hop, mode="vocal_envelope",
                 song=song, track_id=track_id, duration=duration,
-                audio_path=audio_path)
+                audio_path=audio_path, stem_path=stem_path)
             return {**state, "source": "vocal_envelope", "stem": payload.get("stem")}
         lips_server.clear()
         return {"ok": True, "active": False, "reason": "no_cues",
@@ -3516,12 +3661,17 @@ class MusicSynthPlugin(NekoPluginBase):
                 # v5 起行尾拖长音由干声包络补延续段；v6 起 cue 轨带包络，
                 # 桥按响度调制张口度；v7 起每个 cue 带重音强度；
                 # v8 起重音掺入「这一句里谁更响」的局部名次；
-                # v9 起包络只许来自干净人声（带 stem_kind），旧缓存重算。
+                # v9 起包络只许来自干净人声（带 stem_kind），旧缓存重算；
+                # v10 起行内用干声音节起音切段，长音整段留给它真正的字；
+                # v11 起每行带情绪（moods），且英文按拼写规则重算口型位、
+                #     中文 e/舌尖元音改判中性口型——旧缓存一律重算。
+                # v12 起每个 cue 带音内相位（声母/韵尾），整字一个口型的
+                #     旧轨全部重算。v14：中性元音改判 Z（嘴半张）。
                 try:
                     old_v = int(data.get("v") or 0)
                 except (TypeError, ValueError):
                     old_v = 0
-                if old_v < 9:
+                if old_v < 14:
                     data = None
                 elif isinstance(data, dict):
                     kind = str(data.get("stem_kind") or "")
@@ -3568,6 +3718,212 @@ class MusicSynthPlugin(NekoPluginBase):
             except Exception:  # noqa: BLE001 - 缓存不写也能唱
                 pass
         return payload
+
+    # ---- 全景舞台：show.json 的生成 / 复用 ------------------------------
+    # 编排是纯离线计算（librosa 分析 15~25 秒），必须和唱歌解耦：
+    # 播放照常开始，这里开一条后台线程算 show.json，算完只更新工件 + 口型服务
+    # 的登记；任何失败都只写日志，绝不反过来影响 ms_sing / ms_play。
+    _SHOW_ARTIFACT = "show_json"
+
+    def _show_python(self) -> Path:
+        """跑编排 worker 的解释器：优先分离环境（librosa 确定可用）。"""
+        sep = str((getattr(self._pipeline, "paths", {}) or {}).get("sep_python") or "")
+        if sep and Path(sep).is_file():
+            return Path(sep)
+        return Path(sys.executable)
+
+    @staticmethod
+    def _file_mtime(path) -> float:
+        try:
+            return float(os.path.getmtime(str(path))) if path else 0.0
+        except OSError:
+            return 0.0
+
+    def _show_dir(self, track_id: str) -> Path:
+        return self._pipeline.work_dir / "tracks" / str(track_id)
+
+    def _show_file(self, track_id: str) -> Path:
+        return self._show_dir(track_id) / "show.json"
+
+    def _show_job(self, track: dict, payload: dict, target: str, *,
+                  seed: int, preset: str) -> dict:
+        """组装 choreo_worker 的 job（和 temp 验收脚本同一份结构）。"""
+        artifacts = track.get("artifacts") or {}
+        audio = str(artifacts.get("final") or target or "")
+        stem = str(payload.get("stem") or "")
+        duration = float(payload.get("duration") or track.get("duration_s") or 0.0)
+        lyrics, timed, _src = lipsync.track_lyrics(track)
+        lines: list[dict] = []
+        for row in (timed or []):
+            if not isinstance(row, dict) or row.get("at_s") is None:
+                continue
+            try:
+                at = float(row.get("at_s"))
+            except (TypeError, ValueError):
+                continue
+            lines.append({"t0": at, "text": str(row.get("text") or "")})
+        lyrics_key = lipsync.lyrics_key(lyrics) if str(lyrics or "").strip() else ""
+        return {
+            "audio": audio,
+            "stem": stem,
+            "duration": duration,
+            "cues": list(payload.get("cues") or []),
+            "env": list(payload.get("env") or []),
+            "hop": float(payload.get("hop") or 0.05),
+            "lines": lines,
+            "line_moods": lipsync.line_moods(timed or [], duration),
+            "track": {"id": str(track.get("id") or ""),
+                      "title": track.get("title"),
+                      "artist": track.get("artist"),
+                      "duration_s": duration},
+            "seed": int(seed),
+            "preset": preset or None,
+            "out": str(self._show_file(str(track.get("id") or ""))),
+            "lyrics_key": lyrics_key,
+        }
+
+    def _show_cached(self, job: dict) -> dict | None:
+        """已有 show.json 且输入指纹一致 → 直接复用（不碰音频，秒回）。"""
+        path = str(job.get("out") or "")
+        if not path or not Path(path).is_file():
+            return None
+        try:
+            old = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(old, dict) or old.get("schema") != choreo_schema.SCHEMA:
+            return None
+        preset_name = str((old.get("style") or {}).get("preset") or "")
+        if not preset_name:
+            return None
+        try:
+            if int(old.get("seed")) != int(job.get("seed")):
+                return None
+        except (TypeError, ValueError):
+            return None
+        want = choreo_director.input_fingerprint(
+            audio=str(job.get("audio") or ""),
+            stem=str(job.get("stem") or ""),
+            lyrics_key=str(job.get("lyrics_key") or ""),
+            cues=len(job.get("cues") or []),
+            seed=int(job["seed"]),
+            preset=preset_name,
+            audio_mtime=self._file_mtime(job.get("audio")),
+            stem_mtime=self._file_mtime(job.get("stem")),
+            # 歌词语义的来源标记（llm:<模型> / fallback）来自 worker 写的侧车文件
+            semantics=choreo_semantics.tag_for(
+                Path(path).parent / choreo_semantics.CACHE_NAME))
+        if want != str(old.get("input_hash") or ""):
+            return None
+        return old
+
+    def _build_show_sync(self, track: dict, payload: dict, target: str, *,
+                         seed=None, preset: str = "", force: bool = False) -> dict:
+        """同步生成/复用 show.json（worker 独立进程）。调用方负责放到线程里。"""
+        track_id = str((track or {}).get("id") or "")
+        if not track_id:
+            return {"ok": False, "error": "没有曲目 id"}
+        artifacts = (track or {}).get("artifacts") or {}
+        audio = str(artifacts.get("final") or target or "")
+        if not audio or not Path(audio).is_file():
+            return {"ok": False, "track_id": track_id, "error": "这首还没有成品音频"}
+        try:
+            seed_value = int(seed) if seed is not None else choreo_director.default_seed(track)
+        except (TypeError, ValueError):
+            seed_value = choreo_director.default_seed(track)
+        seed_value &= 0x7FFFFFFF
+        preset_key = choreo_presets.normalize(preset) if str(preset or "").strip() else ""
+        job = self._show_job(track, payload or {}, target,
+                             seed=seed_value, preset=preset_key)
+        if not force:
+            hit = self._show_cached(job)
+            if hit:
+                path = str(job.get("out"))
+                lips_server.set_show(track_id, path)
+                try:
+                    self._pipeline.store.update(
+                        track_id, artifacts={self._SHOW_ARTIFACT: path})
+                except Exception:  # noqa: BLE001 - 工件存不下来也能用
+                    pass
+                return {"ok": True, "reused": True, "path": path,
+                        "seed": int(hit.get("seed") or seed_value),
+                        "preset": str((hit.get("style") or {}).get("preset") or ""),
+                        "input_hash": hit.get("input_hash"),
+                        "lines": len(hit.get("lines") or []),
+                        "sections": len((hit.get("music") or {}).get("sections") or [])}
+        folder = self._show_dir(track_id)
+        folder.mkdir(parents=True, exist_ok=True)
+        script = self._plugin_dir / "workers" / "choreo_worker.py"
+        try:
+            result = runtime.run_worker(
+                self._show_python(), script, job, cwd=folder, timeout=900,
+                log_path=folder / "show.log")
+        except Exception as exc:  # noqa: BLE001 - 编排失败不挡唱歌
+            return {"ok": False, "track_id": track_id,
+                    "error": f"{type(exc).__name__}: {exc}"}
+        if not result.get("ok"):
+            return {"ok": False, "track_id": track_id,
+                    "step": result.get("step"),
+                    "error": str(result.get("error") or "编排失败"),
+                    "trace": str(result.get("trace") or "")[-1500:]}
+        path = str(result.get("path") or job.get("out") or "")
+        lips_server.set_show(track_id, path)
+        try:
+            self._pipeline.store.update(
+                track_id, artifacts={self._SHOW_ARTIFACT: path})
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": True, "reused": False, "path": path,
+                "seed": int(result.get("seed") or seed_value),
+                "preset": str(result.get("preset") or ""),
+                "input_hash": str(result.get("input_hash") or ""),
+                "lines": int(result.get("lines") or 0),
+                "sections": len(result.get("sections") or []),
+                "seconds": result.get("seconds")}
+
+    def _ensure_show_async(self, track: dict, payload: dict, target: str, *,
+                           seed=None, preset: str = "") -> None:
+        """唱歌准备完之后排一次后台编排（同曲目已有线程在跑就不重复起）。"""
+        track_id = str((track or {}).get("id") or "")
+        if not track_id or not (payload or {}).get("cues"):
+            return
+        lock = getattr(self, "_show_lock", None)
+        if lock is None:
+            lock = self._show_lock = threading.Lock()
+        workers = getattr(self, "_show_workers", None)
+        if workers is None:
+            workers = self._show_workers = {}
+        with lock:
+            alive = workers.get(track_id)
+            if alive is not None and alive.is_alive():
+                return
+            thread = threading.Thread(
+                target=self._show_worker_run, name=f"choreo-{track_id}", daemon=True,
+                args=(track_id, track, payload, target, seed, preset))
+            workers[track_id] = thread
+        thread.start()
+
+    def _show_worker_run(self, track_id: str, track: dict, payload: dict,
+                         target: str, seed, preset: str) -> None:
+        try:
+            result = self._build_show_sync(track, payload, target,
+                                           seed=seed, preset=preset)
+            if result.get("ok"):
+                self.logger.info(
+                    "[show] %s %s seed=%s preset=%s lines=%s",
+                    track_id, "复用" if result.get("reused") else "生成",
+                    result.get("seed"), result.get("preset"), result.get("lines"))
+            else:
+                self.logger.warning("[show] %s 生成失败：%s",
+                                    track_id, result.get("error"))
+        except Exception as exc:  # noqa: BLE001 - 后台线程不能把异常抛出去
+            self.logger.warning("[show] %s 生成异常：%s", track_id, exc)
+        finally:
+            lock = getattr(self, "_show_lock", None)
+            workers = getattr(self, "_show_workers", None) or {}
+            if lock is not None:
+                with lock:
+                    workers.pop(track_id, None)
 
     @staticmethod
     def _clean_song_title(title: str) -> str:
@@ -3616,6 +3972,20 @@ class MusicSynthPlugin(NekoPluginBase):
         target = str(((track or {}).get("artifacts") or {}).get("final") or "")
         return bool(target) and Path(target).is_file()
 
+    def _processing_others(self, track_id: str) -> list:
+        """除这首以外还在处理的歌。AI 回话时要把「别的歌在排队」和「这首」分开说。"""
+        out = []
+        try:
+            for t in self._pipeline.store.all():
+                if str(t.get("id") or "") == str(track_id or ""):
+                    continue
+                if str(t.get("status") or "") in ("running", "queued"):
+                    out.append({"title": t.get("title"), "step": t.get("step"),
+                                "progress": t.get("progress")})
+        except Exception:  # noqa: BLE001 - 只是附注信息
+            return []
+        return out[:5]
+
     def _sing_track(self, track: dict) -> dict:
         """播放一首已经做好的歌，并把口型轨一起发出去（AI 和面板共用）。"""
         target = str((track.get("artifacts") or {}).get("final") or "")
@@ -3644,6 +4014,7 @@ class MusicSynthPlugin(NekoPluginBase):
         return {"ok": True, "singing": True, "playing": True,
                 "title": track.get("title"), "track_id": track.get("id"),
                 "path": target, "timbre": track.get("timbre_source"),
+                "processing_others": self._processing_others(str(track.get("id") or "")),
                 "lips": lips, **how}
 
     # 2026-11-03 面板入口：ui.action 与 plugin_entry 同名，让 hosted-ui 能转发 ms_play。
@@ -3818,6 +4189,37 @@ class MusicSynthPlugin(NekoPluginBase):
         return Ok({"ok": True, **state, "seconds": span, "text": lyrics,
                    "sample": cues[:6]})
 
+    @plugin_entry(id="ms_show_build", name="为她而唱 · 生成舞台编排",
+                  description=("为已处理的曲目生成（或复用缓存）全景舞台用的 show.json；"
+                               "同曲目同 seed 结果逐字节一致，force=true 强制重算，"
+                               "preset 可指定 ballad/pop/edm"),
+                  input_schema={"type": "object", "properties": {
+                      "track_id": {"type": "string"},
+                      "seed": {"type": "integer"},
+                      "force": {"type": "boolean"},
+                      "preset": {"type": "string"}}})
+    async def ms_show_build(self, track_id: str = "", seed=None,
+                            force: bool = False, preset: str = "", **_):
+        track_id = str(track_id or "").strip()
+        track = self._pipeline.store.get(track_id) if track_id else None
+        if not track:
+            return Ok({"ok": False, "error": "曲目不存在", "track_id": track_id})
+        target = str((track.get("artifacts") or {}).get("final")
+                     or track.get("source") or "")
+        try:
+            payload = await asyncio.to_thread(self._lips_payload, track, target)
+        except Exception as exc:  # noqa: BLE001
+            return Ok({"ok": False, "track_id": track_id,
+                       "error": f"口型轨不可用：{type(exc).__name__}: {exc}"})
+        try:
+            seed_value = int(seed) if seed is not None else None
+        except (TypeError, ValueError):
+            seed_value = None
+        result = await asyncio.to_thread(
+            self._build_show_sync, track, payload, target,
+            seed=seed_value, preset=str(preset or ""), force=bool(force))
+        return Ok({"track_id": track_id, "title": track.get("title"), **result})
+
     # 2026-11-03 面板「设为当前模型」：只做用户显式点击的切换，复用 ms_set_active_model。
     # 入口本体在文件末尾的 ms_set_active_model 上声明；这里再挂一个 @plugin_entry 会与它
     # 抢同一个 id（后注册的覆盖前面的），所以只保留 @ui.action 作为按钮绑定。
@@ -3829,9 +4231,13 @@ class MusicSynthPlugin(NekoPluginBase):
         name="music_synth_sing",
         description=("让她唱出已经做好的歌。【演唱/播放】入口：按歌名或 track_id 找到成品，"
                      "直接用系统播放器放出来，并返回文件路径。"
+                     "凡是用户点歌、催歌、问某首歌唱好没有，都必须先调用本工具查真实状态再回答，"
+                     "不要凭上一轮对话的记忆说「还在分离/变声」，那是过期信息。"
                      "如果点名的歌在库里但还没唱过（刚录下来/刚生成的原曲），会自动开始处理，"
                      "做完自动播放，这时返回 processing=true —— 告诉用户「正在做，做好就唱」，"
-                     "不要说已经唱好了。只有真的拿到 ok=true 且 singing=true 才算唱了；"
+                     "不要说已经唱好了。返回值里的 processing_others 是别的歌在处理，"
+                     "和用户点的那首无关，两者不能混着说。"
+                     "只有真的拿到 ok=true 且 singing=true 才算唱了；"
                      "ok=false 时必须如实说明原因。"),
         parameters={"type": "object", "properties": {
             "title": {"type": "string", "description": "歌名关键词，可不填"},
@@ -3856,7 +4262,8 @@ class MusicSynthPlugin(NekoPluginBase):
             track = self._pipeline.store.get(str(track_id))
             if not track:
                 self.logger.info("[playback] ms_sing 曲目不存在 track_id=%r", track_id)
-                return Ok({"ok": False, "error": "曲目不存在", "track_id": track_id})
+                return Ok({"ok": False, "error": "曲目不存在", "track_id": track_id,
+                           "speech": self._speech("blocked", "曲目不存在")})
             if not self._finished(track):
                 return await self._begin_sing(track)
             picked = track
@@ -3887,11 +4294,14 @@ class MusicSynthPlugin(NekoPluginBase):
             self.logger.info("[playback] ms_sing 没有可唱的成品 title=%r tracks=%d",
                              title, len(tracks))
             return Ok({"ok": False, "error": "还没有可以唱的成品",
+                       "speech": self._speech("blocked", "还没有可以唱的成品"),
                        "hint": "用 music_synth_sing_anchor 先把录到的歌跑一遍（分离→变声→混音）",
                        "pending": [{"id": t["id"], "title": t.get("title"),
                                     "status": t.get("status"), "step": t.get("step")}
                                    for t in pending[:5]]})
         res = await asyncio.to_thread(self._sing_track, picked)
+        res.setdefault("speech", self._speech("done" if res.get("ok") else "failed",
+                                              str(res.get("error") or ""), picked))
         return Ok(res)
 
     async def _begin_sing(self, track: dict) -> "Ok":
@@ -3905,13 +4315,17 @@ class MusicSynthPlugin(NekoPluginBase):
                              track_id, status)
             return Ok({"ok": False, "track_id": track_id, "title": track.get("title"),
                        "status": status, "error": reason,
+                       "speech": self._speech("blocked", reason, track),
                        "note": "纯音乐没有人声、或者这段录音没放完整；完整听一遍再唱"})
         self._pending_play.add(track_id)
         if status in ("running", "queued"):
             self.logger.info("[playback] ms_sing 已在处理，登记自动播放 track=%s", track_id)
             return Ok({"ok": True, "processing": True, "already": True,
                        "track_id": track_id, "title": track.get("title"), "status": status,
-                       "note": "这首正在处理，做完会自动播放"})
+                       "step": track.get("step"), "progress": track.get("progress"),
+                       "processing_others": self._processing_others(track_id),
+                       "speech": self._speech("processing", "这首还在处理", track),
+                       "note": "就是这首还在处理（不是别的歌），做完会自动播放"})
         if not str(track.get("lyrics") or "").strip():
             lp = await self._perception_lyrics()
             if lp and self._lyrics_for_track(track, lp):
@@ -3925,8 +4339,10 @@ class MusicSynthPlugin(NekoPluginBase):
                          track_id, track.get("title"), job_id)
         return Ok({"ok": True, "started": True, "processing": True,
                    "track_id": track_id, "title": track.get("title"), "job_id": job_id,
-                   "note": "这首还没唱过，已经开始处理（分离→变声→混音），做完会自动播放；"
-                           "先别催，处理完我再告诉你"})
+                   "processing_others": self._processing_others(track_id),
+                   "speech": self._speech("submitted", "已提交后台处理，还没唱好", track),
+                   "note": "这首还没唱过，已经开始处理（分离→变声→混音），做完会自己开始播放；"
+                           "它没过完之前不算唱好了"})
 
     @staticmethod
     def _lyrics_for_track(track: dict, lp: dict) -> bool:
@@ -6631,14 +7047,9 @@ class MusicSynthPlugin(NekoPluginBase):
                     conv = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
                 finally:
                     stop_watch.set()
-                if conv.get("ok"):
-                    self._job_update(job_id, state="done", progress=100,
-                                     detail="全部完成：已用当前音色唱好",
-                                     track_id=track_id)
-                else:
-                    self._job_update(job_id, state="failed", progress=100,
-                                     detail=str(conv.get("error") or "变声失败"),
-                                     track_id=track_id)
+                job_state, job_detail = self._job_outcome(conv, track_id)
+                self._job_update(job_id, state=job_state, progress=100,
+                                 detail=job_detail, track_id=track_id)
 
         self._thread(f"ms-ace-{job_id}", run)
         self._job_update(job_id, vram_mode=policy["mode"],

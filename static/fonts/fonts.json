@@ -1,0 +1,106 @@
+{
+ "fonts": [
+  {
+   "id": "zcool-kuaile",
+   "persona": "cute_round",
+   "family": "ZCOOL KuaiLe",
+   "file": "zcool-kuaile/ZCOOLKuaiLe-Regular.woff2",
+   "weight": 400,
+   "license": "OFL-1.1",
+   "source_url": "https://github.com/google/fonts/tree/main/ofl/zcoolkuaile",
+   "sha256": "ba34649d1ddcf953eb6680340f1d5090e4a31f0ce6d8a061df6416fac3eb8b03",
+   "subset": "GB2312 一级 3755 + 假名 + ASCII/Latin-1 + 6 份 fixture 用字，共 4374 字"
+  },
+  {
+   "id": "lxgw-wenkai",
+   "persona": "soft_hand",
+   "family": "Wenkai Subset",
+   "file": "lxgw-wenkai/WenkaiSubset-Regular.woff2",
+   "weight": 400,
+   "license": "OFL-1.1",
+   "source_url": "https://github.com/lxgw/LxgwWenKai/releases/tag/v1.530",
+   "sha256": "bea314c5e718a3f06e9f41e151d755daf2f2a41c972baab9abb3674971497d2c",
+   "subset": "GB2312 一级 3755 + 假名 + ASCII/Latin-1 + 6 份 fixture 用字，共 4374 字"
+  },
+  {
+   "id": "noto-serif-sc",
+   "persona": "elegant_serif",
+   "family": "Noto Serif SC",
+   "file": "noto-serif-sc/NotoSerifSC-Regular.woff2",
+   "weight": 500,
+   "license": "OFL-1.1",
+   "source_url": "https://github.com/google/fonts/tree/main/ofl/notoserifsc",
+   "sha256": "12b4ef7adc966e77808e0c01141a255073ee7a43ab3fe99f7c8e154473cf0ac2",
+   "subset": "GB2312 一级 3755 + 假名 + ASCII/Latin-1 + 6 份 fixture 用字，共 4374 字"
+  },
+  {
+   "id": "smiley-pop",
+   "persona": "bold_pop",
+   "family": "Pop Display Subset",
+   "file": "smiley-pop/PopDisplaySubset-Oblique.woff2",
+   "weight": 900,
+   "license": "OFL-1.1",
+   "source_url": "https://github.com/atelier-anchor/smiley-sans/releases/tag/v2.0.1",
+   "sha256": "a09872aab17758cee93433203c702c36993578c89ad4084f3d525ef156f36392",
+   "subset": "GB2312 一级 3755 + 假名 + ASCII/Latin-1 + 6 份 fixture 用字，共 4374 字"
+  },
+  {
+   "id": "noto-sans-mono-cjk",
+   "persona": "tech_mono",
+   "family": "Noto Sans Mono CJK SC",
+   "file": "noto-sans-mono-cjk/NotoSansMonoCJKsc-Regular.woff2",
+   "weight": 400,
+   "license": "OFL-1.1",
+   "source_url": "https://github.com/notofonts/noto-cjk/tree/main/Sans/Mono",
+   "sha256": "e55ddb5ea7e6435af2aad1df112bd44d358dcdd9093b1f819312ab5b59641bbe",
+   "subset": "GB2312 一级 3755 + 假名 + ASCII/Latin-1 + 6 份 fixture 用字，共 4374 字"
+  },
+  {
+   "id": "ma-shan-zheng",
+   "persona": "brush_ancient",
+   "family": "Ma Shan Zheng",
+   "file": "ma-shan-zheng/MaShanZheng-Regular.woff2",
+   "weight": 400,
+   "license": "OFL-1.1",
+   "source_url": "https://github.com/google/fonts/tree/main/ofl/mashanzheng",
+   "sha256": "ba989de431c655755cbd984480d462eae85ce5c7cf861b49e0db75d2f9363394",
+   "subset": "GB2312 一级 3755 + 假名 + ASCII/Latin-1 + 6 份 fixture 用字，共 4374 字"
+  },
+  {
+   "id": "zen-maru-gothic",
+   "persona": "cute_round",
+   "family": "Zen Maru Gothic",
+   "file": "zen-maru-gothic/ZenMaruGothic-Regular.woff2",
+   "weight": 400,
+   "license": "OFL-1.1",
+   "source_url": "https://github.com/google/fonts/tree/main/ofl/zenmarugothic",
+   "sha256": "c2ea316878759d47cf5c7ac817459158ff82fca98900143644081c111b58eed6",
+   "subset": "GB2312 一级 3755 + 假名 + ASCII/Latin-1 + 6 份 fixture 用字，共 4374 字"
+  },
+  {
+   "id": "zen-maru-gothic-bold",
+   "persona": "bold_pop",
+   "family": "Zen Maru Gothic",
+   "file": "zen-maru-gothic/ZenMaruGothic-Bold.woff2",
+   "weight": 700,
+   "license": "OFL-1.1",
+   "source_url": "https://github.com/google/fonts/tree/main/ofl/zenmarugothic",
+   "sha256": "a8a4236202676a0bbce0101c0a4d66c12f13a6bad2207fd1008248663368078c",
+   "subset": "GB2312 一级 3755 + 假名 + ASCII/Latin-1 + 6 份 fixture 用字，共 4374 字"
+  }
+ ],
+ "_meta": {
+  "built": "T2-B 2026-11-14（返工 F-1：追加 zen-maru-gothic / zen-maru-gothic-bold）",
+  "charset_chars": 4374,
+  "charset_sources": [
+   "demo_neon.show.json",
+   "demo_pulse.show.json",
+   "demo_star.show.json",
+   "theme_cute.show.json",
+   "theme_hot.show.json",
+   "theme_longing.show.json"
+  ],
+  "note": "霞鹜文楷与得意黑带 Reserved Font Name，子集输出改名为 *_Subset；其余保留原族名。subset 字段写的是请求字集（4374 字）；pyftsubset 只保留源字体已有的字形，各款实际 cmap 见 _reports/P2_flash_glyph_cover.json 的 fonts 段。cute_round/bold_pop 的第二条记录是运行时按字符回退用的备用字体。",
+  "total_bytes": 7878356
+ }
+}

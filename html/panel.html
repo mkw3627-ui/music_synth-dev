@@ -441,7 +441,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     return h("button", p, kids);
   }
 
-  // ../../music_synth-dev/ui/api.ts
+  // ../../.neko-plugin-installations/plugins/music_synth/ui/api.ts
   var ORIGIN = "http://127.0.0.1:48916";
   var PLUGIN_ID = "music_synth";
   function sleep(ms) {
@@ -689,7 +689,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
   var jsx = withKey;
   var jsxs = withKey;
 
-  // ../../music_synth-dev/ui/ui.tsx
+  // ../../.neko-plugin-installations/plugins/music_synth/ui/ui.tsx
   var BRAND = "#e02d76";
   var BRAND_SOFT = "#ffe5ef";
   var BRAND_DEEP = "#9c204e";
@@ -1114,7 +1114,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     return (n / 3600).toFixed(1) + " 小时";
   }
 
-  // ../../music_synth-dev/ui/materials.ts
+  // ../../.neko-plugin-installations/plugins/music_synth/ui/materials.ts
   var MATERIALS = [
     {
       slot: "song",
@@ -1384,7 +1384,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     return s;
   }
 
-  // ../../music_synth-dev/ui/trainModel.ts
+  // ../../.neko-plugin-installations/plugins/music_synth/ui/trainModel.ts
   var SLOTS = [
     {
       key: "song",
@@ -1577,7 +1577,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     return p;
   }
 
-  // ../../music_synth-dev/ui/pageStart.tsx
+  // ../../.neko-plugin-installations/plugins/music_synth/ui/pageStart.tsx
   function greeting() {
     const h2 = (/* @__PURE__ */ new Date()).getHours();
     if (h2 < 5) return "这么晚还没睡呀";
@@ -1692,7 +1692,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
   }
 
-  // ../../music_synth-dev/ui/sourceList.tsx
+  // ../../.neko-plugin-installations/plugins/music_synth/ui/sourceList.tsx
   var DANGER = { color: "#c93c3c", borderColor: "rgba(201,60,60,0.28)" };
   function innerOf(f) {
     return f && Array.isArray(f.files) && f.files.length ? f.files[0] : f;
@@ -1921,7 +1921,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
   }
 
-  // ../../music_synth-dev/ui/pageMaterials.tsx
+  // ../../.neko-plugin-installations/plugins/music_synth/ui/pageMaterials.tsx
   var LANGS = ["中文", "日语", "英语", "其他语言"];
   function PageMaterials(props) {
     const { api, onGo } = props;
@@ -2168,7 +2168,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
   }
 
-  // ../../music_synth-dev/ui/pageTrain.tsx
+  // ../../.neko-plugin-installations/plugins/music_synth/ui/pageTrain.tsx
   var STEP_NAMES = ["放素材", "训练设置", "看着她唱", "保存声音"];
   var ENDED = ["finished", "failed", "stopped"];
   var ACTIVE_PHASES = ["training", "preparing", "preprocessing", "previewing"];
@@ -3228,7 +3228,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
   }
 
-  // ../../music_synth-dev/ui/pageModels.tsx
+  // ../../.neko-plugin-installations/plugins/music_synth/ui/pageModels.tsx
   function PageModels(props) {
     const { api, snap, onRefresh } = props;
     const s = snap || {};
@@ -3547,7 +3547,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
   }
 
-  // ../../music_synth-dev/ui/pageSing.tsx
+  // ../../.neko-plugin-installations/plugins/music_synth/ui/pageSing.tsx
   var PHASE = {
     pending: ["等下就处理", "neutral"],
     waiting: ["等下就处理", "neutral"],
@@ -3879,7 +3879,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
   }
 
-  // ../../music_synth-dev/ui/pageCreate.tsx
+  // ../../.neko-plugin-installations/plugins/music_synth/ui/pageCreate.tsx
   var TA_STYLE = {
     border: "1px solid transparent",
     borderRadius: 12,
@@ -4545,7 +4545,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
   }
 
-  // ../../music_synth-dev/ui/pageSettings.tsx
+  // ../../.neko-plugin-installations/plugins/music_synth/ui/pageSettings.tsx
   function tierWord(plan) {
     const t = String(plan && plan.tier || "");
     if (t === "high") return { text: "很好 · 又快又细", tone: "success" };
@@ -5283,7 +5283,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
   }
 
-  // ../../music_synth-dev/ui/onboarding.tsx
+  // ../../.neko-plugin-installations/plugins/music_synth/ui/onboarding.tsx
   var STEPS = ["体验", "功能", "用法", "环境", "开始"];
   var STEP_TITLES = ["先听听效果", "她能做什么", "怎么用", "准备运行环境", "准备完成"];
   var REDOWNLOAD_KEYS = ["ddsp_contentvec", "sep_karaoke"];
@@ -5487,6 +5487,9 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const [picking, setPicking] = useState(false);
     const [pickErr, setPickErr] = useState("");
     const [pickNote, setPickNote] = useState("");
+    const [pickManual, setPickManual] = useState(false);
+    const [pathErr, setPathErr] = useState("");
+    const pickRun = useRef(0);
     const [job, setJob] = useState(null);
     const [prog, setProg] = useState(null);
     const [installing, setInstalling] = useState(false);
@@ -5605,11 +5608,19 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       };
     }, [installing, mockMode]);
     const startInstall = async (only) => {
+      const target = normalizePath(path);
+      const bad = pathProblem(target);
+      if (bad) {
+        setPathErr(bad);
+        setMustInstall(false);
+        setStep(4);
+        return;
+      }
       setBusy(only || "all");
       setErr("");
       setMustInstall(false);
       try {
-        const r = await callEntry(props.api, "ms_setup_install", only ? { path: path.trim(), items: [only] } : { path: path.trim() }, 6e4);
+        const r = await callEntry(props.api, "ms_setup_install", only ? { path: target, items: [only] } : { path: target }, 6e4);
         if (r && r.already_ready) {
           setProg({ job_state: "done", items: {}, detail: "环境已就绪" });
           setMockDone(true);
@@ -5658,50 +5669,185 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       }
       setBusy("");
     };
+    const pathProblem = (raw) => {
+      const p = String(raw || "").trim();
+      if (!p) return "";
+      if (/^[A-Za-z]$/.test(p) || /^[A-Za-z]:$/.test(p)) return "";
+      if (!/^[A-Za-z]:[\\/]/.test(p) && !/^\\\\[^\\]/.test(p)) {
+        return "要填完整路径：盘符开头，例如 D:\\NEKOMusicSynth（只写 D 或 D: 也可以，会自动补成 D:\\NEKOMusicSynth）";
+      }
+      if (/[<>:"|?*]/.test(p.slice(2))) return '路径里不能有 < > : " | ? * 这些字符';
+      if (p.length > 180) return "路径太长了，换个短一点的位置";
+      return "";
+    };
+    const normalizePath = (raw) => {
+      let p = String(raw || "").trim().replace(/[\\/]+$/, "");
+      if (/^[A-Za-z]$/.test(p)) p += ":\\NEKOMusicSynth";
+      if (/^[A-Za-z]:$/.test(p)) p += "\\NEKOMusicSynth";
+      return p;
+    };
+    const withTimeout = (p, ms, msg) => new Promise((resolve, reject) => {
+      let done2 = false;
+      const timer = setTimeout(() => {
+        if (!done2) {
+          done2 = true;
+          reject(Error(msg));
+        }
+      }, ms);
+      Promise.resolve(p).then(
+        (v) => {
+          if (!done2) {
+            done2 = true;
+            clearTimeout(timer);
+            resolve(v);
+          }
+        },
+        (e) => {
+          if (!done2) {
+            done2 = true;
+            clearTimeout(timer);
+            reject(e);
+          }
+        }
+      );
+    });
     const pickFolder = async () => {
       if (picking || installing) return;
+      const run = ++pickRun.current;
       setPicking(true);
       setPickErr("");
       setPickNote("");
+      setPickManual(false);
+      setPathErr("");
+      const alive = () => pickRun.current === run;
+      let got = false;
+      const apply = (raw) => {
+        const v = normalizePath(String(raw || ""));
+        if (!v) return false;
+        setPath(v);
+        setPickErr("");
+        setPickNote("");
+        setPickManual(false);
+        got = true;
+        return true;
+      };
       try {
         const host = window.nekoHost;
         if (host && typeof host.pickDirectory === "function") {
-          const r = await host.pickDirectory({ startPath: path.trim(), title: "选择安装文件夹" });
-          if (r && r.cancelled !== true && r.selected_root) setPath(String(r.selected_root));
-          setPicking(false);
-          return;
+          setPickNote("正在打开系统选择窗口…（90 秒没有反应会自动换一种方式，也可以点「取消」）");
+          try {
+            const r = await withTimeout(
+              host.pickDirectory({ startPath: path.trim(), title: "选择安装文件夹" }),
+              9e4,
+              "宿主的目录框 90 秒没有返回"
+            );
+            if (!alive()) return;
+            if (r && r.cancelled === true) {
+              setPickNote("已取消。");
+              return;
+            }
+            if (r && r.selected_root && apply(r.selected_root)) return;
+            setPickNote("宿主窗口没返回路径，改用插件自己的窗口…");
+          } catch (e) {
+            if (!alive()) return;
+            setPickNote("宿主窗口没打开，改用插件自己的窗口…");
+          }
         }
-        const deadline = Date.now() + 10 * 60 * 1e3;
+        const deadline = Date.now() + 3 * 60 * 1e3;
         let first = true;
-        while (Date.now() < deadline) {
+        while (Date.now() < deadline && alive()) {
           const r = await callEntry(
             props.api,
             "ms_setup_browse",
-            { start_path: path.trim(), title: "选择安装文件夹", wait: first ? 2 : 20, restart: first },
+            { start_path: path.trim(), title: "选择安装文件夹", wait: first ? 3 : 10, restart: first },
             4e4
           );
+          if (!alive()) return;
           first = false;
           const st = String(r && r.state || "");
           if (st === "picked") {
-            if (r.path) setPath(String(r.path));
+            if (r.path) apply(r.path);
             setPickNote("");
-            setPicking(false);
             return;
           }
           if (st === "cancelled") {
-            setPickNote("");
-            setPicking(false);
+            setPickNote("已取消。");
             return;
           }
           if (st === "error") throw Error(String(r.error || "系统目录选择框打不开"));
-          setPickNote("已弹出系统选择窗口，在里面选好目录后会自动填进来。");
+          setPickNote("在系统窗口里选好目录就会自动填入（最多等 3 分钟）。");
         }
-        setPicking(false);
-        setPickErr("等了 10 分钟还没选好；也可以直接在下面的输入框里填路径。");
+        if (!alive()) return;
+        setPickErr("等了 3 分钟没选好，直接填路径吧。");
       } catch (e) {
-        setPickNote("");
-        setPicking(false);
-        setPickErr("打不开系统目录选择框（" + String(e && e.message || e) + "）；可以直接在下面的输入框里填路径。");
+        if (!alive()) return;
+        setPickErr("打不开系统目录选择框。直接填路径点「保存并使用这个位置」，或看下面的手填说明。");
+        setPickManual(true);
+      } finally {
+        if (alive()) setPicking(false);
+        if (!got) {
+          try {
+            await callEntry(props.api, "ms_setup_browse", { cancel: true }, 8e3);
+          } catch (e) {
+          }
+        }
+      }
+    };
+    const cancelPick = async () => {
+      pickRun.current += 1;
+      setPicking(false);
+      setPickErr("");
+      setPickNote("已取消。");
+      try {
+        await callEntry(props.api, "ms_setup_browse", { cancel: true }, 8e3);
+      } catch (e) {
+      }
+    };
+    const savePath = async () => {
+      const p = normalizePath(path);
+      const bad = pathProblem(p);
+      setPathErr(bad);
+      if (bad || !p) return;
+      setBusy("savepath");
+      setErr("");
+      try {
+        const r = await callEntry(props.api, "ms_set_config", { compute_root: p }, 6e4);
+        if (!r || r.ok === false) throw Error(String(r && r.error || "没能保存安装位置"));
+        const stored = String(r.paths && r.paths.compute_root || p);
+        setPath(stored);
+        setPickErr("");
+        setPickManual(false);
+        setPickNote("安装位置已保存：" + stored + "。可以点下面的安装按钮了。");
+        await check();
+      } catch (e) {
+        setPickErr("保存安装位置失败：" + String(e && e.message || e) + "。可以按下面的说明手动改 data\\config.json。");
+        setPickManual(true);
+      }
+      setBusy("");
+    };
+    const configJson = () => {
+      const p = path.trim() && !pathProblem(path) ? normalizePath(path) : "D:\\NEKOMusicSynth";
+      return JSON.stringify({
+        compute_root: p,
+        envs_dir: "",
+        models_dir: "",
+        work_dir: "",
+        sep_model_dir: "",
+        ddsp_root: "",
+        ddsp_ckpt: "",
+        synth_python: "",
+        sep_python: "",
+        train_runs_dir: ""
+      }, null, 2);
+    };
+    const copyConfig = async () => {
+      try {
+        const nav = window.navigator;
+        if (!nav || !nav.clipboard || !nav.clipboard.writeText) throw Error("no clipboard");
+        await nav.clipboard.writeText(configJson());
+        setPickNote("配置内容已复制。粘到 data\\config.json 保存后，重启插件再回到这一页。");
+      } catch (e) {
+        setPickNote("复制失败，请照着下面的内容手写。");
       }
     };
     const items = report && report.items || [];
@@ -5709,6 +5855,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const optGb = report ? Number(report.optional_missing_gb || 0) || 0 : 0;
     const needsPath = !!report && (report.needs_path === true || Array.isArray(report.missing) && report.missing.indexOf("install_path") >= 0);
     const lack = freeGb !== null && needGb > 0 && freeGb < Math.max(0.5, needGb * 1.15);
+    const pathIssue = pathProblem(path);
     const allReady = !!report && report.ready === true;
     const canNext = allReady || mockDone;
     const knownMissing = !!report && !allReady && !mockDone && items.some((i) => i.required && !i.ok && i.installable);
@@ -5942,7 +6089,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const rank = (i) => i.required ? i.status === "ready" ? 2 : 0 : i.status === "ready" ? 3 : 1;
     const showing = [...items].sort((a, b) => rank(a) - rank(b));
     const firstOptIdx = showing.findIndex((i) => i.required === false);
-    const driveTips = (report && report.hardware && report.hardware.drives || []).map((d) => String(d.drive || "")).filter((s) => /^[A-Za-z]:/.test(s)).slice(0, 4);
+    const driveOptions = (report && report.hardware && report.hardware.drives || []).map((d) => ({ drive: String(d.drive || ""), free: Number(d.free_gib) })).filter((d) => /^[A-Za-z]:$/.test(d.drive)).sort((a, b) => (isFinite(b.free) ? b.free : -1) - (isFinite(a.free) ? a.free : -1)).slice(0, 4);
     const overall = (() => {
       if (!prog) return 0;
       const list = items.filter((i) => i.status !== "ready");
@@ -5964,7 +6111,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const page4 = /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 14 }, children: [
       /* @__PURE__ */ jsxs("div", { style: { textAlign: "center" }, children: [
         /* @__PURE__ */ jsx("div", { style: { fontSize: 19, fontWeight: 800, color: INK }, children: "准备运行环境" }),
-        /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK_2, marginTop: 6, lineHeight: 1.8 }, children: "欢迎使用「为她而唱」。第一次打开需要先准备好她会用到的程序、模型和音频处理工具，之后就不用再装了。" })
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK_2, marginTop: 6, lineHeight: 1.8 }, children: "第一次打开要先装好程序、模型和音频工具，只需一次。" })
       ] }),
       mustInstall ? /* @__PURE__ */ jsx(Alert, { tone: "warning", children: "必需的程序还没装好，先在下面把它装好才能开始使用。" }) : null,
       mockMode ? /* @__PURE__ */ jsx(Alert, { tone: "info", children: "当前是模拟演示：没有连上安装接口，进度为示例数据，只用于查看界面流程。" }) : null,
@@ -5978,25 +6125,29 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         /* @__PURE__ */ jsx("div", { style: { fontSize: 14, fontWeight: 700, color: "#9c204e", marginTop: 4 }, children: row[1] })
       ] }, i)) }),
       /* @__PURE__ */ jsxs("div", { style: { padding: 16, borderRadius: 18, background: "rgba(255,255,255,0.72)", border: "1px solid " + LINE, display: "flex", flexDirection: "column", gap: 10 }, children: [
-        /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK, lineHeight: 1.8 }, children: "程序、模型和临时文件都会放在这里。选一个空间充足的盘就行，装在 D 盘、E 盘都可以。" }),
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK, lineHeight: 1.8 }, children: "程序、模型都装到这里，选个空间够的盘就行。" }),
         /* @__PURE__ */ jsxs("label", { style: { display: "flex", flexDirection: "column", gap: 6, fontSize: 12, color: INK_2 }, children: [
           /* @__PURE__ */ jsx("span", { children: "安装到哪里" }),
-          /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 8, alignItems: "center" }, children: [
+          /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }, children: [
             /* @__PURE__ */ jsx(
               "input",
               {
                 value: path,
                 placeholder: "例如 D:\\\\NEKOMusicSynth",
                 disabled: installing,
-                onChange: (e) => setPath(e.target.value),
+                "aria-invalid": !!pathIssue,
+                onChange: (e) => {
+                  setPath(e.target.value);
+                  setPathErr("");
+                },
                 style: {
-                  flex: 1,
+                  flex: "1 1 220px",
                   minWidth: 0,
-                  border: "1px solid " + (lack ? "#e8a3a3" : "transparent"),
+                  border: "1px solid " + (pathIssue || lack ? "#e8a3a3" : "transparent"),
                   borderRadius: 12,
                   padding: "10px 14px",
                   fontSize: 13,
-                  background: lack ? "#fff6f6" : "rgba(248,250,252,0.95)",
+                  background: pathIssue || lack ? "#fff6f6" : "rgba(248,250,252,0.95)",
                   color: INK,
                   outline: "none"
                 }
@@ -6010,52 +6161,104 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
                 onClick: pickFolder,
                 children: picking ? "选择中…" : "选择文件夹"
               }
-            )
+            ),
+            picking ? /* @__PURE__ */ jsx(Btn, { style: { ...ghostBtn, padding: "9px 14px", fontSize: 12.5, flex: "0 0 auto" }, onClick: cancelPick, children: "取消" }) : null
           ] })
         ] }),
-        /* @__PURE__ */ jsx(Muted, { children: "点「选择文件夹」在系统窗口里挑一个位置；模型和程序只装到这个目录，不会改动系统设置。" }),
-        pickNote ? /* @__PURE__ */ jsx(Muted, { children: pickNote }) : null,
-        pickErr ? /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 8 }, children: [
-          /* @__PURE__ */ jsx(Alert, { tone: "warning", children: pickErr }),
-          driveTips.length ? /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }, children: [
-            /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11.5 }, children: "快捷填入：" }),
-            driveTips.map((d) => /* @__PURE__ */ jsxs(
+        pathErr || pathIssue ? /* @__PURE__ */ jsx(Muted, { style: { color: "#c93c3c", fontSize: 11.5 }, children: pathErr || pathIssue }) : null,
+        /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11.5 }, children: "填完整路径，如 D:\\NEKOMusicSynth；只写 D: 也行。" }),
+        driveOptions.length ? /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }, children: [
+          /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11.5 }, children: "推荐位置：" }),
+          driveOptions.map((d) => {
+            const target = d.drive + "\\NEKOMusicSynth";
+            const on = path.trim().toUpperCase() === target.toUpperCase();
+            return /* @__PURE__ */ jsxs(
               "button",
               {
                 type: "button",
                 disabled: installing,
-                onClick: () => setPath(d + "\\NEKOMusicSynth"),
-                style: { border: "1px solid rgba(224,45,118,0.16)", background: "#fff", color: BRAND_DEEP, borderRadius: 9, padding: "5px 10px", fontSize: 11.5, cursor: "pointer", fontFamily: "inherit" },
+                onClick: () => {
+                  setPath(target);
+                  setPathErr("");
+                  setPickErr("");
+                  setPickNote("");
+                },
+                style: {
+                  border: "1px solid " + (on ? BRAND : "rgba(224,45,118,0.16)"),
+                  background: on ? "rgba(255,229,239,0.75)" : "#fff",
+                  color: BRAND_DEEP,
+                  borderRadius: 9,
+                  padding: "6px 10px",
+                  fontSize: 11.5,
+                  cursor: installing ? "default" : "pointer",
+                  fontFamily: "inherit"
+                },
                 children: [
-                  d,
-                  "\\NEKOMusicSynth"
+                  target,
+                  isFinite(d.free) ? " · 剩 " + Math.round(d.free) + " GB" : ""
                 ]
               },
-              d
-            ))
-          ] }) : null
+              d.drive
+            );
+          })
         ] }) : null,
-        /* @__PURE__ */ jsx("div", { style: { display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }, children: !path.trim() ? /* @__PURE__ */ jsx(StatusBadge, { tone: "warning", children: "请先填写安装目录，否则不会开始下载" }) : needsPath ? freeGb !== null ? /* @__PURE__ */ jsxs(StatusBadge, { tone: "success", children: [
-          "这个盘还剩 ",
+        /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }, children: [
+          /* @__PURE__ */ jsx(
+            Btn,
+            {
+              style: { ...ghostBtn, padding: "9px 14px", fontSize: 12.5 },
+              disabled: installing || !!busy || !!pathIssue || !path.trim(),
+              onClick: savePath,
+              children: busy === "savepath" ? "保存中…" : "保存并使用这个位置"
+            }
+          ),
+          !pickManual ? /* @__PURE__ */ jsx(
+            "button",
+            {
+              type: "button",
+              onClick: () => setPickManual(true),
+              style: { border: 0, background: "transparent", color: INK_3, fontSize: 11.5, cursor: "pointer", padding: 0, textDecoration: "underline", fontFamily: "inherit" },
+              children: "打不开选择窗口？手填配置"
+            }
+          ) : null
+        ] }),
+        /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11.5 }, children: "只装到这个目录，不改系统设置。" }),
+        pickNote ? /* @__PURE__ */ jsx(Muted, { children: pickNote }) : null,
+        pickErr ? /* @__PURE__ */ jsx(Alert, { tone: "warning", children: pickErr }) : null,
+        pickManual ? /* @__PURE__ */ jsxs("div", { style: { padding: 12, borderRadius: 12, background: "rgba(248,250,252,0.95)", border: "1px solid " + LINE, display: "flex", flexDirection: "column", gap: 8 }, children: [
+          /* @__PURE__ */ jsx("div", { style: { fontSize: 12, color: INK, fontWeight: 700 }, children: "打不开系统窗口时：手填配置" }),
+          /* @__PURE__ */ jsxs("div", { style: { fontSize: 11.5, color: INK_2, lineHeight: 1.8 }, children: [
+            "1. 打开插件数据目录里的 ",
+            /* @__PURE__ */ jsx("b", { children: "data\\config.json" }),
+            "（没有就新建）",
+            /* @__PURE__ */ jsx("br", {}),
+            "2. 粘贴下面的内容，保存后重载插件",
+            /* @__PURE__ */ jsx("br", {}),
+            "3. 空字符串行别删，它们让各目录按新盘重算"
+          ] }),
+          /* @__PURE__ */ jsx("pre", { style: { margin: 0, padding: 10, borderRadius: 10, background: "#fff", border: "1px solid " + LINE, fontSize: 11, color: INK, overflowX: "auto", fontFamily: "Consolas, monospace", lineHeight: 1.55 }, children: configJson() }),
+          /* @__PURE__ */ jsx("div", { style: { display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }, children: /* @__PURE__ */ jsx(Btn, { style: { ...ghostBtn, padding: "6px 12px", fontSize: 11.5 }, onClick: copyConfig, children: "复制配置" }) })
+        ] }) : null,
+        /* @__PURE__ */ jsx("div", { style: { display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }, children: !path.trim() ? /* @__PURE__ */ jsx(StatusBadge, { tone: "warning", children: "先填安装目录" }) : pathIssue ? /* @__PURE__ */ jsxs(StatusBadge, { tone: "error", children: [
+          "路径不能用：",
+          pathIssue
+        ] }) : freeGb !== null ? lack ? /* @__PURE__ */ jsxs(StatusBadge, { tone: "error", children: [
+          "只剩 ",
           freeGb.toFixed(1),
-          " GB · 点下面的「用这个目录开始安装」"
-        ] }) : /* @__PURE__ */ jsx(StatusBadge, { tone: "neutral", children: "目录已填 · 点下面的「用这个目录开始安装」" }) : freeGb !== null ? lack ? /* @__PURE__ */ jsxs(StatusBadge, { tone: "error", children: [
-          "这个盘只剩 ",
-          freeGb.toFixed(1),
-          " GB，还要约 ",
+          " GB，需要约 ",
           needGb,
-          " GB，换一个盘吧"
+          " GB，换个盘"
         ] }) : needGb > 0 ? /* @__PURE__ */ jsxs(StatusBadge, { tone: "success", children: [
-          "这个盘还剩 ",
+          "剩 ",
           freeGb.toFixed(1),
           " GB · 需要约 ",
           needGb,
           " GB"
         ] }) : /* @__PURE__ */ jsxs(StatusBadge, { tone: "success", children: [
-          "这个盘还剩 ",
+          "剩 ",
           freeGb.toFixed(1),
-          " GB · 必需项已齐"
-        ] }) : /* @__PURE__ */ jsx(Muted, { children: "（无法读取剩余空间，也可以继续）" }) }),
+          " GB · 已齐"
+        ] }) : /* @__PURE__ */ jsx(Muted, { children: "读不到剩余空间，也可以继续" }) }),
         mockMode ? /* @__PURE__ */ jsx(Muted, { children: "安装向导暂时读不到检测结果。" }) : null
       ] }),
       installing || prog && prog.items ? /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 6 }, children: [
@@ -6180,13 +6383,13 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between", alignItems: "center" }, children: [
             /* @__PURE__ */ jsx(Btn, { style: ghostBtn, onClick: () => setStep(3), disabled: installing, children: "上一步" }),
             /* @__PURE__ */ jsxs(Row, { style: { gap: 10 }, children: [
-              !items.some((i) => i.installable && i.status !== "ready") && !(needsPath && !!path.trim()) ? null : /* @__PURE__ */ jsx(
+              !items.some((i) => i.installable && i.status !== "ready") ? null : /* @__PURE__ */ jsx(
                 Btn,
                 {
                   style: primaryBtn,
-                  disabled: !!busy || installing || !path.trim() || lack,
+                  disabled: !!busy || installing || !path.trim() || !!pathIssue || lack || !items.some((i) => i.installable && i.status !== "ready"),
                   onClick: () => startInstall(),
-                  children: installing ? "正在安装…" : busy === "all" ? "正在启动…" : needsPath ? "用这个目录开始安装" : needGb > 0 ? "一键安装全部" : "安装可选项"
+                  children: installing ? "正在安装…" : busy === "all" ? "正在启动…" : needGb > 0 ? "一键安装全部" : "安装可选项"
                 }
               ),
               /* @__PURE__ */ jsx(Btn, { style: canNext ? primaryBtn : ghostBtn, disabled: !canNext || installing, onClick: () => setStep(5), children: canNext ? "下一步：开始使用 →" : "装好后继续" })
@@ -6198,7 +6401,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     ] });
   }
 
-  // ../../music_synth-dev/ui/panel.tsx
+  // ../../.neko-plugin-installations/plugins/music_synth/ui/panel.tsx
   function wizardStartAt() {
     try {
       const q = String(window.location && window.location.search || "");

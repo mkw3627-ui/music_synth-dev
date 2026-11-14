@@ -1364,11 +1364,14 @@ def check_dependencies(paths: dict, probe: dict | None = None) -> dict:
 # 系统目录框。对话框会阻塞线程，所以放在后台线程里，entry 只负责「打开 + 等一会
 # 儿」，没选完就返回 open，面板下次调用接着等——避开宿主的单次调用超时。
 _BROWSE_LOCK = threading.Lock()
-_BROWSE: dict = {"state": "idle", "path": "", "error": ""}
+# hwnd：系统框打开后记下的窗口句柄，browse_cancel 用它把框关掉；
+# gen：每开始/取消一次 +1，迟到的后台线程看到代号不对就丢掉自己的结果，
+#      不会把刚取消的状态又写回 picked。
+_BROWSE: dict = {"state": "idle", "path": "", "error": "", "hwnd": 0, "gen": 0}
 _BROWSE_THREAD: list = [None]
 
 
-def _browse_dialog_win32(start_path: str, title: str) -> tuple[str, str]:
+def _browse_dialog_win32(start_path: str, title: str, gen: int = 0) -> tuple[str, str]:
     """Windows 原生文件夹选择框（shell32!SHBrowseForFolderW，纯 ctypes）。
 
     宿主是 PyInstaller 打的 exe，tkinter 只带了 __init__，没有 filedialog 子模块，
@@ -1402,18 +1405,46 @@ def _browse_dialog_win32(start_path: str, title: str) -> tuple[str, str]:
     user32.SendMessageW.restype = ctypes.c_void_p
     user32.SetForegroundWindow.argtypes = [wintypes.HWND]
     user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.IsWindow.argtypes = [wintypes.HWND]
+    user32.IsWindow.restype = wintypes.BOOL
+    user32.PostMessageW.argtypes = [wintypes.HWND, ctypes.c_uint,
+                                    ctypes.c_size_t, ctypes.c_void_p]
+    user32.PostMessageW.restype = wintypes.BOOL
 
     BFFM_INITIALIZED = 1
     BFFM_SETSELECTIONW = 0x400 + 103
+    WM_CLOSE = 0x0010
     initial = str(start_path or "")
     if not (initial and Path(initial).is_dir()):
         initial = ""
+    dlg = [0]
+
+    # 有主窗口时把框挂在它下面：框出现在应用前面、跟着应用走，而不是弹在
+    # 用户看不见的后台（hwndOwner=None 时就是后者）。
+    owner = None
+    try:
+        fg = user32.GetForegroundWindow()
+        if fg and user32.IsWindow(fg):
+            owner = fg
+    except Exception:  # noqa: BLE001
+        owner = None
 
     @ctypes.WINFUNCTYPE(ctypes.c_int, wintypes.HWND, ctypes.c_uint,
                         ctypes.c_void_p, ctypes.c_void_p)
     def on_msg(hwnd, msg, lparam, data):  # noqa: ANN001
         if msg == BFFM_INITIALIZED:
+            dlg[0] = int(hwnd or 0)
             try:
+                with _BROWSE_LOCK:
+                    _BROWSE["hwnd"] = dlg[0]
+                    stale = bool(gen) and gen != _BROWSE["gen"]
+                if stale:
+                    # 框还没画出来就已经被取消了：直接关掉，别留一个用户
+                    # 不知道怎么处理的窗口在屏幕上。
+                    user32.PostMessageW(hwnd, WM_CLOSE, 0, None)
+                    return 0
                 user32.SetForegroundWindow(hwnd)
                 if initial:
                     ptr = ctypes.cast(ctypes.c_wchar_p(initial), ctypes.c_void_p)
@@ -1424,7 +1455,7 @@ def _browse_dialog_win32(start_path: str, title: str) -> tuple[str, str]:
 
     display = ctypes.create_unicode_buffer(260)
     bi = BROWSEINFOW()
-    bi.hwndOwner = None
+    bi.hwndOwner = owner
     bi.pszDisplayName = ctypes.cast(display, wintypes.LPWSTR)
     bi.lpszTitle = title or "选择安装文件夹"
     # BIF_RETURNONLYFSDIRS | BIF_EDITBOX | BIF_NEWDIALOGSTYLE
@@ -1437,7 +1468,13 @@ def _browse_dialog_win32(start_path: str, title: str) -> tuple[str, str]:
         ole32.CoInitialize(None)
     except Exception:  # noqa: BLE001
         pass
-    pidl = shell32.SHBrowseForFolderW(ctypes.byref(bi))
+    try:
+        pidl = shell32.SHBrowseForFolderW(ctypes.byref(bi))
+    finally:
+        # 框已经关了：把句柄清掉，免得 browse_cancel 往一个已销毁的窗口发消息
+        with _BROWSE_LOCK:
+            if _BROWSE.get("hwnd") == dlg[0]:
+                _BROWSE["hwnd"] = 0
     if not pidl:
         return "", ""  # 用户取消
     try:
@@ -1478,12 +1515,12 @@ def _browse_dialog_tk(start_path: str, title: str) -> tuple[str, str]:
             pass
 
 
-def _browse_dialog(start_path: str, title: str) -> tuple[str, str]:
+def _browse_dialog(start_path: str, title: str, gen: int = 0) -> tuple[str, str]:
     """弹系统目录选择框。返回 (路径, 错误)；路径为空表示用户取消。"""
     errors: list[str] = []
     if sys.platform == "win32":
         try:
-            return _browse_dialog_win32(start_path, title)
+            return _browse_dialog_win32(start_path, title, gen)
         except Exception as exc:  # noqa: BLE001
             errors.append(f"win32: {type(exc).__name__}: {exc}")
     try:
@@ -1498,17 +1535,28 @@ def browse_start(start_path: str = "", title: str = "", restart: bool = False) -
 
     上一次已经选完/取消/失败时，只有 ``restart=True`` 才重新弹框；否则原样返回
     上次结果，避免轮询把刚取消的窗口又弹出来。
+
+    取消过的框：即使旧线程还卡在 SHBrowseForFolderW 里（个别系统不响应
+    WM_CLOSE），``restart`` 也会另开一个——否则用户会被一个看不见的框永久锁死。
     """
     with _BROWSE_LOCK:
         th = _BROWSE_THREAD[0]
-        if th is not None and th.is_alive():
+        alive = th is not None and th.is_alive()
+        if alive and not restart:
+            return dict(_BROWSE)
+        if alive and _BROWSE["state"] not in {"cancelled", "error"}:
+            # 框正开着：复用，别再弹第二个
             return dict(_BROWSE)
         if not restart and _BROWSE["state"] in {"picked", "cancelled", "error"}:
             return dict(_BROWSE)
 
+        gen = int(_BROWSE.get("gen") or 0) + 1
+
         def worker() -> None:
-            path, err = _browse_dialog(start_path, title)
+            path, err = _browse_dialog(start_path, title, gen)
             with _BROWSE_LOCK:
+                if int(_BROWSE.get("gen") or 0) != gen:
+                    return  # 这次选择已经被取消/被新一轮顶掉了，结果作废
                 if err:
                     _BROWSE.update(state="error", path="", error=err)
                 elif path:
@@ -1516,11 +1564,38 @@ def browse_start(start_path: str = "", title: str = "", restart: bool = False) -
                 else:
                     _BROWSE.update(state="cancelled", path="", error="")
 
-        _BROWSE.update(state="open", path="", error="")
+        _BROWSE.update(state="open", path="", error="", hwnd=0, gen=gen)
         th = threading.Thread(target=worker, name="ms-setup-browse", daemon=True)
         _BROWSE_THREAD[0] = th
         th.start()
         return dict(_BROWSE)
+
+
+def browse_cancel() -> dict:
+    """关掉还没选完的系统目录框，并把状态复位成 cancelled。
+
+    面板上的「取消」和超时都走这里：卡在「选择中…」永远不会自己好，
+    必须能主动把状态收回来。
+    """
+    with _BROWSE_LOCK:
+        _BROWSE["gen"] = int(_BROWSE.get("gen") or 0) + 1
+        hwnd = int(_BROWSE.get("hwnd") or 0)
+        _BROWSE.update(state="cancelled", path="", error="", hwnd=0)
+        result = dict(_BROWSE)
+    if hwnd:
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.PostMessageW.argtypes = [wintypes.HWND, ctypes.c_uint,
+                                            ctypes.c_size_t, ctypes.c_void_p]
+            user32.PostMessageW.restype = wintypes.BOOL
+            # 先走标准的「取消」，再兜一个 WM_CLOSE（有些外壳只认其中一个）
+            user32.PostMessageW(hwnd, 0x0111, 2, None)  # WM_COMMAND / IDCANCEL
+            user32.PostMessageW(hwnd, 0x0010, 0, None)  # WM_CLOSE
+        except Exception:  # noqa: BLE001
+            pass
+    return result
 
 
 def browse_wait(seconds: float = 20.0) -> dict:

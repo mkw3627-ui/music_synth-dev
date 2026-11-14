@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>为她而唱 · 舞台运行时 · 离线预览</title>
+<link rel="stylesheet" href="./stage.css">
+<link rel="stylesheet" href="./skins/skins.css">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #stage { position: fixed; inset: 0; }
+  #msg { position: fixed; right: 16px; top: 14px; z-index: 40; font: 12px "Microsoft YaHei", sans-serif; color: #99a; max-width: 40vw; }
+  #msg.err { color: #f88; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="msg">模型加载中…</div>
+
+<script src="./vendor/pixi.min.js"></script>
+<script src="./vendor/live2dcubismcore.min.js"></script>
+<script src="./vendor/cubism4.min.js"></script>
+<script src="./skins/skins.js"></script>
+<script src="./stage-scenes.js"></script>
+<script src="./stage-lyrics.js"></script>
+<script src="./stage-runtime.js"></script>
+<script>
+'use strict';
+/* =============================================================================
+ * 离线预览页（可无声）
+ *
+ * 参数：
+ *   ?fixture=demo_star        fixtures/<name>.show.json
+ *   ?t=52.3                   定格的秒数（不自动播放）
+ *   ?autoplay=1               自动播放（静音，只走时钟）
+ *   ?m=<model url>            模型路径，默认 /model/Blue cat.model3.json
+ *   ?ui=0                     隐藏所有控件（截图用）
+ *   ?hud=0 / ?sub=0           关闭编排面板 / 字幕条
+ *   ?fps=30                   渲染帧率上限（默认 30）
+ * ========================================================================== */
+const Q = new URLSearchParams(location.search);
+const FIXTURES = [
+  { id: 'demo_star', name: '留给你的光', tag: '星夜抒情' },
+  { id: 'demo_neon', name: '闪闪发亮', tag: '霓虹流行' },
+  { id: 'demo_pulse', name: '回声频率', tag: '电子脉冲' },
+  { id: 'theme_cute', name: '甜系主题', tag: 'cute' },
+  { id: 'theme_longing', name: '思念主题', tag: 'longing' },
+  { id: 'theme_hot', name: '燃系主题', tag: 'hot' }
+];
+const CUR = Q.get('fixture') || 'demo_star';
+const M = Q.get('m') || '/model/Blue%20cat.model3.json';
+const UI = Q.get('ui') !== '0';
+const T0 = Q.has('t') ? +Q.get('t') : 0;
+const AUTOPLAY = Q.get('autoplay') === '1';
+
+let pixiApp = null, show = null, ctl = null;
+const msg = document.getElementById('msg');
+const fmt = t => Math.floor(t / 60) + ':' + String(Math.floor(t % 60)).padStart(2, '0');
+
+function buildControls() {
+  if (!UI) return;
+  const secs = show.music.sections || [];
+  const el = document.createElement('div');
+  el.className = 'ns-preview-ui';
+  el.innerHTML =
+    FIXTURES.map(f => `<button data-fx="${f.id}" class="${f.id === CUR ? 'act' : ''}" title="${f.tag}">${f.name}</button>`).join('') +
+    `<button id="pp">▶ 播放</button><input id="scrub" type="range" min="0" max="1000" value="0"><span class="tm" id="tm">0:00</span>` +
+    secs.map(s => `<button data-sec="${s.id}">${s.label || s.id}</button>`).join('') +
+    `<button id="hud">编排面板</button><button id="sub">字幕</button>`;
+  document.body.appendChild(el);
+  ctl = el;
+  el.querySelectorAll('[data-fx]').forEach(b => b.onclick = () => {
+    location.href = '?fixture=' + b.dataset.fx + '&t=' + NekoStage.t.toFixed(2) +
+      (Q.has('m') ? '&m=' + encodeURIComponent(M) : '') + (UI ? '' : '&ui=0');
+  });
+  el.querySelectorAll('[data-sec]').forEach(b => b.onclick = () => {
+    const s = secs.find(x => x.id === b.dataset.sec);
+    if (s) seek(Math.max(0, s.t0 - (s.id === 'intro' ? 0 : .01)));
+  });
+  const pp = el.querySelector('#pp');
+  pp.onclick = () => { NekoStage.playing ? NekoStage.pause() : NekoStage.play(); syncBtn(); };
+  const sl = el.querySelector('#scrub');
+  let dragging = false;
+  sl.addEventListener('pointerdown', () => dragging = true);
+  sl.addEventListener('pointerup', () => { dragging = false; NekoStage.play(); syncBtn(); });
+  sl.addEventListener('input', () => seek(sl.value / 1000 * show.duration));
+  el.querySelector('#hud').onclick = () => NekoStage.setHud(!window.__hud);
+  el.querySelector('#sub').onclick = () => NekoStage.setSub(!window.__sub);
+  window.__hud = Q.get('hud') !== '0';
+  window.__sub = Q.get('sub') !== '0';
+  NekoStage.setHud(window.__hud);
+  NekoStage.setSub(window.__sub);
+  window.__syncUi = () => {
+    if (!ctl) return;
+    ctl.querySelector('#scrub').value = (NekoStage.t / show.duration * 1000).toFixed(0);
+    ctl.querySelector('#tm').textContent = fmt(NekoStage.t) + ' / ' + fmt(show.duration);
+    if (NekoStage.playing && !dragging) { /* 主循环里刷新 */ }
+  };
+  setInterval(() => { if (!dragging) window.__syncUi(); syncBtn(); }, 200);
+}
+
+function syncBtn() {
+  if (!ctl) return;
+  const b = ctl.querySelector('#pp');
+  if (b) b.textContent = NekoStage.playing ? '⏸ 暂停' : '▶ 播放';
+}
+
+function seek(t) { NekoStage.seek(t); window.__syncUi && window.__syncUi(); }
+
+async function init() {
+  try {
+    const res = await fetch('./fixtures/' + CUR + '.show.json');
+    if (!res.ok) throw new Error('fixture ' + CUR + ' HTTP ' + res.status);
+    show = await res.json();
+  } catch (e) {
+    msg.className = 'err';
+    msg.textContent = 'fixture 读取失败：' + e.message + '\n（请用 tools/stage_check/serve.py 启动本地服务后打开本页）';
+    window.__previewReady = false;
+    return;
+  }
+
+  // 字体资产与舞台同目录：/stage/fonts.json（本地预览直接读同目录 fonts.json）
+  window.__NEKO_STAGE_BASE = './';
+  let fonts = null;
+  try {
+    fonts = await NekoStage.loadFonts(show);
+    window.__fonts = fonts;
+  } catch (e) {
+    fonts = null;
+    console.warn('[preview] 字体预加载失败，走系统字体：' + e);
+  }
+  // 验收用：?noskin=1 关掉皮肤层，回到 P1 的「歌曲调色板直接铺底」路径，
+  // 只用于与原型截图做同底色的亮度对照（D6 复算）；正式预览不要带这个参数。
+  if (Q.get('noskin') === '1') window.NekoStageSkins = null;
+  NekoStage.start({ show, fonts, root: '#stage', fps: +(Q.get('fps') || 30), t0: T0, hud: Q.get('hud') !== '0', sub: Q.get('sub') !== '0' });
+
+  // Live2D：运行时把 canvas 交出来，PIXI 直接用它当画布
+  try {
+    pixiApp = new PIXI.Application({
+      view: NekoStage.canvas,
+      backgroundAlpha: 0,
+      resizeTo: window,
+      antialias: true,
+      autoDensity: true,
+      resolution: Math.min(devicePixelRatio || 1, 1.5)
+    });
+    const model = await PIXI.live2d.Live2DModel.from(M, { autoInteract: false });
+    pixiApp.stage.addChild(model);
+    NekoStage.setModel(model, pixiApp.stage);
+    window.__pixi = pixiApp;
+    window.__model = model;
+    msg.textContent = '';
+    window.__modelOk = true;
+  } catch (e) {
+    msg.className = 'err';
+    msg.textContent = '模型没加载出来（背景/歌词照常预览）：' + e;
+    window.__modelOk = false;
+  }
+
+  seek(T0);
+  if (AUTOPLAY) NekoStage.play();
+  buildControls();
+  window.__previewReady = true;
+}
+
+/* 供 stage_check 脚本调用 */
+window.__preview = {
+  get ready() { return !!window.__previewReady; },
+  get show() { return show; },
+  fixture: CUR,
+  seek,
+  play() { NekoStage.play(); syncBtn(); },
+  pause() { NekoStage.pause(); syncBtn(); },
+  renderAt(t) { seek(t); },
+  duration() { return show ? show.duration : 0; },
+  info() { return NekoStage.info(); },
+  fonts() { return window.__fonts || null; },
+  skin() { return NekoStage.skin; },
+  stats() { return NekoStage.stats(); }
+};
+window.__previewReady = false;
+init();
+</script>
+</body>
+</html>
