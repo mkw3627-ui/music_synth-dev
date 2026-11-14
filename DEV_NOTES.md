@@ -1806,3 +1806,28 @@ winget 输出的是 UTF-8，遇到多字节续字节 0x80 就抛 `UnicodeDecodeE
   都会触发第二次 `--force` 安装并成功；普通失败不重试。
 - `tests/ffmpeg_winget_stub.py` 4 用例仍全 PASS；Ruff 无新增；compile 通过。
 - 真实 winget 安装未在本机执行（上一轮开发机已实际装过 9.0.2）。
+
+---
+
+## 0.2.56 发布：winget 报「已安装」时也走 --force 重装（2026-11-15）
+
+用户点「安装 FFmpeg」报 `winget 安装失败（退出码 2316632161 / 0x8A150061）`。
+
+### 根因
+
+`0x8A150061` = `APPINSTALLER_CLI_ERROR_PACKAGE_ALREADY_INSTALLED`：winget 认为
+包已经装了。但当前进程仍找不到 ffmpeg（WinGet Links 别名缺失或 PATH 没刷新），
+而 0.2.55 的 `--force` 重试只覆盖 `0` 和 `UPDATE_NOT_APPLICABLE`，于是被当成
+普通失败，没去执行能重新登记别名的那一步。
+
+### 改法
+
+- 新增 `_WINGET_ALREADY_INSTALLED = 0x8A150061`。
+- 重试条件加入 `ALREADY_INSTALLED`（按低 32 位比较，兼容有符号/无符号）。
+
+### 验证
+
+- 桩验证：`0x8A150061`（无符号）与 `-1978335135`（有符号）都会触发第二次
+  `--force` 并成功；能找到 ffmpeg 时不重试；真实失败码不重试。
+- ffmpeg_winget_stub 4 用例全 PASS；CI Ruff 通过；compile 通过。
+- 真实 winget 安装未在本机执行。

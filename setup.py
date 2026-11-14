@@ -1805,6 +1805,7 @@ WINGET_TIMEOUT_S = 900.0  # 约 80MB 下载 + 安装，给 15 分钟
 # winget 的退出码是 HRESULT：0x8A15002B = APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE。
 # Python 在 Windows 上可能按有符号或无符号报告，所以统一按低 32 位比较。
 _WINGET_UPDATE_NOT_APPLICABLE = 0x8A15002B
+_WINGET_ALREADY_INSTALLED = 0x8A150061  # APPINSTALLER_CLI_ERROR_PACKAGE_ALREADY_INSTALLED
 
 
 def _winget_install_args(extra: list[str]) -> list[str]:
@@ -1848,8 +1849,8 @@ def install_ffmpeg_winget(progress=None, timeout: float = WINGET_TIMEOUT_S) -> d
         return {"ok": True, "detected": True, "need_restart": False, "installed": True,
                 "path": exe, "output_summary": summary, "error": ""}
 
-    # 已登记但不可用 / 升级不适用：用 --force 强制重装一次，修好登记与 Links 别名。
-    if code == 0 or (code & 0xFFFFFFFF) == _WINGET_UPDATE_NOT_APPLICABLE:
+    # 已登记但不可用 / 升级不适用 / 已安装但找不到别名：用 --force 强制重装一次，修好登记与 Links 别名。
+    if code == 0 or (code & 0xFFFFFFFF) in (_WINGET_UPDATE_NOT_APPLICABLE, _WINGET_ALREADY_INSTALLED):
         code2, summary2 = _attempt(["--force"], "用 winget 强制安装 FFmpeg")
         summary = summary2 or summary
         exe = runtime._find_ffmpeg()
