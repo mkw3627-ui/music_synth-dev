@@ -254,6 +254,29 @@ def _dead_proxy_text(text: str) -> bool:
     return "10061" in t or "connection refused" in t
 
 
+# 网络整体断掉（不是某个源坏了）时不该立刻判失败：等一会儿再试。
+# 但整个安装过程最多等这么久，避免离线时无限挂起。
+NET_WAIT_BUDGET_S = 15 * 60.0
+_NET_BUDGET = {"left": NET_WAIT_BUDGET_S}
+_NET_HINTS = (
+    "timed out", "timeout", "connection", "reset", "ssl", "tls", "eof",
+    "incompleteread", "broken pipe", "getaddrinfo", "name or service",
+    "temporary failure", "network is unreachable", "no route",
+    "10054", "10060", "10061", "11001", "下载不完整", "速度过慢",
+    "502", "503", "504", "429",
+)
+
+
+def reset_network_budget(seconds: float = NET_WAIT_BUDGET_S) -> None:
+    _NET_BUDGET["left"] = float(seconds)
+
+
+def _network_down_error(exc: BaseException | str) -> bool:
+    """这条错误像不像「网断了 / 连接被掐」，而不是「这个源没有这个文件」。"""
+    text = str(exc).lower()
+    return any(h in text for h in _NET_HINTS)
+
+
 def _pip(python: Path, args: list[str], progress, label: str) -> None:
     base = [str(python), "-m", "pip", "install", "--disable-pip-version-check",
             "--no-input", "--retries", "5", "--timeout", "60"]
@@ -268,23 +291,35 @@ def _pip(python: Path, args: list[str], progress, label: str) -> None:
                     for mirror in PYPI_MIRRORS]
         attempts.append(([], "官方源"))
     code, tail = 1, ""
-    for extra, tag in attempts:
-        cmd = base + extra + list(args)
-        shown = f"{label}（{tag}）" if tag else label
-        code, tail = _run_stream(cmd, progress, shown)
-        if code == 0:
-            return
-        _say(f"{label}: {tag or '指定源'} 失败（退出码 {code}），换源重试")
-        if _dead_proxy_text(tail):
-            # 代理在插件启动后退出：缓存里仍是「代理可用」，子进程环境还带着死代理。
-            # 重新探测一次，确认代理真的死了就用干净环境再试一回。
-            _reset_proxy_state()
-            if not runtime.proxy_alive():
-                _say(f"{label}: 代理已失效，去掉代理变量重试")
-                code, tail = _run_stream(cmd, progress, f"{label}（直连）")
-                if code == 0:
-                    return
-    raise RuntimeError(f"{label} 失败（退出码 {code}）：{tail[-1500:]}")
+    round_no = 0
+    while True:
+        round_no += 1
+        for extra, tag in attempts:
+            cmd = base + extra + list(args)
+            shown = f"{label}（{tag}）" if tag else label
+            code, tail = _run_stream(cmd, progress, shown)
+            if code == 0:
+                return
+            _say(f"{label}: {tag or '指定源'} 失败（退出码 {code}），换源重试")
+            if _dead_proxy_text(tail):
+                # 代理在插件启动后退出：缓存里仍是「代理可用」，子进程环境还带着死代理。
+                # 重新探测一次，确认代理真的死了就用干净环境再试一回。
+                _reset_proxy_state()
+                if not runtime.proxy_alive():
+                    _say(f"{label}: 代理已失效，去掉代理变量重试")
+                    code, tail = _run_stream(cmd, progress, f"{label}（直连）")
+                    if code == 0:
+                        return
+        # 所有源都失败：如果看起来是网断了，等一会儿整轮重试（受总预算约束）。
+        if _network_down_error(tail) and _NET_BUDGET["left"] > 0:
+            wait_s = min(60.0, 10.0 * round_no, _NET_BUDGET["left"])
+            _NET_BUDGET["left"] -= wait_s
+            _say(f"{label}: 网络看起来断开了，{wait_s:.0f} 秒后重试（第 {round_no} 轮）")
+            if progress:
+                progress(f"{label}：网络断开，{wait_s:.0f} 秒后重试…")
+            time.sleep(wait_s)
+            continue
+        raise RuntimeError(f"{label} 失败（退出码 {code}）：{tail[-1500:]}")
 
 
 
@@ -465,37 +500,53 @@ def _download_file(url: str, target: Path, progress, label: str,
     errors: list[str] = []
     proxy_retried = False
     part = target.with_name(target.name + ".part")
-    for candidate in _mirror_urls(url):
-        # 镜像只给一半的超时：某个镜像挂了别让用户等满 120 秒，快速换下一个。
-        wait = timeout if candidate == url else min(timeout, 45.0)
-        resume_tries = 0
-        while True:
-            before = part.stat().st_size if part.exists() else 0
-            try:
-                _download_one(candidate, target, progress, label, expected_bytes, wait)
-                if candidate != url:
-                    _say(f"{label}: 已通过国内镜像 {urllib.parse.urlsplit(candidate).hostname} 下载")
-                return
-            except (OSError, urllib.error.URLError, urllib.error.HTTPError,
-                    http.client.HTTPException, RuntimeError) as exc:
-                errors.append(f"{urllib.parse.urlsplit(candidate).hostname}: {exc}")
-                _say(f"{label}: {errors[-1][:160]}，换源重试")
-                after = part.stat().st_size if part.exists() else 0
-                # 连接被掐断（IncompleteRead / 连接重置）时 .part 已经落了一部分，
-                # 同一个源接着下比从头换源快得多。最多续传两次，避免死循环。
-                if after > before and resume_tries < 2:
-                    resume_tries += 1
-                    _say(f"{label}: 连接中断，同源断点续传（已有 {after / 2**20:.1f} MB）")
-                    continue
-                if not proxy_retried and _dead_proxy_detected(exc):
-                    # 插件启动时代理还活着、之后被关掉：清缓存直连，同一个源再试一次。
-                    proxy_retried = True
-                    _reset_proxy_state()
-                    if not runtime.proxy_alive():
-                        _say(f"{label}: 代理已失效，改走直连重试")
+    round_no = 0
+    while True:
+        round_no += 1
+        network_only = True
+        for candidate in _mirror_urls(url):
+            # 镜像只给一半的超时：某个镜像挂了别让用户等满 120 秒，快速换下一个。
+            wait = timeout if candidate == url else min(timeout, 45.0)
+            resume_tries = 0
+            while True:
+                before = part.stat().st_size if part.exists() else 0
+                try:
+                    _download_one(candidate, target, progress, label, expected_bytes, wait)
+                    if candidate != url:
+                        _say(f"{label}: 已通过国内镜像 {urllib.parse.urlsplit(candidate).hostname} 下载")
+                    return
+                except (OSError, urllib.error.URLError, urllib.error.HTTPError,
+                        http.client.HTTPException, RuntimeError) as exc:
+                    if not _network_down_error(exc):
+                        network_only = False
+                    errors.append(f"{urllib.parse.urlsplit(candidate).hostname}: {exc}")
+                    _say(f"{label}: {errors[-1][:160]}，换源重试")
+                    after = part.stat().st_size if part.exists() else 0
+                    # 连接被掐断（IncompleteRead / 连接重置）时 .part 已经落了一部分，
+                    # 同一个源接着下比从头换源快得多。最多续传两次，避免死循环。
+                    if after > before and resume_tries < 2:
+                        resume_tries += 1
+                        _say(f"{label}: 连接中断，同源断点续传（已有 {after / 2**20:.1f} MB）")
                         continue
-                break
-    raise RuntimeError(f"{label} 下载失败：" + "; ".join(errors)[-800:])
+                    if not proxy_retried and _dead_proxy_detected(exc):
+                        # 插件启动时代理还活着、之后被关掉：清缓存直连，同一个源再试一次。
+                        proxy_retried = True
+                        _reset_proxy_state()
+                        if not runtime.proxy_alive():
+                            _say(f"{label}: 代理已失效，改走直连重试")
+                            continue
+                    break
+        # 这一轮所有源都失败：如果看起来是网断了，等一会儿再整轮重试。
+        # 用户拔网线/断 Wi-Fi 时安装不会立刻判死，恢复后自动接着下。
+        if network_only and _NET_BUDGET["left"] > 0:
+            wait_s = min(60.0, 5.0 * round_no, _NET_BUDGET["left"])
+            _NET_BUDGET["left"] -= wait_s
+            _say(f"{label}: 网络看起来断开了，{wait_s:.0f} 秒后重试（第 {round_no} 轮）")
+            if progress:
+                progress(f"{label}：网络断开，{wait_s:.0f} 秒后重试…")
+            time.sleep(wait_s)
+            continue
+        raise RuntimeError(f"{label} 下载失败：" + "; ".join(errors)[-800:])
 
 
 def _download_one(url: str, target: Path, progress, label: str,
@@ -1676,6 +1727,8 @@ def _item_map(report: dict) -> dict:
 
 def install(paths: dict, items: list[str] | None, progress, probe: dict | None = None) -> dict:
     """Install the requested missing items. ``items=None`` means everything missing."""
+    # 每次安装重新给「等网络恢复」的预算，避免上一轮的等待拖累这一轮。
+    reset_network_budget()
     probe = probe or runtime.probe_hardware(force=True)
     gpu = probe.get("gpu")
     report = check_dependencies(paths, probe)
