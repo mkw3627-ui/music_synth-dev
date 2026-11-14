@@ -301,23 +301,23 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
           } else {
             idle = 0
           }
-          if (s === "done") {
+          if (s === "done" || s === "failed") {
             setInstalling(false)
+            // 无论成功还是失败，都重新检测一次：已装好的项显示「已就绪」，没装的保持「待安装」。
+            // 旧代码只在成功时刷新，失败时清单还停在装之前的状态（全「等待」、进度条 0），
+            // 看起来就像装好的项也没完成。
             const fresh = await check()
-            if (fresh && fresh.ready) setStep(5)
-            else {
-              // 别把进度条清空：用户会以为白装了。把还没就绪的必需项列出来。
-              const miss = ((fresh && fresh.items) || []).filter((i: Item) => i.required && !i.ok)
-              setErr("安装跑完了，但这些必需项还没就绪：" +
-                (miss.map((i: Item) => i.label).join("、") || "（检测结果里没有可显示的项）") +
-                "。可以再点一次安装补装。")
-              setProg(st.progress || null)
+            setProg(null)
+            if (s === "done" && fresh && fresh.ready) { setStep(5); return }
+            if (s === "failed") {
+              setErr(String((st.progress && st.progress.detail) || (st.job && st.job.detail) ||
+                "安装没有全部完成，看下面哪一项失败了。"))
+              return
             }
-            return
-          }
-          if (s === "failed") {
-            setInstalling(false)
-            setErr(String((st.progress && st.progress.detail) || "安装没有全部完成，看下面哪一项失败了。"))
+            const miss = ((fresh && fresh.items) || []).filter((i: Item) => i.required && !i.ok)
+            setErr("安装跑完了，但这些必需项还没就绪：" +
+              (miss.map((i: Item) => i.label).join("、") || "（检测结果里没有可显示的项）") +
+              "。可以再点一次安装补装。")
             return
           }
         } catch (e: any) {
