@@ -975,7 +975,8 @@ class MusicSynthPlugin(NekoPluginBase):
                     "report": after,
                     "last_install": {k: v for k, v in result.items() if k != "report"},
                 })
-                errs = [f"{e.get('item')}: {e.get('error')}" for e in result.get("errors", [])]
+                errs = [f"{e.get('item')}: {e.get('error')}" for e in result.get("errors", [])
+                        if not e.get("optional")]
                 if not result.get("ok"):
                     if result.get("error"):
                         errs.insert(0, str(result["error"]))
@@ -1091,9 +1092,11 @@ class MusicSynthPlugin(NekoPluginBase):
             for v in out.values():
                 if v["state"] != "ready":
                     v.update(state="done", pct=100)
+        optional_keys = {str(it.get("key") or "") for it in items
+                         if it.get("required") is False}
         for e in ((job.get("result") or {}).get("errors") or []):
             k = str((e or {}).get("item") or "")
-            if k in out:
+            if k in out and k not in optional_keys:
                 out[k].update(state="failed", error=str((e or {}).get("error") or ""))
         return {"items": out, "current": current, "stage": stage,
                 "detail": detail[-300:], "job_state": st}

@@ -1448,3 +1448,36 @@ g39~g41 一直在修「人声驱动的全身」，但用户看到的**身体上�
 - 本地模拟「源 A 先发一半再断、之后忽略 Range；源 B 支持 Range」：
   旧逻辑会回 0，新逻辑保留 0.5MB 进度，换源 B 一次 Range 续传拿到完整 1MB，
   逐字节一致。
+
+---
+
+## 0.2.44 发布：HF 镜像中转被墙 + 可选项不再算安装失败（2026-11-15）
+
+用户实测：高质量训练底模（10x2048）下载失败，日志里
+`hf-mirror.com` 和 `huggingface.co` 都是
+`SSL: UNEXPECTED_EOF_WHILE_READING`；并追问「这个不是可选嘛」。
+
+### 根因
+
+1. **hf-mirror.com 现在不再自己出字节**：对 `resolve/main/...` 请求返回 302，
+   目标 `cas-bridge.xethub.hf.co`（HuggingFace 的新 Xet CDN）。这条 CDN
+   国内连不通，客户端跟过去就是 SSL EOF。官方 huggingface.co 同样被墙。
+2. **可选项的失败被当成安装失败**：底模 low/high 是 `optional`，但下载失败仍
+   进 errors，面板列表标红「失败」，看起来像整次安装没完成。
+
+### 改法
+
+- HF 文件地址改为「hf-mirror.com → hf-mirror.net → huggingface.co」三档。
+  `hf-mirror.net` 实测直接出字节（同文件前 64KB sha256 与 hf-mirror.com 一致），
+  ContentVec 和三个 DDSP 底模都走这套。
+- `_opener()` 加重定向守卫：发现 302 目标是 `*.hf.co/xethub` 时不跟随、
+  直接判该源不可用并换下一个——不再撞 TLS、也不消耗「等网」预算。
+- 可选项下载失败只标成「可选 / 待安装」，不再标红「失败」，也不进
+  「安装未全部完成」的原因列表；必需项规则不变。
+- 体检页的 HF 两行按实际镜像域名显示。
+
+### 验证
+
+- 本地实测：hf-mirror.com 的 resolve URL 被守卫拦下（HTTPError 302 换源），
+  hf-mirror.net 同 URL 返回 206 并给出字节。
+- CI：Ruff、check --release 通过。

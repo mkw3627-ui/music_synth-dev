@@ -48,12 +48,20 @@ PYPI_MIRRORS = (PYPI_INDEX, "https://mirrors.aliyun.com/pypi/simple/")
 # no git binary is required on the target machine).
 DDSP_ZIP = ("https://codeload.github.com/yxlllc/DDSP-SVC/zip/"
             "b9d4e6a58182448aa7259a636570d53c49c92b1d")
-# ContentVec encoder (contentvec768l12tta2x) — direct HF resolve link.
-# ContentVec encoder (contentvec768l12tta2x). 国内优先镜像，失败再试官方 HF。
-CONTENTVEC_URLS = [
-    "https://hf-mirror.com/lengyue233/content-vec-best/resolve/main/pytorch_model.bin",
-    "https://huggingface.co/lengyue233/content-vec-best/resolve/main/pytorch_model.bin",
-]
+# ContentVec encoder (contentvec768l12tta2x)。国内优先镜像，失败再试官方 HF。
+# 注意：hf-mirror.com 现在会把 resolve 请求 302 到 cas-bridge.xethub.hf.co，
+# 那条 CDN 国内连不通（用户实测 SSL EOF）；hf-mirror.net 仍直接出字节，
+# 实测同一文件前 64KB 的 sha256 与 hf-mirror.com 一致。
+HF_MIRROR_HOSTS = ("hf-mirror.com", "hf-mirror.net")
+
+
+def _hf_urls(path: str) -> list[str]:
+    """同一份 HF 文件：两个国内镜像 + 官方，按顺序尝试。"""
+    return ([f"https://{host}/{path}" for host in HF_MIRROR_HOSTS]
+            + [f"https://huggingface.co/{path}"])
+
+
+CONTENTVEC_URLS = _hf_urls("lengyue233/content-vec-best/resolve/main/pytorch_model.bin")
 CONTENTVEC_URL = CONTENTVEC_URLS[0]
 # NSF-HiFiGAN vocoder (pc_nsf_hifigan 44.1k hop512 128bin 2025.02).
 VOCODER_ZIP = ("https://github.com/openvpi/vocoders/releases/download/"
@@ -63,26 +71,14 @@ VOCODER_ZIP = ("https://github.com/openvpi/vocoders/releases/download/"
 RMVPE_ZIP = "https://github.com/yxlllc/RMVPE/releases/download/230917/rmvpe.zip"
 # DDSP-SVC 6.3 训练底模（RectifiedFlow pretrain）。上游只有 SVCFusion 的
 # .sf_dlc 包（本质是 torch zip，里面 files.model_0.pt 才是标准检查点），
-# 安装时下载后转成 model_0.pt。国内优先 hf-mirror，失败再试 huggingface。
-REFLOW_BASE_URLS = [
-    ("https://hf-mirror.com/SVCFusion/DDSP6.3-Pretrain/resolve/main/"
-     "ddsp6.3_6x512_6x1024.sf_dlc"),
-    ("https://huggingface.co/SVCFusion/DDSP6.3-Pretrain/resolve/main/"
-     "ddsp6.3_6x512_6x1024.sf_dlc"),
-]
+# 安装时下载后转成 model_0.pt。国内优先镜像，失败再试 huggingface。
+REFLOW_BASE_URLS = _hf_urls("SVCFusion/DDSP6.3-Pretrain/resolve/main/"
+                            "ddsp6.3_6x512_6x1024.sf_dlc")
 # 翻唱训练的低/高两档底模（同一个官方仓库的不同结构变体）。
-LOW_BASE_URLS = [
-    ("https://hf-mirror.com/SVCFusion/DDSP6.3-Pretrain/resolve/main/"
-     "ddsp6.3_6x512_6x512.sf_dlc"),
-    ("https://huggingface.co/SVCFusion/DDSP6.3-Pretrain/resolve/main/"
-     "ddsp6.3_6x512_6x512.sf_dlc"),
-]
-HIGH_BASE_URLS = [
-    ("https://hf-mirror.com/SVCFusion/DDSP6.3-Pretrain/resolve/main/"
-     "ddsp6.3_6x512_10x2048.sf_dlc"),
-    ("https://huggingface.co/SVCFusion/DDSP6.3-Pretrain/resolve/main/"
-     "ddsp6.3_6x512_10x2048.sf_dlc"),
-]
+LOW_BASE_URLS = _hf_urls("SVCFusion/DDSP6.3-Pretrain/resolve/main/"
+                         "ddsp6.3_6x512_6x512.sf_dlc")
+HIGH_BASE_URLS = _hf_urls("SVCFusion/DDSP6.3-Pretrain/resolve/main/"
+                          "ddsp6.3_6x512_10x2048.sf_dlc")
 # Fallback only if the GitHub API is unreachable.
 PYTHON_STANDALONE_PINNED = (
     "https://github.com/astral-sh/python-build-standalone/releases/download/"
@@ -393,10 +389,25 @@ def proxy_alive() -> bool:
     return alive
 
 
+class _MirrorRedirectGuard(urllib.request.HTTPRedirectHandler):
+    """hf-mirror.com 会把 resolve 请求 302 到 cas-bridge.xethub.hf.co。
+
+    那条 CDN 国内连不通（用户实测 SSL EOF）。在跟随重定向前拦下：判这个源
+    不可用、直接换下一个镜像，别去撞 TLS 超时、也别把「等网」预算耗光。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        host = (urllib.parse.urlsplit(newurl).hostname or "").lower()
+        if host.endswith(".hf.co") or "xethub" in host:
+            raise urllib.error.HTTPError(
+                newurl, code, f"镜像中转到了 {host}（国内连不通），换源", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _opener():
     """urllib opener：代理挂了就返回强制直连的 opener。"""
     if _OPENER[0] is None:
-        handlers = []
+        handlers: list = [_MirrorRedirectGuard()]
         if not proxy_alive():
             handlers.append(urllib.request.ProxyHandler({}))
         _OPENER[0] = urllib.request.build_opener(*handlers)
@@ -1897,7 +1908,12 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
                 _download_sep_weights(paths, progress, spec["label"])
             installed.append(key)
         except Exception as exc:  # noqa: BLE001
-            errors.append({"item": key, "error": f"{type(exc).__name__}: {exc}"})
+            err = {"item": key, "error": f"{type(exc).__name__}: {exc}"}
+            # 可选项（低/高质量训练底模）下不下来都不影响能不能用：
+            # 标上 optional，上层就不会把它算成「安装未完成」。
+            if spec.get("optional"):
+                err["optional"] = True
+            errors.append(err)
 
     report_after = check_dependencies(paths, probe)
     return {
@@ -1922,9 +1938,10 @@ def diagnose_download_sources(probe_bytes: int = 65536, timeout: float = 8.0) ->
     sources += [(f"GitHub 镜像 {urllib.parse.urlsplit(m).hostname}", m + VOCODER_ZIP)
                 for m in GH_MIRRORS]
     sources += [
-        ("HF 镜像 hf-mirror", CONTENTVEC_URLS[0]),
-        ("HuggingFace 官方", CONTENTVEC_URLS[1]),
+        (f"HF 镜像 {urllib.parse.urlsplit(u).hostname}", u)
+        for u in CONTENTVEC_URLS[:2]
     ]
+    sources.append(("HuggingFace 官方", CONTENTVEC_URLS[-1]))
     sources += [(f"PyPI 镜像 {urllib.parse.urlsplit(m).hostname}", m + "/pip/")
                 for m in PYPI_MIRRORS]
     sources.append(("PyTorch 官方", TORCH_CU128_INDEX + "/"))
