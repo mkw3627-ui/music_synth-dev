@@ -1082,6 +1082,9 @@ class MusicSynthPlugin(NekoPluginBase):
                 last = float((self._setup_pct or {}).get(current) or 0.0)
                 pct = max(last, pct)
                 self._setup_pct[current] = pct
+            elif current in self._setup_pct:
+                # pip 的「Installing collected packages」等行没有字节数：沿用上一次的百分比，不让条归零。
+                pct = self._setup_pct[current]
             out[current].update(state="active", pct=pct, done_mb=done_mb, total_mb=total_mb,
                                 stage=stage, detail=detail[-200:])
         # 3) 已经跑完的项 / 全部结束

@@ -1481,3 +1481,36 @@ g39~g41 一直在修「人声驱动的全身」，但用户看到的**身体上�
 - 本地实测：hf-mirror.com 的 resolve URL 被守卫拦下（HTTPError 302 换源），
   hf-mirror.net 同 URL 返回 206 并给出字节。
 - CI：Ruff、check --release 通过。
+
+---
+
+## 0.2.45：pip 依赖安装也进分项进度条（2026-11-15）
+
+用户反馈：`安装 torch/torchaudio（CPU）：Installing collected packages: mpmath,
+typing-extensions, sympy …` 这些 pip 内部的下载/安装没有进度，下面的进度条全不动。
+
+### 根因
+
+- `_run_stream` 把 pip 的每行输出按「标签」上报，标签是
+  `安装 torch/torchaudio（CPU）`、`安装 DDSP-SVC 依赖（清华）` 这类文本；
+  进度映射按分项名精确匹配，匹配不上就永远不进入 active，条不动。
+- pip 在非终端下默认不输出字节进度，只有 `Installing collected packages` 这种行，
+  即使匹配上也没有百分比。
+
+### 改法
+
+- `_pip` 新增 `head` 参数：进度行统一归到真实分项名（PyTorch / torchaudio、
+  安装 DDSP-SVC 依赖、分离环境（audio-separator venv）、audio-separator、
+  FFmpeg（可选，用于视频导入/试听））；镜像标签只留在日志里。
+- venv 的 pip ≥ 24.1 时加 `--progress-bar raw`，pip 会输出
+  `Progress <已下字节> of <总字节>`；`_run_stream` 把它转成「x/y MB」，
+  现有进度条直接能画。pip 版本低于 24.1 自动不加，行为不变。
+- `__init__.py`：没有字节数的行（如 `Installing collected packages`）沿用上一次
+  百分比，不再把条打回 0。
+
+### 验证
+
+- 本机 pip 26.3 实测：`pip download --no-cache-dir --progress-bar raw numpy`
+  输出 `Progress 0 of 12608406` → `Progress 5505024 of 12608406`，格式与正则一致。
+- 两个文件 `compile` 通过。
+- 还没在真实安装里端到端跑过；本地安装目录已同步本版，需重启宿主生效。

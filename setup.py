@@ -202,9 +202,32 @@ def _free_gib(path: Path) -> float | None:
     except OSError:
         return None
 
+_PIP_RAW_RE = re.compile(r"Progress\s+(\d+)\s+of\s+(\d+)")
+_PIP_RAW_CACHE: dict[str, bool] = {}
+
+
+def _pip_raw_progress_ok(python: Path) -> bool:
+    """这个 venv 的 pip 是否 ≥ 24.1（支持 ``--progress-bar raw`` 字节进度）。"""
+    key = str(python)
+    if key not in _PIP_RAW_CACHE:
+        try:
+            out = subprocess.run([key, "-m", "pip", "--version"], capture_output=True,
+                                 text=True, errors="replace", timeout=30, check=False,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            m = re.search(r"pip\s+(\d+)\.(\d+)", out.stdout or "")
+            _PIP_RAW_CACHE[key] = bool(m and (int(m.group(1)), int(m.group(2))) >= (24, 1))
+        except (OSError, subprocess.TimeoutExpired):
+            _PIP_RAW_CACHE[key] = False
+    return _PIP_RAW_CACHE[key]
+
+
 def _run_stream(cmd: list[str], progress, label: str, env: dict | None = None,
-                cwd: Path | None = None, timeout: float = 7200.0) -> tuple[int, str]:
-    """Run a command, streaming its last line into ``progress``."""
+                cwd: Path | None = None, timeout: float = 7200.0,
+                head: str | None = None) -> tuple[int, str]:
+    """Run a command, streaming its last line into ``progress``.
+
+    ``head`` is the item label progress lines are filed under; ``label`` may carry a mirror tag.
+    """
     _say(f"{label}: {' '.join(str(c) for c in cmd[:4])} …")
     proc = subprocess.Popen(
         [str(c) for c in cmd], cwd=str(cwd) if cwd else None,
@@ -237,7 +260,10 @@ def _run_stream(cmd: list[str], progress, label: str, env: dict | None = None,
         tail.append(line)
         tail = tail[-40:]
         if progress:
-            progress(f"{label}：{line[-160:]}")
+            raw = _PIP_RAW_RE.search(line)
+            text = (f"{int(raw.group(1)) / 2**20:.1f}/{int(raw.group(2)) / 2**20:.1f} MB"
+                    if raw else line[-160:])
+            progress(f"{head or label}：{text}")
     code = proc.wait()
     if state["killed"]:
         return -1, "\n".join(tail + ["（超时被终止）"])
@@ -278,9 +304,14 @@ def _network_down_error(exc: BaseException | str) -> bool:
     return any(h in text for h in _NET_HINTS)
 
 
-def _pip(python: Path, args: list[str], progress, label: str) -> None:
+def _pip(python: Path, args: list[str], progress, label: str, head: str | None = None) -> None:
+    # head 是进度条认的分项名（与安装面板的项名一致）；label 只给日志用，可带镜像标记。
+    head = head or label
     base = [str(python), "-m", "pip", "install", "--disable-pip-version-check",
             "--no-input", "--retries", "5", "--timeout", "60"]
+    if _pip_raw_progress_ok(python):
+        # 非终端下 pip 默认不输出下载进度，只能看到 Installing collected packages；raw 才有字节数。
+        base += ["--progress-bar", "raw"]
     has_index = any(str(a).startswith("--index-url") or str(a).startswith("-i") for a in args)
     # 没指定源时：清华 → 阿里云 → 官方。任何一个连接失败就换下一档，
     # 避免用户本地镜像挂了整条安装链路直接失败。
@@ -298,7 +329,7 @@ def _pip(python: Path, args: list[str], progress, label: str) -> None:
         for extra, tag in attempts:
             cmd = base + extra + list(args)
             shown = f"{label}（{tag}）" if tag else label
-            code, tail = _run_stream(cmd, progress, shown)
+            code, tail = _run_stream(cmd, progress, shown, head=head)
             if code == 0:
                 return
             _say(f"{label}: {tag or '指定源'} 失败（退出码 {code}），换源重试")
@@ -308,7 +339,7 @@ def _pip(python: Path, args: list[str], progress, label: str) -> None:
                 _reset_proxy_state()
                 if not runtime.proxy_alive():
                     _say(f"{label}: 代理已失效，去掉代理变量重试")
-                    code, tail = _run_stream(cmd, progress, f"{label}（直连）")
+                    code, tail = _run_stream(cmd, progress, f"{label}（直连）", head=head)
                     if code == 0:
                         return
         # 所有源都失败：如果看起来是网断了，等一会儿整轮重试（受总预算约束）。
@@ -317,7 +348,7 @@ def _pip(python: Path, args: list[str], progress, label: str) -> None:
             _NET_BUDGET["left"] -= wait_s
             _say(f"{label}: 网络看起来断开了，{wait_s:.0f} 秒后重试（第 {round_no} 轮）")
             if progress:
-                progress(f"{label}：网络断开，{wait_s:.0f} 秒后重试…")
+                progress(f"{head}：网络断开，{wait_s:.0f} 秒后重试…")
             time.sleep(wait_s)
             continue
         raise RuntimeError(f"{label} 失败（退出码 {code}）：{tail[-1500:]}")
@@ -1842,13 +1873,13 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
     if "torch" in requested and synth_py.is_file():
         try:
             _pip(synth_py, ["--index-url", index, "torch", "torchaudio"], progress,
-                 f"安装 torch/torchaudio（{torch_label}）")
+                 f"安装 torch/torchaudio（{torch_label}）", head="PyTorch / torchaudio")
             installed.append("torch")
         except Exception as exc:  # noqa: BLE001
             errors.append({"item": "torch", "error": str(exc)})
     if ("synth_env" in requested or "ddsp_deps" in requested) and synth_py.is_file():
         try:
-            _pip(synth_py, DDSP_PACKAGES, progress, "安装 DDSP-SVC 依赖")
+            _pip(synth_py, DDSP_PACKAGES, progress, "安装 DDSP-SVC 依赖", head="安装 DDSP-SVC 依赖")
             installed.append("synth_deps")
             invalidate_deps_cache(synth_py)
         except Exception as exc:  # noqa: BLE001
@@ -1856,13 +1887,15 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
         # 市场不允许插件包携带 .pyd/.exe/.dll，逐应用采集（proc-tap）和系统媒体
         # 信息（winrt）改用 pip 装进合成环境；缺了只是这两个功能不可用，不阻塞安装。
         try:
-            _pip(synth_py, CAPTURE_NATIVE_PACKAGES, progress, "安装采集 / 系统媒体组件")
+            _pip(synth_py, CAPTURE_NATIVE_PACKAGES, progress, "安装采集 / 系统媒体组件",
+                 head="安装 DDSP-SVC 依赖")
             installed.append("capture_native")
         except Exception as exc:  # noqa: BLE001
             errors.append({"item": "capture_native", "error": str(exc)})
     if "ffmpeg" in requested and synth_py.is_file():
         try:
-            _pip(synth_py, ["imageio-ffmpeg"], progress, "安装 imageio-ffmpeg")
+            _pip(synth_py, ["imageio-ffmpeg"], progress, "安装 imageio-ffmpeg",
+                 head="FFmpeg（可选，用于视频导入/试听）")
             installed.append("ffmpeg")
         except Exception as exc:  # noqa: BLE001
             errors.append({"item": "ffmpeg", "error": str(exc)})
@@ -1870,17 +1903,17 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
     if sep_py.is_file() and ("sep_env" in requested or "audio_separator" in requested):
         try:
             _pip(sep_py, ["--index-url", index, "torch", "torchaudio"], progress,
-                 f"安装分离环境 torch（{torch_label}）")
+                 f"安装分离环境 torch（{torch_label}）", head="分离环境（audio-separator venv）")
         except Exception as exc:  # noqa: BLE001
             errors.append({"item": "sep_torch", "error": str(exc)})
         try:
-            _pip(sep_py, SEP_PACKAGES, progress, "安装 audio-separator 依赖")
+            _pip(sep_py, SEP_PACKAGES, progress, "安装 audio-separator 依赖", head="audio-separator")
             installed.append("audio_separator")
         except Exception as exc:  # noqa: BLE001
             errors.append({"item": "audio_separator", "error": str(exc)})
         try:
             _pip(sep_py, ["onnxruntime-gpu" if gpu else "onnxruntime"], progress,
-                 "安装 onnxruntime")
+                 "安装 onnxruntime", head="audio-separator")
         except Exception as exc:  # noqa: BLE001
             # CPU wheel is a safe fallback for older drivers.
             errors.append({"item": "sep_onnxruntime", "error": str(exc)})
