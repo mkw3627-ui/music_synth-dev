@@ -12,7 +12,6 @@ import sys
 import traceback
 from pathlib import Path
 
-
 # HuggingFace 官方在国内容易连不上；ModelScope 源失败时会回落到 HF，
 # 这里把 HF 端点指到镜像（用户自己设过就不覆盖）。
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
