@@ -1860,3 +1860,36 @@ winget 报告安装成功，但没有创建 `WinGet\Links\ffmpeg.exe` 别名，P
   目录找到 `ffmpeg-9.0.2-full_build\bin\ffmpeg.exe`，`ffmpeg_status` 返回 available
   且版本正确；PATH 正常时仍优先用 PATH。
 - ffmpeg_winget_stub 4 用例全 PASS；CI Ruff 通过；compile 通过。
+
+---
+
+## 0.2.58 发布：纯 CPU 机器加载 GPU 保存的 RMVPE 权重（2026-11-15）
+
+用户机器（无 NVIDIA）合成报：
+`RuntimeError: Attempting to deserialize object on a CUDA device but
+torch.cuda.is_available() is False`，调用栈在
+`DDSP-SVC/encoder/rmvpe/inference.py` 的 `torch.load(model_path)`。
+
+### 根因
+
+上游 RMVPE（以及 `ddsp/vocoder.py` 的几处）用 `torch.load` 不带 `map_location`，
+而权重是在 GPU 上保存的；纯 CPU 机器反序列化直接失败。现有的「GPU OOM 后
+CPU 重试」只改 `device` 和 `CUDA_VISIBLE_DEVICES`，不改变 `torch.load` 的行为，
+重试也会撞同一个错。
+
+### 改法（`workers/ddsp_worker.py`，不改上游文件）
+
+- 新增 `_cpu_load_shim()`：在**本插件自己的输出目录**写一个 `sitecustomize.py`，
+  仅在 `torch.cuda.is_available()` 为 False 时把 `torch.load` 的默认
+  `map_location` 设为 `cpu`；有 GPU 的机器完全不生效。
+- `_run()` 把 shim 目录放进子进程 `PYTHONPATH` 最前面；shim 不写进上游 DDSP
+  仓库（那里会被重新下载覆盖）。
+- 覆盖 RMVPE 与 vocoder 等所有上游 `torch.load` 调用（进程级）。
+
+### 验证
+
+- 用 DDSP 环境把张量存成 CUDA checkpoint，再以 `CUDA_VISIBLE_DEVICES=-1`
+  复现：无 shim 返回用户那条 `RuntimeError`；挂上 shim 后 rc=0，
+  张量落在 `cpu`。
+- `sitecustomize.py` 编译通过；插件文件 compile 通过；CI Ruff 无新增；
+  ffmpeg_winget_stub 4 用例仍全 PASS。

@@ -21,7 +21,31 @@ import traceback
 from pathlib import Path
 
 
-def _run(cmd: list[str], cwd: Path, timeout: float) -> tuple[int, str]:
+def _cpu_load_shim(directory: Path) -> Path:
+    """写一个 sitecustomize：只在无 CUDA 时把 torch.load 默认映射到 CPU。
+
+    上游 RMVPE 的 ``torch.load(model_path)`` 不带 map_location，GPU 上保存的权重
+    在纯 CPU 机器上会直接报 CUDA 反序列化错误。这里不改上游文件，只在子进程的
+    PYTHONPATH 上加一个 sitecustomize；有 GPU 时完全不生效。worker 自己不 import torch。
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    shim = directory / "sitecustomize.py"
+    shim.write_text(
+        "try:\n"
+        "    import torch\n"
+        "except Exception:\n"
+        "    torch = None\n"
+        "if torch is not None and not torch.cuda.is_available():\n"
+        "    _orig_load = torch.load\n"
+        "    def _cpu_load(*args, **kwargs):\n"
+        "        kwargs.setdefault('map_location', 'cpu')\n"
+        "        return _orig_load(*args, **kwargs)\n"
+        "    torch.load = _cpu_load\n",
+        encoding="utf-8")
+    return directory
+
+
+def _run(cmd: list[str], cwd: Path, timeout: float, shim_root: Path | None = None) -> tuple[int, str]:
     env = dict(os.environ)
     for key in ("PYTHONHOME", "PYTHONSTARTUP", "VIRTUAL_ENV", "CONDA_PREFIX"):
         env.pop(key, None)
@@ -30,7 +54,10 @@ def _run(cmd: list[str], cwd: Path, timeout: float) -> tuple[int, str]:
     # into site-packages.  Prepend the repo root to PYTHONPATH so those resolve.
     repo_path = str(cwd)
     existing = env.pop("PYTHONPATH", "")
-    env["PYTHONPATH"] = repo_path + (os.pathsep + existing if existing else "")
+    # shim 放在我们自己的输出目录，绝不写进上游 DDSP 仓库（cwd 就是上游仓库）。
+    shim_dir = _cpu_load_shim(Path(shim_root or cwd) / ".cpu_load_shim")
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (str(shim_dir), repo_path, existing) if p)
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUNBUFFERED", "1")
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -97,7 +124,7 @@ def main() -> int:
             "-th", str(threshold),
         ]
         timeout = float(job.get("timeout") or 7200)
-        code, tail = _run(cmd, repo, timeout)
+        code, tail = _run(cmd, repo, timeout, shim_root=out_dir)
 
         if code != 0 or not output.is_file():
             result["error"] = f"DDSP 转换退出码 {code}：{tail}"
