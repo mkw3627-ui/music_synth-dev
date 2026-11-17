@@ -182,7 +182,34 @@ SEP_PACKAGES = [
 # proc-tap 提供逐应用 WASAPI 采集，winrt 提供系统媒体信息（SMTC）。
 CAPTURE_NATIVE_PACKAGES = [
     "proc-tap==1.1.1", "winrt-Windows.Media.Control",
+    # 第五十六轮：proc-tap 依赖 numpy/scipy，不钉住的话 pip 会把合成环境的 numpy 1.26.4 升到 2.x，
+    # torch/DDSP 随后导入失败（新机器上「采集组件装完、变声坏了」）。和 DDSP_PACKAGES 保持同一版本。
+    "numpy==1.26.4",
 ]
+
+
+def install_capture_native(python, progress=None) -> dict:
+    """逐应用声道采集组件：pip 装进合成环境，装完立刻验证能 import。
+
+    引导页「安装」和「让她唱歌」页的「安装独立采集组件」都走这里。
+    以前后者只会从插件包里复制 proc-tap 目录——市场禁止二进制后包里已经没有了，
+    所以在没有「为她所听」的机器上永远失败。"""
+    py = Path(str(python or ""))
+    if not py.is_file():
+        return {"ok": False, "error": f"合成环境还没装好（{py}），先在引导页装「DDSP-SVC 环境」"}
+    prog = progress or (lambda *_: None)
+    try:
+        _pip(py, CAPTURE_NATIVE_PACKAGES, prog, "安装采集 / 系统媒体组件",
+             head="逐应用声道采集组件（proc-tap / 系统媒体）")
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[-800:]}
+    probe = subprocess.run(
+        [str(py), "-I", "-c", "import numpy, proctap._native, winrt.windows.media.control; print(numpy.__version__)"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if probe.returncode != 0:
+        return {"ok": False, "error": "装完了但导入失败：" + (probe.stderr or probe.stdout)[-600:]}
+    return {"ok": True, "numpy": probe.stdout.strip(), "note": "逐应用声道采集组件已装好"}
 
 
 # ---------------------------------------------------------------------------
@@ -1283,6 +1310,12 @@ def stash_model_files(paths: dict, key: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Dependency report
 # ---------------------------------------------------------------------------
+# 第五十六轮：引导页要装全插件的东西。ACE（原创歌曲）的依赖与模型由插件主体管理（路径、下载器都在那边），
+# 这里留两个挂钩：EXTRA_CHECKS 返回额外的检查项，EXTRA_INSTALLERS[key](progress) 负责安装。
+EXTRA_CHECKS: list = []
+EXTRA_INSTALLERS: dict = {}
+
+
 def _item(key: str, label: str, status: str, detail: str = "", *,
           required: bool = True, installable: bool = False, fix: str = "",
           size_gb: float = 0.0, action: str = "") -> dict:
@@ -1481,6 +1514,14 @@ def check_dependencies(paths: dict, probe: dict | None = None) -> dict:
             item["resolved_path"] = str(resolved)
             item["detected_by"] = detected_method
         items.append(item)
+
+    # 原创歌曲（ACE）等插件挂进来的项 ---------------------------------------
+    for hook in EXTRA_CHECKS:
+        try:
+            items.extend(hook(paths, probe) or [])
+        except Exception as exc:  # noqa: BLE001 - 额外检查失败不影响主清单
+            items.append(_item("extra_check_error", "附加检查", "optional",
+                               f"{type(exc).__name__}: {exc}", required=False))
 
     # disk -----------------------------------------------------------------
     root = Path(paths["compute_root"])
@@ -1991,12 +2032,11 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
     if "capture_native" in requested and synth_py.is_file():
         # 逐应用采集（proc-tap）+ 系统媒体（winrt）：独立引导项，缺了不阻塞安装。
         # 市场不允许插件包携带 .pyd/.exe/.dll，所以改用 pip 装进合成环境。
-        try:
-            _pip(synth_py, CAPTURE_NATIVE_PACKAGES, progress, "安装采集 / 系统媒体组件",
-                 head="逐应用声道采集组件（proc-tap / 系统媒体）")
+        res = install_capture_native(synth_py, progress)
+        if res.get("ok"):
             installed.append("capture_native")
-        except Exception as exc:  # noqa: BLE001
-            errors.append({"item": "capture_native", "error": str(exc)})
+        else:
+            errors.append({"item": "capture_native", "error": res.get("error") or "未知错误"})
     if "ffmpeg" in requested:
         # 人声分离（audio-separator）要用系统 PATH 里的 ffmpeg，pip 的 imageio-ffmpeg 它用不到，
         # 所以这里改成调 winget 装系统版；只有用户点「安装」才走到这。
@@ -2058,6 +2098,19 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
             if spec.get("optional"):
                 err["optional"] = True
             errors.append(err)
+
+    # 原创歌曲（ACE）依赖 / 模型：放在最后（要先有合成环境的 Python）
+    for key, fn in EXTRA_INSTALLERS.items():
+        if key not in requested:
+            continue
+        try:
+            res = fn(progress) or {}
+            if res.get("ok"):
+                installed.append(key)
+            else:
+                errors.append({"item": key, "error": str(res.get("error") or "安装失败")})
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"item": key, "error": f"{type(exc).__name__}: {exc}"})
 
     report_after = check_dependencies(paths, probe)
     return {

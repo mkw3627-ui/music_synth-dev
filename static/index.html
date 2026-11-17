@@ -1938,6 +1938,51 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       callEntry(api, "ms_corpus_requirements", { steps: STEPS_CHOICES[1] }, 6e4).then((r) => setReq(r)).catch(() => {
       });
     }, []);
+    // 第五十六轮：声音包在后台导入（插件进程自己读文件、装包），面板只看进度；切走页面不影响
+    const [bgImport, setBgImport] = useState(null);
+    const importKindText = (job) => job && job.kind === "ace" ? "原创歌曲的声音" : "翻唱的声音";
+    const pollImport = async () => {
+      try {
+        const r = await callEntry(api, "ms_voice_import", { action: "status" }, 15e3);
+        setBgImport(r);
+        const job = r && r.job || {};
+        const pick = r && r.pick || {};
+        if (job.state === "done") setImportMsg({ tone: "info", text: job.detail || "导入成功", kind: job.kind });
+        else if (job.state === "failed") setImportMsg({ tone: "error", text: job.detail || "导入失败" });
+        else if (pick.state === "error") setImportMsg({ tone: "error", text: "文件选择框打不开：" + (pick.error || "") });
+        return r;
+      } catch (e) {
+        return null;
+      }
+    };
+    useEffect(() => {
+      let alive = true;
+      pollImport();
+      const id = setInterval(() => {
+        if (!alive) return;
+        const b0 = bgImport;
+        const running = b0 && (b0.pick && b0.pick.state === "open" || b0.job && b0.job.state === "running");
+        if (running || importBusy === "bg") pollImport().then((r) => {
+          const done = r && !(r.pick && r.pick.state === "open") && !(r.job && r.job.state === "running") && (r.job && r.job.state || r.pick && r.pick.state === "cancelled");
+          if (done && alive) setImportBusy("");
+        });
+      }, 1200);
+      return () => {
+        alive = false;
+        clearInterval(id);
+      };
+    }, [bgImport && bgImport.job && bgImport.job.state, bgImport && bgImport.pick && bgImport.pick.state, importBusy]);
+    const pickAndImport = async () => {
+      setImportMsg(null);
+      setImportBusy("bg");
+      try {
+        await callEntry(api, "ms_voice_import", { action: "pick" }, 15e3);
+        await pollImport();
+      } catch (e) {
+        setImportBusy("");
+        setImportMsg({ tone: "error", text: "没能打开文件选择框：" + String(e && e.message || e) });
+      }
+    };
     const list = c.list;
     const need = requirementOf(req, STEPS_CHOICES[1]);
     const have = effectiveSeconds(list, c.countSpeech);
@@ -1965,7 +2010,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       const f = arr[0];
       if (!f) return;
       if (!/\.zip$/i.test(f.name)) {
-        setImportMsg({ tone: "error", text: "请选择 .zip 声音包（里面要同时有 model_*.pt 和 config.yaml）" });
+        setImportMsg({ tone: "error", text: "请选择 .zip 声音包（翻唱的声音：model_*.pt + config.yaml；原创歌曲的声音：adapter_config.json + 权重）" });
         return;
       }
       setImportBusy("import");
@@ -1974,7 +2019,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       try {
         const r = await uploadModelChunked(api, f, 6e5, setImportPct);
         if (r && r.ok) {
-          setImportMsg({ tone: "info", text: "导入成功：「" + (r.name || f.name) + "」已经出现在「我的声音」里了" });
+          setImportMsg({ tone: "info", kind: r.kind === "ace_lora" ? "ace" : "cover", text: "导入成功：" + (r.kind === "ace_lora" ? "原创歌曲的声音" : "翻唱的声音") + "「" + ((r.installed || []).join("、") || r.name || f.name) + "」已经出现在「我的声音」里了" });
         } else {
           setImportMsg({ tone: "error", text: "导入失败：" + (r && r.error || "未知错误") });
         }
@@ -2045,20 +2090,26 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           sub: /* @__PURE__ */ jsx(Muted, { children: "不用训练，导入 .zip 声音包" }),
           children: /* @__PURE__ */ jsxs(Col, { style: { gap: 10 }, children: [
             /* @__PURE__ */ jsxs("div", { style: { fontSize: 12.5, color: INK_2, lineHeight: 1.8 }, children: [
-              "把「我的声音 → 导出」生成的声音包，或者别人打包好的 zip 拖进来。包里要有",
-              /* @__PURE__ */ jsx("b", { children: " model_*.pt" }),
-              " 和 ",
-              /* @__PURE__ */ jsx("b", { children: "config.yaml" }),
-              "；导入后直接出现在「我的声音」里，不用再训练。"
+              "把「我的声音 → 导出」生成的声音包，或者别人打包好的 zip 导进来，两种都认：",
+              /* @__PURE__ */ jsx("b", { children: "翻唱的声音" }),
+              "（包里有 model_*.pt 和 config.yaml）、",
+              /* @__PURE__ */ jsx("b", { children: "原创歌曲的声音" }),
+              "（包里有 adapter_config.json）。导入后直接出现在「我的声音」对应的分组里，不用再训练。"
             ] }),
+            /* @__PURE__ */ jsxs(Row, { style: { gap: 10, alignItems: "center", flexWrap: "wrap" }, children: [
+              /* @__PURE__ */ jsx(Btn, { style: PRIMARY_BTN, disabled: !!importBusy, onClick: pickAndImport, children: importBusy === "bg" ? "正在后台导入…" : "选择声音包（后台导入）" }),
+              /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11.5 }, children: "推荐：在后台导入，切到别的页面也会继续" })
+            ] }),
+            bgImport && bgImport.pick && bgImport.pick.state === "open" ? /* @__PURE__ */ jsx(Muted, { children: "已经弹出文件选择框（如果没看到，看看任务栏）" }) : null,
+            bgImport && bgImport.job && bgImport.job.state === "running" ? /* @__PURE__ */ jsx(Muted, { children: (bgImport.job.detail || "正在导入") + "…（后台进行，可以先去别的页面）" }) : null,
             /* @__PURE__ */ jsx(
               DropZone,
               {
                 busy: !!importBusy,
                 accept: ".zip",
                 multiple: false,
-                hint: "点击或拖拽 .zip 声音包至此",
-                note: "只接受 .zip 声音包",
+                hint: "也可以把 .zip 声音包拖到这里",
+                note: "拖拽导入要停在这个页面直到完成；大的包建议用上面的「后台导入」",
                 onFiles: importVoice
               }
             ),

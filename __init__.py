@@ -45,6 +45,7 @@ from . import (
 )
 from . import setup as setup_mod
 from . import compat as compat_mod
+from . import voice_import as voice_import_mod
 
 # 离线编排（show.json）：schema/director/presets 都只用标准库，进程内直接 import
 # 不影响启动耗时；真正的重活（librosa 分析）在 choreo_worker 子进程里跑。
@@ -323,6 +324,12 @@ class MusicSynthPlugin(NekoPluginBase):
         # 分片上传会话：upload_id -> {path, slot, name, size}
         self._uploads: dict[str, dict] = {}
         self._uploads_lock = threading.Lock()
+        # 第五十六轮：引导页清单 / 一键安装把「原创歌曲」的依赖与模型也包进来
+        setup_mod.EXTRA_CHECKS[:] = [lambda paths, probe: self._ace_setup_items(paths, probe)]
+        setup_mod.EXTRA_INSTALLERS.clear()
+        setup_mod.EXTRA_INSTALLERS["ace_deps"] = lambda progress: (
+            progress("原创歌曲：安装 ACE 依赖（约 0.3GB）") or self._ace_install_deps_sync())
+        setup_mod.EXTRA_INSTALLERS["ace_model"] = lambda progress: self._ace_install_model_sync(progress)
         # 声音包导入会话：upload_id -> {path, name, size}
         self._model_uploads: dict[str, dict] = {}
         # 语料索引的读改写锁：删除/登记/更新可能来自不同线程，不加锁会互相覆盖
@@ -3113,7 +3120,7 @@ class MusicSynthPlugin(NekoPluginBase):
                                 "label": r.get("label")} for r in rows[:60]]})
 
     @plugin_entry(id="ms_capture_install", name="为她而唱 · 安装独立采集组件",
-                  description="把逐应用声道隔离运行环境复制到本插件（优先硬链接，不占额外空间）",
+                  description="安装逐应用声道采集组件（proc-tap + 系统媒体，pip 装进合成环境并验证能用）",
                   input_schema={"type": "object", "properties": {}})
     @error_log.logged_entry
     async def ms_capture_install(self, **_):
@@ -3121,7 +3128,16 @@ class MusicSynthPlugin(NekoPluginBase):
 
         def run():
             try:
-                result = runtime.copy_app_capture_runtime(self._data_dir)
+                # 第五十六轮：先 pip 装进合成环境（新机器上包里没有 proc-tap 二进制可复制）；
+                # 合成环境还没装时退回旧办法：从「为她所听」复制。
+                synth = str(self._pipeline.paths.get("synth_python") or "")
+                self._job_update(job_id, progress=10, detail="正在安装逐应用声道采集组件（约 30MB）")
+                result = setup_mod.install_capture_native(
+                    synth, lambda d="": self._job_update(job_id, detail=str(d)[:200]))
+                if not result.get("ok") and not Path(synth).is_file():
+                    result = runtime.copy_app_capture_runtime(self._data_dir)
+                if synth:
+                    setup_mod.invalidate_deps_cache(synth)
                 self._job_update(
                     job_id, state="done" if result.get("ok") else "failed", progress=100,
                     detail=(result.get("error") or result.get("note")
@@ -4677,6 +4693,25 @@ class MusicSynthPlugin(NekoPluginBase):
         lib = self._assets.effects()
         out = {"learned": lib.get("learned") or [], "templates": lib.get("templates") or [],
                "frames": lib.get("frames") or [], "tags": lib.get("tags") or {}, "updated_at": lib.get("updated_at")}
+        # 第五十六轮：随插件发布一份「出厂风格库」（static/stage/bundled_effects.json：学好的配色/构图参数、
+        # 版式模板、边框基因，只有数字和颜色，不含任何图片或网址）。新装的机器自己还没学过东西时
+        # 舞台也有完整的风格可用；本机学到的条目按 id 合并在后面（同 id 以本机为准）。
+        try:
+            bundled = json.loads((self._plugin_dir / "static" / "stage" / "bundled_effects.json")
+                                 .read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            bundled = {}
+        def _key(x):
+            return str(x.get("id")) if x.get("id") else json.dumps(x, sort_keys=True, ensure_ascii=False)
+
+        for key in ("learned", "templates", "frames"):
+            mine = [x for x in (out.get(key) or []) if isinstance(x, dict)]
+            seen = {_key(x) for x in mine}
+            out[key] = mine + [x for x in (bundled.get(key) or [])
+                               if isinstance(x, dict) and _key(x) not in seen]
+        tags = dict(bundled.get("tags") or {})
+        tags.update(out.get("tags") or {})
+        out["tags"] = tags
         tmp = self._assets_pub / "learned_effects.json.tmp"
         tmp.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, self._assets_pub / "learned_effects.json")
@@ -7129,6 +7164,66 @@ class MusicSynthPlugin(NekoPluginBase):
             return Ok({"ok": False, "error": f"打不开文件夹：{exc}", "dir": str(folder)})
         return Ok({"ok": True, "dir": str(folder)})
 
+    # ---------------------------------------------------------------- 第五十六轮：后台导入声音包
+    def _voice_import_run(self, path: str) -> str:
+        """后台线程装一个本地 .zip 声音包；返回 job_id。翻唱（DDSP）/ 原创（ACE LoRA）自动区分。"""
+        job_id = self._job_begin("voice-import")
+        name = Path(str(path)).name
+        self._job_update(job_id, progress=5, detail=f"正在导入「{name}」", file=name)
+        self._voice_import_last = job_id
+
+        def run():
+            try:
+                res = model_package.import_model_zip(
+                    Path(path), name, str(self._pipeline.paths.get("ddsp_root") or ""),
+                    self._ace_paths()["root"] / "loras")
+            except Exception as exc:  # noqa: BLE001
+                res = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            kind = "ace" if res.get("kind") == "ace_lora" else "cover"
+            label = "原创歌曲的声音" if kind == "ace" else "翻唱的声音"
+            if res.get("ok"):
+                names = res.get("installed") or [res.get("name")]
+                detail = f"导入成功：{label}「{'、'.join(str(n) for n in names if n)}」"
+                if res.get("skipped"):
+                    detail += "（跳过：" + "；".join(res["skipped"]) + "）"
+                self._job_update(job_id, state="done", progress=100, detail=detail, kind=kind, result=res)
+            else:
+                self._job_update(job_id, state="failed", progress=100,
+                                 detail="导入失败：" + str(res.get("error") or "未知错误"), result=res)
+
+        self._thread(f"ms-voice-import-{job_id}", run)
+        return job_id
+
+    @plugin_entry(id="ms_voice_import", name="为她而唱 · 后台导入声音包",
+                  description=("在后台导入 .zip 声音包，不依赖面板页面：action=pick 弹系统文件框选包、选好自动开始导入；"
+                               "action=path 直接导入给定本地路径；action=status 查询选择框和最近一次导入的进度/结果。"
+                               "翻唱声音（model_*.pt + config.yaml）和原创歌曲声音（ACE LoRA）自动区分。"),
+                  input_schema={"type": "object", "properties": {
+                      "action": {"type": "string", "enum": ["pick", "path", "status"]},
+                      "path": {"type": "string"}, "job_id": {"type": "string"}}})
+    @error_log.logged_entry
+    async def ms_voice_import(self, action: str = "status", path: str = "", job_id: str = "", **_):
+        if not hasattr(self, "_voice_pick"):
+            self._voice_pick = voice_import_mod.PickState()
+            self._voice_pick_job = ""
+        if action == "path":
+            p = Path(str(path or "").strip().strip('"'))
+            if not p.is_file() or p.suffix.lower() != ".zip":
+                return Ok({"ok": False, "error": f"找不到 .zip 声音包：{p}"})
+            return Ok({"ok": True, "job_id": self._voice_import_run(str(p))})
+        if action == "pick":
+            st = self._voice_pick.start(str(self._exports_dir()))
+            self._voice_pick_job = ""
+            return Ok(dict(st, ok=True))
+        # status：选好了文件就自动开始导入（只开始一次）
+        pick = self._voice_pick.get()
+        if pick.get("state") == "picked" and pick.get("path") and not self._voice_pick_job:
+            self._voice_pick_job = self._voice_import_run(pick["path"])
+        jid = str(job_id or self._voice_pick_job or getattr(self, "_voice_import_last", "") or "")
+        with self._jobs_lock:
+            job = dict(self._jobs.get(jid) or {})
+        return Ok({"ok": True, "pick": pick, "job_id": jid, "job": job})
+
     @plugin_entry(id="ms_model_import_begin", name="为她而唱 · 开始导入声音",
                   description="开一个声音包分片上传会话；只接受 .zip（内含 model_*.pt 和 config.yaml）",
                   input_schema={"type": "object", "properties": {
@@ -7191,11 +7286,14 @@ class MusicSynthPlugin(NekoPluginBase):
         try:
             if not src.is_file() or int(rec.get("size") or 0) <= 0:
                 return Ok({"ok": False, "error": "上传的声音包是空的"})
-            return Ok(await asyncio.to_thread(
+            res = await asyncio.to_thread(
                 model_package.import_model_zip, src,
                 str(rec.get("name") or "voice.zip"),
                 str(self._pipeline.paths.get("ddsp_root") or ""),
-                self._ace_paths()["root"] / "loras"))
+                self._ace_paths()["root"] / "loras")
+            if isinstance(res, dict) and res.get("ok"):
+                res = dict(res, kind_label=("原创歌曲的声音" if res.get("kind") == "ace_lora" else "翻唱的声音"))
+            return Ok(res)
         finally:
             try:
                 src.unlink(missing_ok=True)
@@ -7672,7 +7770,8 @@ class MusicSynthPlugin(NekoPluginBase):
                 if not (p["pylibs"] / pkg).exists():
                     problems.append(f"ACE 依赖 {pkg}")
                     break
-        if not (self._plugin_dir / "acestep" / "__init__.py").is_file():
+        if not any((self._plugin_dir / sub / "acestep" / "__init__.py").is_file()
+                   for sub in ("vendor", ".")):
             problems.append("ACE-Step 代码 acestep/")
         for key in ("Qwen3-Embedding-0.6B", "vae"):
             if not (p["checkpoints"] / key).is_dir():
@@ -8700,6 +8799,83 @@ class MusicSynthPlugin(NekoPluginBase):
         except OSError as exc:
             return Ok({"ok": False, "error": f"无法创建依赖目录：{exc}"})
         job_id = self._job_begin("ace-install")
+
+        def run():
+            self._job_update(job_id, progress=5, detail="正在安装 ACE 依赖（约 300MB）")
+            res = self._ace_install_deps_sync()
+            self._job_update(job_id, state="done" if res.get("ok") else "failed", progress=100,
+                             detail=res.get("detail") or res.get("error") or "")
+
+        self._thread(f"ms-ace-install-{job_id}", run)
+        return Ok({"ok": True, "job_id": job_id})
+
+    # ---------------------------------------------------------------- 第五十六轮：ACE 进引导页
+    def _ace_setup_items(self, paths: dict, probe: dict) -> list:
+        """引导页清单里的「原创歌曲」两项：ACE 依赖、ACE 基础模型（turbo + VAE + 文本编码器）。
+
+        没有 NVIDIA 显卡的机器原创暂不支持（CPU 上 ACE 会随机崩溃），这两项标为可选，不阻塞引导。"""
+        if not paths.get("configured"):
+            return []
+        gpu_ok = bool((probe or {}).get("gpu"))
+        p = self._ace_paths()
+        out = []
+        deps_missing = [x for x in self._ace_problems() if x.startswith("ACE 依赖")]
+        out.append(setup_mod._item(
+            "ace_deps", "原创歌曲：ACE 依赖（diffusers / transformers / peft 等）",
+            "ready" if not deps_missing else "missing",
+            str(p["pylibs"]) if not deps_missing else "缺少：" + "、".join(deps_missing),
+            required=gpu_ok, installable=bool(deps_missing),
+            fix="" if not deps_missing else "pip 装到安装目录的 acestep\\pylibs（走国内镜像，约 0.3GB）",
+            size_gb=0.3 if deps_missing else 0.0, action="" if not deps_missing else "ace:deps"))
+        need = [k for k in ("Qwen3-Embedding-0.6B", "vae") if not (p["checkpoints"] / k).is_dir()]
+        if not self._ace_model_ready(p["checkpoints"] / self.ACE_MODEL_DEFAULT):
+            need.append(self.ACE_MODEL_DEFAULT)
+        out.append(setup_mod._item(
+            "ace_model", "原创歌曲：ACE 基础模型（2B turbo + VAE + 文本编码器）",
+            "ready" if not need else "missing",
+            str(p["checkpoints"]) if not need else "缺少：" + "、".join(need),
+            required=gpu_ok, installable=bool(need),
+            fix="" if not need else "从 ModelScope 国内源下载（失败回落 HF 镜像），约 6GB，可断点续传",
+            size_gb=6.0 if need else 0.0, action="" if not need else "ace:model"))
+        return out
+
+    def _ace_install_model_sync(self, progress=None) -> dict:
+        """下载 ACE 主模型（turbo + vae + Qwen3 文本编码器）。走插件自带的 ACE 下载器（ModelScope 优先）。"""
+        p = self._ace_paths()
+        if not p["python"].is_file():
+            return {"ok": False, "error": "合成环境还没装好"}
+        if [x for x in self._ace_problems() if x.startswith("ACE 依赖")]:
+            return {"ok": False, "error": "先装 ACE 依赖"}
+        p["checkpoints"].mkdir(parents=True, exist_ok=True)
+        code_root = next((self._plugin_dir / sub for sub in ("vendor", ".")
+                          if (self._plugin_dir / sub / "acestep" / "__init__.py").is_file()), self._plugin_dir)
+        script = (
+            "import sys, os; os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com');"
+            f"sys.path.insert(0, r'{code_root}'); sys.path.insert(0, r'{p['pylibs']}');"
+            "from acestep.model_downloader import download_main_model;"
+            f"ok, msg = download_main_model(r'{p['checkpoints']}', prefer_source='modelscope');"
+            "print('RESULT', ok, msg); sys.exit(0 if ok else 3)")
+        if progress:
+            progress("原创歌曲：下载 ACE 基础模型（约 6GB，可断点续传）")
+        proc = subprocess.run([str(p["python"]), "-X", "utf8", "-c", script], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=6 * 3600, env=runtime._clean_env(),
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        need = [k for k in ("Qwen3-Embedding-0.6B", "vae") if not (p["checkpoints"] / k).is_dir()]
+        if not self._ace_model_ready(p["checkpoints"] / self.ACE_MODEL_DEFAULT):
+            need.append(self.ACE_MODEL_DEFAULT)
+        if need:
+            return {"ok": False, "error": "下载后仍缺：" + "、".join(need) + "；" + (proc.stdout + proc.stderr)[-600:]}
+        return {"ok": True, "detail": "ACE 基础模型已就绪"}
+
+    def _ace_install_deps_sync(self) -> dict:
+        """ACE 依赖装到 acestep/pylibs（同步）。「原创歌曲」页和引导页一键安装共用。"""
+        p = self._ace_paths()
+        if not p["python"].is_file():
+            return {"ok": False, "error": f"找不到 DDSP 环境的 Python：{p['python']}（先装合成环境）"}
+        try:
+            p["pylibs"].mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return {"ok": False, "error": f"无法创建依赖目录：{exc}"}
         packages = [
             "diffusers==0.36.0", "loguru", "accelerate", "win32-setctime",
             "transformers==4.57.1", "tokenizers==0.22.1", "huggingface_hub==0.36.0",
@@ -8712,40 +8888,38 @@ class MusicSynthPlugin(NekoPluginBase):
             # 国内镜像源（download_source=mirror）走 ModelScope
             "modelscope", "modelscope-hub", "cryptography",
         ]
-
-        def run():
-            self._job_update(job_id, progress=5, detail="正在安装 ACE 依赖（约 100MB）")
-            env = runtime._clean_env()
-            # 用户机器上的本地代理经常是关的；pip 直连失败时不要让它卡在代理上
-            for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy",
-                        "https_proxy", "all_proxy"):
-                env.pop(key, None)
-            env["NO_PROXY"] = "*"
-            # pip --target 不会卸载同名旧版本；先清掉这些包的旧 dist-info，
-            # 否则 importlib.metadata 仍可能读到 transformers 4.51 的版本号。
-            stale = {"transformers", "tokenizers", "huggingface_hub", "peft",
-                     "modelscope", "modelscope_hub", "cryptography",
-                     "pytorch_wavelets", "pywavelets", "vector_quantize_pytorch",
-                     "einx", "torch_einops_utils", "frozendict"}
-            for dist in p["pylibs"].glob("*.dist-info"):
-                stem = dist.name.split("-", 1)[0].replace("-", "_").lower()
-                if stem in stale:
-                    shutil.rmtree(dist, ignore_errors=True)
-            cmd = [str(p["python"]), "-m", "pip", "install", "--no-deps",
-                   "--upgrade", "--target", str(p["pylibs"]), *packages]
+        env = runtime._clean_env()
+        # 用户机器上的本地代理经常是关的；pip 直连失败时不要让它卡在代理上
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy",
+                    "https_proxy", "all_proxy"):
+            env.pop(key, None)
+        env["NO_PROXY"] = "*"
+        # pip --target 不会卸载同名旧版本；先清掉这些包的旧 dist-info，
+        # 否则 importlib.metadata 仍可能读到 transformers 4.51 的版本号。
+        stale = {"transformers", "tokenizers", "huggingface_hub", "peft",
+                 "modelscope", "modelscope_hub", "cryptography",
+                 "pytorch_wavelets", "pywavelets", "vector_quantize_pytorch",
+                 "einx", "torch_einops_utils", "frozendict"}
+        for dist in p["pylibs"].glob("*.dist-info"):
+            stem = dist.name.split("-", 1)[0].replace("-", "_").lower()
+            if stem in stale:
+                shutil.rmtree(dist, ignore_errors=True)
+        # 第五十六轮：清华 → 阿里云 → 官方源（以前只走默认源，国内常常装不上）
+        proc = None
+        for index_args in (["-i", setup_mod.PYPI_MIRRORS[0]], ["-i", setup_mod.PYPI_MIRRORS[1]], []):
+            cmd = [str(p["python"]), "-m", "pip", "install", "--no-deps", "--disable-pip-version-check",
+                   "--upgrade", "--target", str(p["pylibs"]), *index_args, *packages]
             try:
                 proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=1800,
                                       env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             except Exception as exc:  # noqa: BLE001
-                self._job_update(job_id, state="failed", progress=100,
-                                 detail=f"安装失败：{type(exc).__name__}: {exc}")
-                return
-            if proc.returncode != 0:
-                tail = ((proc.stderr or "") + (proc.stdout or ""))[-1200:]
-                self._job_update(job_id, state="failed", progress=100,
-                                 detail="安装失败：" + (tail.strip() or f"pip 退出码 {proc.returncode}"))
-                return
-            self._job_update(job_id, state="done", progress=100, detail="ACE 依赖安装完成")
-
-        self._thread(f"ms-ace-install-{job_id}", run)
-        return Ok({"ok": True, "job_id": job_id})
+                return {"ok": False, "error": f"安装失败：{type(exc).__name__}: {exc}"}
+            if proc.returncode == 0:
+                break
+        if proc is None or proc.returncode != 0:
+            tail = ((proc.stderr or "") + (proc.stdout or ""))[-1200:] if proc else ""
+            return {"ok": False, "error": "安装失败：" + (tail.strip() or "pip 失败")}
+        missing = [x for x in self._ace_problems() if x.startswith("ACE 依赖")]
+        if missing:
+            return {"ok": False, "error": "装完仍缺：" + "、".join(missing)}
+        return {"ok": True, "detail": "ACE 依赖安装完成"}

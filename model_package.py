@@ -175,9 +175,28 @@ def _import_ace_lora(zf, infos, paths, uploaded_name, loras_root) -> dict:
             continue
         variants.setdefault(p.parent.name, []).append(k)
     installed, skipped = [], []
+    # 第五十六轮：同名音色已存在时整包改名（梦梦 → 梦梦_2，变体 梦梦_turbo → 梦梦_2_turbo），
+    # 不再整包导入失败；整包用同一个新名字，面板才能把各底模变体归到同一个音色下。
+    _SFX = ("_xl_turbo", "_xl_sft", "_xl_base", "_turbo", "_sft", "_base")
+
+    def _split(name):
+        for sfx in _SFX:
+            if name.endswith(sfx):
+                return name[: -len(sfx)], sfx
+        return name, ""
+
+    planned = {v: _safe_name(v, fallback="ace_lora") for v in variants}
+    if any((loras_root / n).exists() for n in planned.values()):
+        stems = {_split(n)[0] for n in planned.values()}
+        k = 2
+        while any((loras_root / f"{st}_{k}{_split(n)[1]}").exists()
+                  for n in planned.values() for st in [_split(n)[0]]):
+            k += 1
+        planned = {v: f"{_split(n)[0]}_{k}{_split(n)[1]}" for v, n in planned.items()}
+        skipped.append("同名音色已存在，改名为：" + "、".join(sorted({f"{st}_{k}" for st in stems})))
     for variant, idxs in variants.items():
         names = {paths[k].name for k in idxs}
-        safe = _safe_name(variant, fallback="ace_lora")
+        safe = planned[variant]
         if "adapter_config.json" not in names or not names & {
                 "adapter_model.safetensors", "adapter_model.bin"}:
             skipped.append(f"{variant}（缺少 adapter 配置或权重）")
