@@ -17,7 +17,8 @@ _MIN_WEIGHT_BYTES = 1024 * 1024  # 真正的分片都是百 MB 级；1MB 以下�
 
 # HuggingFace 官方在国内容易连不上；ModelScope 源失败时会回落到 HF，
 # 这里把 HF 端点指到镜像（用户自己设过就不覆盖）。
-os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+# 第五十六轮实测：hf-mirror.com 现在会 308 跳回 huggingface.co（国内不通），hf-mirror.net 能直接下
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.net")
 
 
 def _complete(model_dir: Path) -> bool:

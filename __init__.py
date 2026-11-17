@@ -7521,8 +7521,18 @@ class MusicSynthPlugin(NekoPluginBase):
             "venv": str(Path(p["python"]).parents[1]),
             "base_python": base_python,
         }
+        need_deps = bool(self._ace_deps_missing())
 
         def run():
+            if need_deps:
+                # 第五十六轮：SoulX 的模型下载用 pylibs 里的 modelscope；新机器上先装
+                self._job_update(job_id, state="running", progress=1,
+                                 detail="先安装下载器依赖（ModelScope 等，约 0.3GB）")
+                dep = self._ace_install_deps_sync()
+                if not dep.get("ok"):
+                    self._job_update(job_id, state="failed", progress=100,
+                                     detail="下载器依赖没装上：" + str(dep.get("error") or ""))
+                    return
             stop = threading.Event()
 
             def watch():
@@ -7766,7 +7776,8 @@ class MusicSynthPlugin(NekoPluginBase):
             problems.append("ACE 依赖目录 acestep\\pylibs")
         else:
             for pkg in ("transformers", "diffusers", "loguru", "accelerate",
-                        "win32_setctime", "peft", "vector_quantize_pytorch"):
+                        "win32_setctime", "peft", "vector_quantize_pytorch",
+                        "modelscope", "huggingface_hub"):
                 if not (p["pylibs"] / pkg).exists():
                     problems.append(f"ACE 依赖 {pkg}")
                     break
@@ -7879,6 +7890,7 @@ class MusicSynthPlugin(NekoPluginBase):
             return Ok({"ok": True, "already": True, "model": name})
         if not p["python"].is_file():
             return Ok({"ok": False, "error": f"找不到 DDSP 环境的 Python：{p['python']}"})
+        need_deps = bool(self._ace_deps_missing())
         # 安装前先看她这台电脑：显存/磁盘不够就提示，允许用户执意继续。
         meta = next((m for m in self.ACE_MODEL_CATALOG
                      if m["name"] == name), None)
@@ -7929,6 +7941,15 @@ class MusicSynthPlugin(NekoPluginBase):
         }
 
         def run():
+            if need_deps:
+                # 第五十六轮：新机器先装 ACE 依赖（下载器要用里面的 modelscope / huggingface_hub）
+                self._job_update(job_id, state="running", progress=2,
+                                 detail="先安装原创歌曲依赖（约 0.3GB，含 ModelScope 下载器）")
+                dep = self._ace_install_deps_sync()
+                if not dep.get("ok"):
+                    self._job_update(job_id, state="failed", progress=100,
+                                     detail="原创歌曲依赖没装上：" + str(dep.get("error") or ""))
+                    return
             self._job_update(job_id, state="running", progress=5,
                              detail=f"正在下载 {name}（XL 约 18.6GB，可断点续传）")
             # snapshot_download 不往外报进度，这里按目标目录的实际体积估算，
@@ -8819,7 +8840,8 @@ class MusicSynthPlugin(NekoPluginBase):
         gpu_ok = bool((probe or {}).get("gpu"))
         p = self._ace_paths()
         out = []
-        deps_missing = [x for x in self._ace_problems() if x.startswith("ACE 依赖")]
+        deps_missing = [x for x in self._ace_problems()
+                        if x.startswith("ACE 依赖") or x.startswith("ACE 运行环境")]
         out.append(setup_mod._item(
             "ace_deps", "原创歌曲：ACE 依赖（diffusers / transformers / peft 等）",
             "ready" if not deps_missing else "missing",
@@ -8850,7 +8872,7 @@ class MusicSynthPlugin(NekoPluginBase):
         code_root = next((self._plugin_dir / sub for sub in ("vendor", ".")
                           if (self._plugin_dir / sub / "acestep" / "__init__.py").is_file()), self._plugin_dir)
         script = (
-            "import sys, os; os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com');"
+            "import sys, os; os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.net');"
             f"sys.path.insert(0, r'{code_root}'); sys.path.insert(0, r'{p['pylibs']}');"
             "from acestep.model_downloader import download_main_model;"
             f"ok, msg = download_main_model(r'{p['checkpoints']}', prefer_source='modelscope');"
@@ -8866,6 +8888,9 @@ class MusicSynthPlugin(NekoPluginBase):
         if need:
             return {"ok": False, "error": "下载后仍缺：" + "、".join(need) + "；" + (proc.stdout + proc.stderr)[-600:]}
         return {"ok": True, "detail": "ACE 基础模型已就绪"}
+
+    def _ace_deps_missing(self) -> list:
+        return [x for x in self._ace_problems() if x.startswith("ACE 依赖")]
 
     def _ace_install_deps_sync(self) -> dict:
         """ACE 依赖装到 acestep/pylibs（同步）。「原创歌曲」页和引导页一键安装共用。"""

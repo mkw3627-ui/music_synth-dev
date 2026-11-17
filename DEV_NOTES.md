@@ -1941,3 +1941,22 @@ CPU 重试」只改 `device` 和 `CUDA_VISIBLE_DEVICES`，不改变 `torch.load`
    新增 `static/stage/bundled_effects.json`（出厂风格库：配色/构图参数 47 条、版式模板 132、边框基因 80、标签 202；
    只有数字和颜色，无图片无网址；learned 只收 CC0 / 公有领域来源的 47 条，条款站来源的不分发）。
    `_publish_assets` 把出厂库和本机学到的按 id 合并。空数据目录实测：舞台拿到 47/132/80/202。
+
+---
+
+## 0.3.2：新电脑装不上采集组件 / 缺 modelscope（2026-11-18）
+
+用户在另一台电脑装 0.3.x 后报：`ModuleNotFoundError: No module named 'modelscope'`、
+「逐应用声道采集组件缺失（合成环境 numpy 或 proc-tap）」。本机都显示就绪——本机环境是早就装好的，
+问题只出在**全新安装**。用空目录 + Python 3.10 新建环境复现并修：
+
+- **采集组件**：清单里这一项原来只在「合成环境已存在」时才列出。新电脑第一次一键安装时合成环境还没建，
+  这一项不在要装的清单里 → 一键安装建好环境却不装采集组件 → 装完一直显示缺失。现在始终列出，
+  一键安装在建好合成环境后接着装。
+- **modelscope**：原创歌曲的模型下载器、SoulX 安装都用 `acestep/pylibs` 里的 modelscope，
+  新电脑上 pylibs 还没装就直接 import 失败。现在 `ms_ace_download` / `ms_soulx_install` 发现依赖缺就先自动装；
+  依赖检查把 `modelscope`、`huggingface_hub` 也算进去（以前缺了也显示就绪）；ACE 依赖项在合成环境未建时也列出。
+- HF 回落端点改 `hf-mirror.net`（`hf-mirror.com` 现在 308 跳回官方，国内不通；实测 .net 能下 ACE 文件）。
+
+验证（全新目录 + Python 3.10 + 引导页同一个 `setup.install`）：合成环境、DDSP 依赖、采集组件、ACE 依赖
+78 秒全部装好，四项都显示就绪；`import modelscope, proctap._native` 正常，numpy 保持 1.26.4。

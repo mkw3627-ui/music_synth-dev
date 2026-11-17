@@ -1446,16 +1446,19 @@ def check_dependencies(paths: dict, probe: dict | None = None) -> dict:
 
     # 逐应用声道采集（proc-tap）+ 系统媒体（winrt）：缺了只是这两个功能不可用，
     # 所以不是 required；但要在引导页给出入口，否则用户只能看到「采集不可用」。
-    if ddsp_exists:
-        cap = runtime.locate_app_capture_runtime(paths["data_dir"], str(ddsp_py))
-        cap_ok = bool(cap.get("ok"))
-        items.append(_item(
-            "capture_native", "逐应用声道采集组件（proc-tap / 系统媒体）",
-            "ready" if cap_ok else "missing",
-            (cap.get("source") or "") if cap_ok else (cap.get("error") or "未安装"),
-            required=False, installable=not cap_ok,
-            fix="" if cap_ok else "pip 装进合成环境：proc-tap==1.1.1、winrt-Windows.Media.Control",
-            size_gb=0.02, action="" if cap_ok else "pip:synth:capture"))
+    # 第五十六轮：以前只有合成环境已存在才列这一项——新机器第一次「一键安装」时还没有合成环境，
+    # 这一项不在清单里，于是一键安装建好环境却不装采集组件，装完永远显示「缺失」。现在始终列出，
+    # 一键安装会在合成环境建好之后接着装它。
+    cap = (runtime.locate_app_capture_runtime(paths["data_dir"], str(ddsp_py))
+           if ddsp_exists else {"ok": False, "error": "随合成环境一起安装"})
+    cap_ok = bool(cap.get("ok"))
+    items.append(_item(
+        "capture_native", "逐应用声道采集组件（proc-tap / 系统媒体）",
+        "ready" if cap_ok else "missing",
+        (cap.get("source") or "") if cap_ok else (cap.get("error") or "未安装"),
+        required=False, installable=not cap_ok,
+        fix="" if cap_ok else "一键安装会自动装（pip 装进合成环境：proc-tap、系统媒体组件）",
+        size_gb=0.02, action="" if cap_ok else "pip:synth:capture"))
 
     # separation env -------------------------------------------------------
     sep_py = Path(paths["sep_python"])
