@@ -178,7 +178,8 @@ def _commit_free_gib() -> float:
                         ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
                         ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
                         ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-        st = _MS(); st.dwLength = ctypes.sizeof(_MS)
+        st = _MS()
+        st.dwLength = ctypes.sizeof(_MS)
         if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
             return round(st.ullAvailPageFile / 2**30, 1)
     except Exception:  # noqa: BLE001

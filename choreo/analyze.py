@@ -490,7 +490,6 @@ def _pitch_events(stem: str, lines: list[dict], sr: int = 22050) -> dict:
         if vals.size < 8:
             continue
         med = float(np.median(vals))
-        p85 = float(np.percentile(vals, 85))
         if med <= 0:
             continue
         # 高音：比本句中位数高 3 个半音以上，持续 >= 0.12s

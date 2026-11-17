@@ -139,7 +139,9 @@ def blend(grammars: list, rng: random.Random | None = None) -> dict:
     gs = [g for g in grammars if g]
     if not gs:
         return {}
-    pick = lambda key: rng.choice(gs)[key]
+    def pick(key):
+        return rng.choice(gs)[key]
+
     out = {
         "layout": pick("layout"), "pattern": pick("pattern"), "palette_mood": pick("palette_mood"),
         "symmetry": pick("symmetry"), "typography": pick("typography"),
@@ -179,22 +181,38 @@ def frame_genome(g: dict, palette: list, seed: int) -> dict:
     card = g.get("card") or {}
     mood = g.get("palette_mood")
     kinds = []
-    if card.get("shape") == "ticket": kinds.append("ticket")
-    if card.get("shape") == "polaroid": kinds += ["postcard", "stamp"]
-    if card.get("border") == "lace": kinds += ["stitch", "flowerwreath"]
-    if card.get("border") == "glow" or mood == "neon": kinds += ["neontube", "gradientring"]
-    if card.get("border") == "double": kinds += ["goldleaf", "artdeco"]
-    if card.get("border") == "dashed": kinds.append("stitch")
-    if "stars" in deco or "sparkles" in deco: kinds.append("starline")
-    if "hearts" in deco: kinds.append("heartline")
-    if "bubbles" in deco: kinds.append("bubbleframe")
-    if "clouds" in deco: kinds.append("cloudframe")
-    if "flowers" in deco: kinds.append("flowerwreath")
-    if "tape" in deco or "stickers" in deco: kinds.append("washi")
-    if "ribbons" in deco: kinds.append("ribbon")
-    if g.get("pattern") in ("grid", "checker", "gingham"): kinds += ["notebook", "pixel"]
-    if mood in ("dark", "neon") or g.get("typography") == "stamp": kinds += ["cyberbrackets", "glitchframe"]
-    if mood == "vintage": kinds += ["filmstrip2", "artdeco"]
+    if card.get("shape") == "ticket":
+        kinds.append("ticket")
+    if card.get("shape") == "polaroid":
+        kinds += ["postcard", "stamp"]
+    if card.get("border") == "lace":
+        kinds += ["stitch", "flowerwreath"]
+    if card.get("border") == "glow" or mood == "neon":
+        kinds += ["neontube", "gradientring"]
+    if card.get("border") == "double":
+        kinds += ["goldleaf", "artdeco"]
+    if card.get("border") == "dashed":
+        kinds.append("stitch")
+    if "stars" in deco or "sparkles" in deco:
+        kinds.append("starline")
+    if "hearts" in deco:
+        kinds.append("heartline")
+    if "bubbles" in deco:
+        kinds.append("bubbleframe")
+    if "clouds" in deco:
+        kinds.append("cloudframe")
+    if "flowers" in deco:
+        kinds.append("flowerwreath")
+    if "tape" in deco or "stickers" in deco:
+        kinds.append("washi")
+    if "ribbons" in deco:
+        kinds.append("ribbon")
+    if g.get("pattern") in ("grid", "checker", "gingham"):
+        kinds += ["notebook", "pixel"]
+    if mood in ("dark", "neon") or g.get("typography") == "stamp":
+        kinds += ["cyberbrackets", "glitchframe"]
+    if mood == "vintage":
+        kinds += ["filmstrip2", "artdeco"]
     # 设计语法给出的「相近画法」只占一半机会，另一半在全部 24 种里挑（避免一种画法泛滥：星星装饰太常见）
     if not kinds or rng.random() < .5:
         kinds = FRAME_KINDS

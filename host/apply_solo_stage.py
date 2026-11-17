@@ -22,6 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
+
 def _guess_host() -> Path:
     """在常见 Steam 库位置里找 N.E.K.O 的 resources/bin；都没有就用环境变量 NEKO_HOST_BIN，再不行要求 --host。"""
     import os

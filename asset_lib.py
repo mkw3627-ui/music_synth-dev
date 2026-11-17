@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import random
 import re
@@ -299,7 +298,8 @@ class AssetLib:
         seen, uniq = set(), []
         for c in out:
             if c.get("url") and c["url"] not in seen:
-                seen.add(c["url"]); uniq.append(c)
+                seen.add(c["url"])
+                uniq.append(c)
         return uniq[:limit]
 
     def download(self, style: str = "", limit: int = 8, source_ids: list | None = None, category: str = "") -> dict:
@@ -328,14 +328,16 @@ class AssetLib:
                 try:
                     cands = self._candidates(s, q, limit - len(got))
                 except Exception as exc:  # noqa: BLE001
-                    errors.append(f"{s['id']}: {type(exc).__name__}: {exc}"[:200]); continue
+                    errors.append(f"{s['id']}: {type(exc).__name__}: {exc}"[:200])
+                    continue
                 for c in cands:
                     if len(got) >= limit or got_here >= per_src:
                         break
                     try:
                         data = self._get(c["url"], binary=True)
                     except Exception as exc:  # noqa: BLE001
-                        errors.append(f"{c['url'][:80]}: {exc}"[:200]); continue
+                        errors.append(f"{c['url'][:80]}: {exc}"[:200])
+                        continue
                     if len(data) < 2000:
                         continue
                     h = hashlib.sha256(data).hexdigest()
@@ -345,7 +347,9 @@ class AssetLib:
                         fn.write_bytes(data)
                     rec = dict(c, file=fn.name, sha256=h, size=len(data), source=s["id"], query=q, style=style or q, at=_now(),
                                want_category=category or "", state="pending")
-                    manifest.append(rec); got.append(rec); got_here += 1
+                    manifest.append(rec)
+                    got.append(rec)
+                    got_here += 1
         self._save("inbox_manifest.json", manifest)
         self._info("下载 %d 张参考图（来源 %s），跳过条款不允许的来源 %s", len(got), [s["id"] for s in src], blocked)
         return {"ok": True, "downloaded": len(got), "files": [g["file"] for g in got], "errors": errors[:10],
@@ -354,8 +358,8 @@ class AssetLib:
     # ------------------------------------------------------------ 学风格（只取统计参数，不保留像素）
     @staticmethod
     def _analyze(path: Path) -> dict:
-        from PIL import Image, ImageFilter
         import numpy as np
+        from PIL import Image, ImageFilter
         im = Image.open(path).convert("RGB")
         im.thumbnail((128, 128))   # 只为统计配色/明暗：小图就够，CPU 几乎不费力
         a = np.asarray(im).astype("float32") / 255.0
@@ -403,10 +407,14 @@ class AssetLib:
         energy = "calm" if edge < .06 else ("busy" if edge > .16 else "normal")
         tone = "pastel" if sat < .3 and lum > .55 else ("vivid" if sat > .55 else "soft")
         genres = []
-        if mood == "dark" and (st["sparkle"] > .01 or sat > .5): genres += ["edm", "rock", "dark"]
-        if tone == "pastel": genres += ["cute", "pop", "ballad"]
-        if mood == "mid" and energy == "calm": genres += ["ballad", "jazz", "ancient"]
-        if tone == "vivid" and energy != "calm": genres += ["pop", "edm", "rock"]
+        if mood == "dark" and (st["sparkle"] > .01 or sat > .5):
+            genres += ["edm", "rock", "dark"]
+        if tone == "pastel":
+            genres += ["cute", "pop", "ballad"]
+        if mood == "mid" and energy == "calm":
+            genres += ["ballad", "jazz", "ancient"]
+        if tone == "vivid" and energy != "calm":
+            genres += ["pop", "edm", "rock"]
         shape = "lines" if max(st["horiz"], st["vert"]) > .35 else ("dots" if st["sparkle"] > .02 else "blobs")
         return {"mood": mood, "energy": energy, "tone": tone, "genres": sorted(set(genres)) or ["pop"], "shape": shape}
 
@@ -472,7 +480,9 @@ class AssetLib:
         fs = set(files)
         for m in man:
             if m.get("file") in fs:
-                m["state"] = state; m["state_at"] = _now(); m.update(extra)
+                m["state"] = state
+                m["state_at"] = _now()
+                m.update(extra)
         self._save("inbox_manifest.json", man)
 
     def cleanup_learned(self, keep_days: float = 0) -> dict:
@@ -499,7 +509,9 @@ class AssetLib:
             if age_days < keep_days:
                 continue
             self._to_trash(f, "已学完并已用于生成新素材（模板/边框），按设定清理")
-            m["state"] = "removed"; m["state_at"] = _now(); moved += 1
+            m["state"] = "removed"
+            m["state_at"] = _now()
+            moved += 1
         self._save("inbox_manifest.json", man)
         return {"ok": True, "removed": moved}
 
@@ -530,17 +542,21 @@ class AssetLib:
             idx = []
             pool = list(range(len(genomes)))
             for _j in range(k):
-                tot = sum(w[i] for i in pool); r = rng.uniform(0, tot)
+                tot = sum(w[i] for i in pool)
+                r = rng.uniform(0, tot)
                 for i in pool:
                     r -= w[i]
                     if r <= 0:
-                        idx.append(i); pool.remove(i); break
+                        idx.append(i)
+                        pool.remove(i)
+                        break
             par = [genomes[i] for i in idx]
             kid = _av.breed_genomes(par, rng.randrange(1 << 30))
             kid.update({"id": "fg_" + hashlib.sha1(json.dumps(kid, sort_keys=True).encode()).hexdigest()[:10],
                         "gen": max(p.get("gen", 0) for p in par) + 1,
                         "parents": [p["id"] for p in par], "made_at": _now()})
-            genomes.append(kid); made += 1
+            genomes.append(kid)
+            made += 1
         genomes = genomes[-400:]
         self._save("frame_genomes.json", genomes)
         return {"ok": True, "made": made, "genomes": len(genomes),
@@ -565,7 +581,8 @@ class AssetLib:
                 names = [m.get("name") for m in json.loads(r.read()).get("models", [])]
             for cand in ("qwen2.5vl:7b", "nymphaea-rp:14b-q5"):
                 if cand in names:
-                    model = cand; break
+                    model = cand
+                    break
         except Exception:  # noqa: BLE001
             model = ""
         done = 0
@@ -584,7 +601,8 @@ class AssetLib:
                     with urllib.request.urlopen(req, timeout=180) as r:
                         tags = json.loads(json.loads(r.read()).get("response") or "{}").get("items")
                 except Exception as exc:  # noqa: BLE001
-                    self._info("打标签失败：%s", exc); tags = None
+                    self._info("打标签失败：%s", exc)
+                    tags = None
             byid = {(t.get("group"), t.get("id")): t for t in (tags or []) if isinstance(t, dict)}
             for g, e in chunk:
                 t = byid.get((g, e["id"])) or {}
@@ -647,10 +665,13 @@ class AssetLib:
             try:
                 g = _av.describe(refs / st["ref"], vmodel)
             except Exception as exc:  # noqa: BLE001
-                self._info("复学失败 %s：%s", st.get("ref"), exc); continue
+                self._info("复学失败 %s：%s", st.get("ref"), exc)
+                continue
             if g:
-                st["grammar"] = g; st["vision_model"] = vmodel
-                st["tags"]["keywords"] = g.get("keywords") or []; st["tags"]["layout"] = g.get("layout")
+                st["grammar"] = g
+                st["vision_model"] = vmodel
+                st["tags"]["keywords"] = g.get("keywords") or []
+                st["tags"]["layout"] = g.get("layout")
                 done += 1
         self._save("styles.json", styles)
         self._rebuild_effects(styles)
@@ -680,7 +701,9 @@ class AssetLib:
                 for i in pool:
                     r -= weights[i]
                     if r <= 0:
-                        pick.append(i); pool.remove(i); break
+                        pick.append(i)
+                        pool.remove(i)
+                        break
             g = _av.blend([styles[i]["grammar"] for i in pick], rng)
             # 配色：从参与者的调色盘里各取几种，组合出新调色盘
             pal = []
@@ -694,7 +717,8 @@ class AssetLib:
             for i in pick:
                 genres.update(styles[i]["tags"].get("genres") or [])
             g["genres"] = sorted(genres) or ["pop"]
-            temps.append(g); made += 1
+            temps.append(g)
+            made += 1
         temps = temps[-200:]
         self._save("templates.json", temps)
         self._rebuild_effects(self._load("styles.json", []))

@@ -35,16 +35,16 @@ from . import (
     cache_cleanup,
     claim_state,
     error_log,
+    gpu_sched,
     lips_server,
     lipsync,
     model_package,
     runtime,
     vram_policy,
     vram_release,
-    gpu_sched,
 )
-from . import setup as setup_mod
 from . import compat as compat_mod
+from . import setup as setup_mod
 from . import voice_import as voice_import_mod
 
 # 离线编排（show.json）：schema/director/presets 都只用标准库，进程内直接 import
@@ -4724,7 +4724,8 @@ class MusicSynthPlugin(NekoPluginBase):
 
             class _LII(ctypes.Structure):
                 _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
-            lii = _LII(); lii.cbSize = ctypes.sizeof(_LII)
+            lii = _LII()
+            lii.cbSize = ctypes.sizeof(_LII)
             if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
                 return 0.0
             return (ctypes.windll.kernel32.GetTickCount() - lii.dwTime) / 1000.0
@@ -4790,9 +4791,12 @@ class MusicSynthPlugin(NekoPluginBase):
             def snap():
                 i, k, u = _FT(), _FT(), _FT()
                 ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(i), ctypes.byref(k), ctypes.byref(u))
-                v = lambda f: (f.hi << 32) | f.lo
+                def v(f):
+                    return (f.hi << 32) | f.lo
                 return v(i), v(k), v(u)
-            a = snap(); time.sleep(1.0); b = snap()
+            a = snap()
+            time.sleep(1.0)
+            b = snap()
             idle, kern, user = b[0] - a[0], b[1] - a[1], b[2] - a[2]
             tot = kern + user
             return int(round(100.0 * (tot - idle) / tot)) if tot > 0 else 0
@@ -4833,7 +4837,8 @@ class MusicSynthPlugin(NekoPluginBase):
                 try:
                     st = styles[k % len(styles)]
                     cats = ["frame", "background", "text_plate", "particles", "lines", None]
-                    cat = cats[k % len(cats)]; k += 1
+                    cat = cats[k % len(cats)]
+                    k += 1
                     def still_idle() -> bool:
                         # 每步之间只看「用户回来了没有 / 开始唱歌、处理、训练没有」（显卡此时可能被我们自己的看图模型占着，不算）
                         if self._system_idle_seconds() < 60:
@@ -4942,7 +4947,8 @@ class MusicSynthPlugin(NekoPluginBase):
         elif action == "survey":
             res = lib.survey(max(2, min(8, int(limit or 4))))
         elif action == "feedback":
-            res = lib.feedback(str(style_id), bool(like)); self._publish_assets()
+            res = lib.feedback(str(style_id), bool(like))
+            self._publish_assets()
         elif action == "authorize":
             res = lib.authorize(str(source_id), bool(allow))
         else:
@@ -5068,7 +5074,8 @@ class MusicSynthPlugin(NekoPluginBase):
         # kit 手书的套路（stitch/collage/arcade/denpa/paper/neon，空 = 按曲风自动）。存在曲目上，/show.json 发出时写进 style。
         if action == "mode":
             tr = self._pipeline.store.get(str(track_id)) if track_id else None
-            mode = str(mode or "").lower(); kit = str(kit or "").lower()
+            mode = str(mode or "").lower()
+            kit = str(kit or "").lower()
             if mode not in ("", "tegaki", "stage"):
                 return Ok({"ok": False, "error": "mode 只能是 tegaki / stage / 空"})
             if kit not in ("", "stitch", "collage", "arcade", "denpa", "paper", "neon"):

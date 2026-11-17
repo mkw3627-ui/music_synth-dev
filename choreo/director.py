@@ -868,7 +868,7 @@ def _apply_entrance(line: dict, clears: list[float], rng: random.Random,
     stagger = "cue" if reveal == "type" else combo.get("stagger", "char")
     spread = max(0.05, lead - dur * 0.5)
     for i, ch in enumerate(chars):
-        cs, ce = float(ch[1]), float(ch[2])
+        cs = float(ch[1])
         if line.get("kind") == "title":
             es, ed = cs - 0.5, 1.3
         elif stagger == "cue":
@@ -962,7 +962,6 @@ def _scenes(sections: list[dict], preset: dict, rng: random.Random,
         e = cand[int(rng.random() * len(cand)) % len(cand)]
         entries_seq.append(e)
         return e
-    entries = {}
     out = []
     for seg in sections:
         sid = seg["id"]
@@ -1182,7 +1181,6 @@ def _events(analysis: dict, lines: list[dict], sections: list[dict],
     for line in lines:
         if line.get("kind") in ("title", "flash"):
             continue
-        text = str(line.get("text") or "")
         for i, ch in enumerate(line.get("chars") or []):
             if len(ch) >= 5 and ch[4]:
                 events.append({"t": round(float(ch[1]), 3), "type": "keyword",

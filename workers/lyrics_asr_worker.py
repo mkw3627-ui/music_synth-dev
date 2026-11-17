@@ -49,8 +49,8 @@ def main() -> int:
     try:
         root = Path(job["perception_root"]).resolve()
         sys.path.insert(0, str(root.parent))       # 让 import music_perception.* 生效
-        from faster_whisper import WhisperModel     # 来自为她所听的 singing_asr_venv
         import numpy as np
+        from faster_whisper import WhisperModel  # 来自为她所听的 singing_asr_venv
 
         model_dir = Path(job["model_dir"])
         device = str(job.get("device") or "auto")
@@ -92,11 +92,13 @@ def main() -> int:
         while cuts[-1] < total - 0.5:
             lo, hi = cuts[-1] + 8.0, min(total, cuts[-1] + CHUNK_S)
             if hi >= total:
-                cuts.append(total); break
+                cuts.append(total)
+                break
             best = None
             for f in range(int(hi / 0.05), int(lo / 0.05), -1):
                 if f < len(quiet) and quiet[f]:
-                    best = f * 0.05; break
+                    best = f * 0.05
+                    break
             cuts.append(best if best else hi)
         spans = list(zip(cuts, cuts[1:]))
         for pos, end in spans:
