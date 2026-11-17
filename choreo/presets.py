@@ -17,9 +17,9 @@ SEC_I = {
     "intro": 0.15, "verse": 0.38, "pre": 0.55, "chorus": 0.85,
     "bridge": 0.28, "final": 1.0, "outro": 0.2,
 }
-SEC_BLUR = {
-    "intro": 22, "verse": 13, "pre": 9, "chorus": 5,
-    "bridge": 24, "final": 3, "outro": 18,
+SEC_BLUR = {   # 第三十八轮：整体降低（背景素材发糊），只留景深感
+    "intro": 10, "verse": 6, "pre": 4, "chorus": 2,
+    "bridge": 11, "final": 1, "outro": 8,
 }
 SEC_LUM = {
     "intro": 0.5, "verse": 0.68, "pre": 0.78, "chorus": 1.05,
@@ -83,7 +83,7 @@ PRESETS: dict[str, dict] = {
             "material": {"solid": 3, "grad": 3, "outline": 1, "neon": 1},
             "exit": {"sink": 5, "dissolve": 3, "push": 1, "burst": 1},
         },
-        "scenePool": ["bokeh", "wave", "rings", "beams", "led"],
+        "scenePool": ["skyline", "galaxy", "rainwin", "sky", "sakura", "sunset", "aurora", "lantern", "bubbles", "ocean", "forest", "cafe", "rooftop", "classroom", "space", "starstage"],
         "emo": {
             "intro": "tender", "verse": "longing", "pre": "tender",
             "chorus": "tender", "bridge": "sad", "final": "joy", "outro": "tender",
@@ -130,7 +130,7 @@ PRESETS: dict[str, dict] = {
             "material": {"neon": 4, "solid": 2, "outline": 3, "grad": 2},
             "exit": {"burst": 3, "push": 3, "sink": 2, "dissolve": 1},
         },
-        "scenePool": ["led", "rings", "tunnel", "beams", "wave"],
+        "scenePool": ["concert", "confetti", "skyline", "pattern", "sky", "starstage", "bubbles", "sunset", "neoncity", "hearts", "synth", "festival", "classroom", "kaleido", "wavefield"],
         "emo": {
             "intro": "playful", "verse": "playful", "pre": "joy",
             "chorus": "joy", "bridge": "playful", "final": "joy", "outro": "tender",
@@ -177,7 +177,7 @@ PRESETS: dict[str, dict] = {
             "material": {"outline": 3, "neon": 3, "solid": 2, "grad": 1},
             "exit": {"burst": 3, "dissolve": 3, "push": 2, "sink": 1},
         },
-        "scenePool": ["tunnel", "led", "beams", "rings", "wave"],
+        "scenePool": ["concert", "galaxy", "skyline", "neoncity", "starstage", "tunnel", "aurora", "beams", "synth", "space", "wavefield", "kaleido", "crystal", "festival"],
         "emo": {
             "intro": "determined", "verse": "determined", "pre": "proud",
             "chorus": "proud", "bridge": "longing", "final": "proud",
@@ -225,7 +225,7 @@ PRESETS: dict[str, dict] = {
             "material": {"solid": 3, "outline": 3, "neon": 2, "grad": 1},
             "exit": {"burst": 3, "push": 3, "sink": 1, "dissolve": 1},
         },
-        "scenePool": ["beams", "rings", "tunnel", "led", "wave"],
+        "scenePool": ["concert", "skyline", "neoncity", "starstage", "rainwin", "beams", "galaxy", "sunset", "synth", "rooftop", "wavefield", "festival", "crystal", "space"],
         "emo": {
             "intro": "determined", "verse": "determined", "pre": "proud",
             "chorus": "proud", "bridge": "longing", "final": "proud",
@@ -273,7 +273,7 @@ PRESETS: dict[str, dict] = {
             "material": {"solid": 3, "grad": 3, "neon": 2, "outline": 2},
             "exit": {"dissolve": 3, "sink": 3, "push": 2, "burst": 1},
         },
-        "scenePool": ["bokeh", "wave", "rings", "beams", "led"],
+        "scenePool": ["pattern", "sakura", "confetti", "bubbles", "sky", "starstage", "lantern", "concert", "hearts", "festival", "classroom", "crystal", "kaleido", "ocean"],
         "emo": {
             "intro": "playful", "verse": "playful", "pre": "joy",
             "chorus": "joy", "bridge": "playful", "final": "joy", "outro": "tender",
@@ -320,7 +320,7 @@ PRESETS: dict[str, dict] = {
             "material": {"solid": 3, "grad": 3, "outline": 2, "neon": 0},
             "exit": {"dissolve": 4, "sink": 3, "push": 1, "burst": 0},
         },
-        "scenePool": ["bokeh", "wave", "beams", "rings", "led"],
+        "scenePool": ["sakura", "lantern", "sky", "aurora", "galaxy", "sunset", "rainwin", "forest", "festival", "classroom", "ocean", "cafe", "crystal"],
         "emo": {
             "intro": "tender", "verse": "longing", "pre": "tender",
             "chorus": "tender", "bridge": "sad", "final": "proud", "outro": "longing",
@@ -367,7 +367,7 @@ PRESETS: dict[str, dict] = {
             "material": {"grad": 4, "solid": 3, "outline": 1, "neon": 1},
             "exit": {"dissolve": 4, "sink": 3, "push": 1, "burst": 1},
         },
-        "scenePool": ["bokeh", "beams", "rings", "wave", "led"],
+        "scenePool": ["skyline", "rainwin", "sunset", "galaxy", "neoncity", "concert", "aurora", "cafe", "rooftop", "classroom", "space", "ocean", "starstage"],
         "emo": {
             "intro": "tender", "verse": "longing", "pre": "playful",
             "chorus": "tender", "bridge": "sad", "final": "joy", "outro": "tender",
@@ -414,7 +414,7 @@ PRESETS: dict[str, dict] = {
             "material": {"solid": 4, "outline": 2, "grad": 2, "neon": 1},
             "exit": {"dissolve": 4, "sink": 4, "push": 1, "burst": 1},
         },
-        "scenePool": ["bokeh", "tunnel", "rings", "beams", "led"],
+        "scenePool": ["rainwin", "galaxy", "neoncity", "skyline", "aurora", "concert", "tunnel", "crystal", "space", "forest", "synth", "rooftop", "ocean"],
         "emo": {
             "intro": "sad", "verse": "longing", "pre": "determined",
             "chorus": "determined", "bridge": "sad", "final": "proud",

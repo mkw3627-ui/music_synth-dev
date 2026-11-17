@@ -41,8 +41,10 @@ from . import (
     runtime,
     vram_policy,
     vram_release,
+    gpu_sched,
 )
 from . import setup as setup_mod
+from . import compat as compat_mod
 
 # 离线编排（show.json）：schema/director/presets 都只用标准库，进程内直接 import
 # 不影响启动耗时；真正的重活（librosa 分析）在 choreo_worker 子进程里跑。
@@ -200,6 +202,10 @@ class MusicSynthPlugin(NekoPluginBase):
         # 流水线预生成口型轨时要抓官方歌词：和播放走同一个取词函数（只是
         # 处理时强制重试一次，错过就没有第二次机会了）。
         self._pipeline.lrc_fetcher = lambda _track: self._fetch_lyrics(_track, force=True)
+        # 歌词兜底：用「为她所听」装好的歌声识别模型识别干声（结果缓存在曲目目录）
+        self._pipeline.asr_fetcher = self._asr_lyrics
+        # 识别缺句严重时的辅助：网上搜歌词（按歌名 + 按识别出的歌词片段），只用来修字补句，时间以识别为准
+        self._pipeline.web_fetcher = self._web_lyrics_candidates
         # 口型服务随插件一起起来：主窗口的 bridge 每 3 秒探一次端口，
         # 等第一首歌开播才监听的话，头 3 秒的对嘴会丢。
         try:
@@ -209,8 +215,33 @@ class MusicSynthPlugin(NekoPluginBase):
         # 全景舞台的资源根：show.json 在 work/tracks/<id>/ 下，舞台页/字体只读。
         try:
             lips_server.set_show_root(str(self._pipeline.work_dir))
+            try:
+                self._sync_stage_modes()
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("[stage] 同步演出模式失败：%s", exc)
             _static = self._plugin_dir / "static"
-            lips_server.set_static_roots(_static / "stage", _static / "fonts")
+            # 第四十轮：素材库（学来的图案效果）目录也作为舞台静态根，舞台读 learned_effects.json
+            try:
+                from . import asset_lib as _asset_lib
+                self._assets = _asset_lib.AssetLib(self._data_dir, self.logger)
+                self._assets_pub = self._data_dir / "asset_lib" / "pub"
+                self._assets_pub.mkdir(parents=True, exist_ok=True)
+                self._publish_assets()
+            except Exception as exc:  # noqa: BLE001 - 没有素材库也能唱
+                self._assets = None
+                self._assets_pub = None
+                self.logger.warning("[asset-lib] 初始化失败：%s", exc)
+            lips_server.set_static_roots(_static / "stage", _static / "fonts",
+                                         *([self._assets_pub] if getattr(self, "_assets_pub", None) else []))
+            self._start_idle_learner()
+            # 舞台工作室预演图：当前角色模型目录（Steam 创意工坊 Blue cat；找不到就不登记，预演图只是没有人物）
+            try:
+                for cand in (Path("E:/SteamLibrary/steamapps/workshop/content/4099310/3671939765/Blue cat"),):
+                    if (cand / "Blue cat.model3.json").is_file():
+                        lips_server.set_model_root(cand)
+                        break
+            except Exception:  # noqa: BLE001
+                pass
             # 试听缓存放数据目录（插件目录之外）：插件目录里的文件在宿主升级
             # 替换文件时可能被占用，导致升级回滚。
             lips_server.set_preview_root(self._preview_dir())
@@ -699,6 +730,16 @@ class MusicSynthPlugin(NekoPluginBase):
                     return {"job_id": job_id, "kind": kind}
         return None
 
+    def _stage_performing(self) -> bool:
+        """第四十八轮：舞台是否正在演出（口型服务在放带音频的歌，且没过完）。"""
+        try:
+            snap = lips_server.snapshot(since=-1)
+            return bool(snap.get("active") and snap.get("audio")
+                        and float(snap.get("duration") or 0) > 3
+                        and float(snap.get("elapsed") or 0) < float(snap.get("duration") or 0) + 1)
+        except Exception:  # noqa: BLE001
+            return False
+
     def _wait_training_idle(self, job_id: str) -> None:
         """唱歌前等训练跑完：训练占显存时同时跑会直接 OOM/崩溃。"""
         announced = False
@@ -717,6 +758,18 @@ class MusicSynthPlugin(NekoPluginBase):
     # ------------------------------------------------------------------
     # state / environment
     # ------------------------------------------------------------------
+    @plugin_entry(id="ms_gpu", name="为她而唱 · 显存调度",
+                  description="查看 GPU 单线程调度：谁在用、显存、本地大模型、「为她所听」状态与最近动作",
+                  input_schema={"type": "object", "properties": {"action": {"type": "string", "enum": ["status", "unload_llm"]}}})
+    @error_log.logged_entry
+    async def ms_gpu(self, action: str = "status", **_):
+        if action == "unload_llm":
+            done = await asyncio.to_thread(gpu_sched.ollama_unload, None, self.logger)
+            return Ok({"ok": True, "unloaded": done, **(await asyncio.to_thread(gpu_sched.status))})
+        st = await asyncio.to_thread(gpu_sched.status)
+        st["stage_performing"] = self._stage_performing()
+        return Ok({"ok": True, **st})
+
     @plugin_entry(id="ms_state", name="为她而唱 · 状态",
                   description="读取档位判定、计算环境、曲目列表与产物路径（只读）",
                   input_schema={"type": "object", "properties": {}})
@@ -863,6 +916,47 @@ class MusicSynthPlugin(NekoPluginBase):
                                             paths.get("tier_override", ""),
                                             paths.get("precision", "auto"),
                                             paths.get("max_parallel", 0))})
+
+    @plugin_entry(id="ms_deploy_overview", name="为她而唱 · 全插件部署清单与适配",
+                  description=("只读：列出整个插件（翻唱 / 原创 / 歌词识别 / 舞台）要部署的环境、程序、模型，"
+                               "每项来源、大小、是否就绪；同时检测 CPU/显卡（NVIDIA/AMD/Intel）并给出适配方案。"
+                               "speed=true 时对每个下载源实测速度（每源下载约 4MB）。simulate=true 时附带典型机型的适配对照。"),
+                  input_schema={"type": "object", "properties": {
+                      "speed": {"type": "boolean"}, "simulate": {"type": "boolean"}}},
+                  timeout=180.0)
+    @error_log.logged_entry
+    async def ms_deploy_overview(self, speed: bool = False, simulate: bool = False, **_):
+        paths = self._reload_paths()
+        sysinfo = await asyncio.to_thread(compat_mod.detect_system, True)
+        plan = compat_mod.adapt_plan(sysinfo)
+        report = await asyncio.to_thread(setup_mod.check_dependencies, paths) if paths.get("configured") else None
+        try:
+            ace = getattr(await self.ms_ace_status(), "value", None) if paths.get("configured") else None
+        except Exception:  # noqa: BLE001
+            ace = None
+        if isinstance(ace, dict) and "data" in ace and isinstance(ace.get("data"), dict):
+            ace = ace["data"]
+        try:
+            asr = self._perception_asr_paths()
+        except Exception:  # noqa: BLE001
+            asr = None
+        rows = compat_mod.deploy_manifest(paths, report, ace if isinstance(ace, dict) else None,
+                                          {"model_dir": str(asr["model_dir"])} if asr else None, self._plugin_dir)
+        out = {"ok": True, "system": sysinfo, "adapt": plan, "items": rows,
+               "needs_path": not paths.get("configured"),
+               "missing_gb": round(sum(r["size_gb"] for r in rows if not r["ready"]), 2),
+               "required_missing": [r["label"] for r in rows if r["required"] and not r["ready"]]}
+        if speed:
+            out["speed"] = await asyncio.to_thread(compat_mod.speed_test)
+        if simulate:
+            out["simulate"] = [compat_mod.simulate(p) for p in compat_mod.SIM_PROFILES]
+        try:
+            self._save_setup_state({"adapt": {"at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                              "tier": plan["tier"], "backend": plan["backend"],
+                                              "cpu_threads": plan["cpu_threads"]}})
+        except Exception:  # noqa: BLE001
+            pass
+        return Ok(out)
 
     @plugin_entry(id="ms_dl_diag", name="为她而唱 · 下载链路体检",
                   description=("只读探测：代理是否真的可用、国内镜像（gh-proxy / ghfast / hf-mirror / 清华 PyPI）"
@@ -3144,7 +3238,7 @@ class MusicSynthPlugin(NekoPluginBase):
                        "note": "这首已经唱好了，可在列表里试听或重新唱"})
         lp = await self._perception_lyrics()
         lyrics = lp.get("songs") or []
-        official = lp.get("official_lyrics") or {}
+        official = self._perception_official(lp.get("official_lyrics") or {})
         if lyrics or official:
             self._pipeline.store.update(str(target["id"]),
                                         lyrics_from_perception=lyrics,
@@ -3222,10 +3316,16 @@ class MusicSynthPlugin(NekoPluginBase):
             if getattr(self, "_shutdown", False):
                 self._job_update(job_id, state="canceled", detail="插件已停止")
                 return
-            with self._process_lock:
+            # 第四十八轮：唱歌处理和舞台演出不同时进行——舞台在演就排队等演完；
+            # GPU 单线程（gpu_slot），开工前按需腾显存（卸本地大模型 → 「为她所听」让位 → 必要时整个停掉）
+            slot = gpu_sched.gpu_slot("sing", wait_stage=self._stage_performing, logger=self.logger,
+                                      on_wait=lambda d: self._job_update(job_id, state="queued", detail=d))
+            room = None
+            with self._process_lock, slot:
                 self._job_update(job_id, state="running", detail="")
-                if perception_priority:
-                    self._apply_perception_priority_sync(True)
+                room = gpu_sched.make_room(
+                    "sing", logger=self.logger,
+                    soft_yield=(lambda: self._apply_perception_priority_sync(True)) if perception_priority else None)
                 plan_used = plan
                 if perception_priority:
                     # 让位后重新看一次显存：按腾出来之后的空闲量选档位，
@@ -3245,28 +3345,48 @@ class MusicSynthPlugin(NekoPluginBase):
                 try:
                     result = self._pipeline.process_track(
                         track_id, plan_used, resume=not force)
+                    # 第四十八轮：舞台编排（要用本地大模型读歌词）在处理阶段一起做完，
+                    # 不留到开唱时——开唱时再跑大模型就和演出同时占 GPU 了
+                    try:
+                        fresh0 = self._pipeline.store.get(track_id) or {}
+                        if self._finished(fresh0):
+                            self._job_update(job_id, state="running", progress=99, detail="生成舞台编排…")
+                            target0 = str((fresh0.get("artifacts") or {}).get("final") or "")
+                            payload0 = self._lips_payload(fresh0, target0)
+                            if payload0.get("cues") or payload0.get("env"):
+                                if not payload0.get("cues"):
+                                    payload0 = dict(payload0, cues=[{"_env_only": True}])
+                                built = self._build_show_sync(fresh0, payload0, target0,
+                                                              seed=fresh0.get("show_seed"),
+                                                              preset=str(fresh0.get("show_preset") or ""))
+                                self.logger.info("[show] %s 处理后预生成编排 ok=%s reused=%s",
+                                                 track_id, built.get("ok"), built.get("reused"))
+                    except Exception as exc:  # noqa: BLE001 - 编排失败不影响成品
+                        self.logger.warning("[show] 处理后预生成编排失败：%s", exc)
                     job_state, job_detail = self._job_outcome(result, track_id)
                     self._job_update(job_id, state=job_state,
                                      progress=100, detail=job_detail)
                 except Exception as exc:  # noqa: BLE001
                     self._job_update(job_id, state="failed", detail=f"{type(exc).__name__}: {exc}")
                 finally:
-                    # AI 说过「唱这首」的，处理完自己放出来，不用再等一次调用。
-                    if track_id in self._pending_play:
-                        self._pending_play.discard(track_id)
-                        try:
-                            fresh = self._pipeline.store.get(track_id) or {}
-                            if self._finished(fresh):
-                                info = self._sing_track(fresh)
-                                self.logger.info("[playback] 处理完自动播放 track=%s ok=%s",
-                                                 track_id, info.get("ok"))
-                            else:
-                                self.logger.info("[playback] 处理完仍无成品，不播 track=%s",
-                                                 track_id)
-                        except Exception as exc:  # noqa: BLE001
-                            self.logger.warning("[playback] 自动播放失败：%s", exc)
                     if perception_priority:
                         self._restore_perception_after_sing()
+                    gpu_sched.restore(room, logger=self.logger)
+            # 第四十八轮：GPU 槽释放之后才开演（处理和演出不同时）
+            # AI 说过「唱这首」的，处理完自己放出来，不用再等一次调用。
+            if track_id in self._pending_play:
+                self._pending_play.discard(track_id)
+                try:
+                    fresh = self._pipeline.store.get(track_id) or {}
+                    if self._finished(fresh):
+                        info = self._sing_track(fresh)
+                        self.logger.info("[playback] 处理完自动播放 track=%s ok=%s",
+                                         track_id, info.get("ok"))
+                    else:
+                        self.logger.info("[playback] 处理完仍无成品，不播 track=%s",
+                                         track_id)
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.warning("[playback] 自动播放失败：%s", exc)
 
         self._thread(f"ms-{kind}-{track_id}", run)
         return job_id
@@ -3306,8 +3426,10 @@ class MusicSynthPlugin(NekoPluginBase):
             self._pipeline.store.update(track_id, post_engine=engine)
             track = self._pipeline.store.get(track_id) or track
         lp = await self._perception_lyrics()
+        if lp and not self._lyrics_for_track(track, lp):
+            lp = {}   # 「为她所听」现在听的不是这首，别把别的歌的词贴上来
         lyrics = lp.get("songs") or []
-        official = lp.get("official_lyrics") or {}
+        official = self._perception_official(lp.get("official_lyrics") or {})
         if lyrics or official:
             self._pipeline.store.update(track_id, lyrics_from_perception=lyrics,
                                         official_lyrics=official)
@@ -3658,8 +3780,16 @@ class MusicSynthPlugin(NekoPluginBase):
                                             env=payload.get("env") or [],
                                             hop=float(payload.get("hop") or 0.05))
             # 舞台编排：后台生成/复用 show.json，唱起来之后才用得到。
+            # P5 · T5-B：面板里选过的种子/风格存在曲目上；锁定后只复用现有编排。
             try:
-                self._ensure_show_async(track, payload, target)
+                # 口型那一步可能刚补抓到歌词并写回了曲目记录：编排用最新的记录
+                try:
+                    track = self._pipeline.store.get(track_id) or track
+                except Exception:  # noqa: BLE001
+                    pass
+                self._ensure_show_async(track, payload, target,
+                                        seed=track.get("show_seed"),
+                                        preset=str(track.get("show_preset") or ""))
             except Exception as exc:  # noqa: BLE001 - 编排不能挡住唱歌
                 self.logger.warning("[show] 后台排期失败：%s", exc)
             return {**state, "source": payload.get("source"),
@@ -3678,6 +3808,14 @@ class MusicSynthPlugin(NekoPluginBase):
                 env=env_amp, hop=hop, mode="vocal_envelope",
                 song=song, track_id=track_id, duration=duration,
                 audio_path=audio_path, stem_path=stem_path)
+            # 没歌词的歌也要有舞台编排（纯音乐/歌词拒用）：以前只有有 cue 的歌才排，
+            # 没歌词的歌一直沿用旧编排（里面可能还是错歌词）
+            try:
+                self._ensure_show_async(track, dict(payload, cues=payload.get("cues") or [{"_env_only": True}]), target,
+                                        seed=track.get("show_seed"),
+                                        preset=str(track.get("show_preset") or ""))
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("[show] 后台排期失败：%s", exc)
             return {**state, "source": "vocal_envelope", "stem": payload.get("stem")}
         lips_server.clear()
         return {"ok": True, "active": False, "reason": "no_cues",
@@ -3743,19 +3881,73 @@ class MusicSynthPlugin(NekoPluginBase):
                             kind, data.get("stem"))
                         data = None
             if isinstance(data, dict):
+                src0 = str(data.get("source") or "")
+                if src0.startswith("lrc:") and not src0.startswith(("lrc:local:", "lrc:perception")):
+                    try:
+                        rate0 = lipsync.lyric_match_rate(
+                            {"amp": data.get("env") or [], "hop": data.get("hop") or 0.05,
+                             "duration": data.get("duration")},
+                            (track.get("official_lyrics") or {}).get("timed") or [])
+                    except Exception:  # noqa: BLE001
+                        rate0 = None
+                    if rate0 is not None and rate0 < 0.35:
+                        self.logger.info("[lips] %s 现有歌词和人声对不上（命中 %.2f），按无歌词重算", track.get("id"), rate0)
+                        off0 = track.get("official_lyrics") or {}
+                        rej = {"rejected": True, "source": off0.get("source"), "match_rate": round(rate0, 2),
+                               "rejected_timed": off0.get("timed") or []}
+                        try:
+                            self._pipeline.store.update(str(track.get("id") or ""), official_lyrics=rej)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        track = dict(track, official_lyrics=rej)
+                        data = None
+            if isinstance(data, dict):
                 # 歌词后来又变了（比如处理完之后「为她所听」才认出这首歌），
                 # 缓存的口型轨就过期了，重算一份。
                 lyrics_now, _timed, _src = lipsync.track_lyrics(track)
                 key_now = lipsync.lyrics_key(lyrics_now) if lyrics_now.strip() else ""
                 if str(data.get("lyrics_key") or "") == key_now:
-                    return data
+                    # 没歌词的缓存（只有响度包络）：每次进程再试一次抓歌词（拆「歌手 - 歌名」后可能找得到），
+                    # 抓到了就作废缓存重算；抓不到照用缓存
+                    asr_only = str((track.get("official_lyrics") or {}).get("source") or "") == "asr"
+                    if ((asr_only or (not key_now and data.get("mode") == "envelope"))
+                            and not (track.get("official_lyrics") or {}).get("rejected")
+                            and str(track.get("id") or "") not in (getattr(self, "_lrc_tried", None) or set())):
+                        try:
+                            lrc_try, how_try = self._fetch_lyrics(track)
+                        except Exception:  # noqa: BLE001
+                            lrc_try, how_try = "", ""
+                        if lrc_try and lipsync.parse_lrc(lrc_try):
+                            try:
+                                rate = lipsync.lyric_match_rate(
+                                    {"amp": data.get("env") or [], "hop": data.get("hop") or 0.05,
+                                     "duration": data.get("duration")}, lipsync.parse_lrc(lrc_try))
+                            except Exception:  # noqa: BLE001
+                                rate = None
+                            if rate is not None and rate < 0.35:
+                                self.logger.info("[lips] %s 补抓到的歌词和人声对不上（命中 %.2f），不用", track.get("id"), rate)
+                                lrc_try = ""
+                        if lrc_try and lipsync.parse_lrc(lrc_try):
+                            self.logger.info("[lips] %s 补抓到歌词（%s），口型轨重算", track.get("id"), how_try)
+                            parsed = lipsync.parse_lrc(lrc_try)
+                            official = {"source": how_try, "lrc": lrc_try, "timed": parsed,
+                                        "lines": [r["text"] for r in parsed]}
+                            try:
+                                self._pipeline.store.update(str(track.get("id") or ""), official_lyrics=official)
+                                track = dict(track, official_lyrics=official)
+                            except Exception:  # noqa: BLE001
+                                pass
+                            data = None
+                    if isinstance(data, dict):
+                        return data
         # 老曲目（或者口型那一步被跳过）：现场补算一份，顺手落盘给下次用。
         if not stem:
             self.logger.warning("[lips] 没有干净人声可用（track=%s），"
                                 "不拿成品混音凑数", track.get("id"))
         payload = lipsync.build_track_payload(
             track, stem=stem, duration=float(track.get("duration_s") or 0.0),
-            lrc_fetcher=self._fetch_lyrics)
+            lrc_fetcher=self._fetch_lyrics, asr_fetcher=self._asr_lyrics,
+            web_fetcher=self._web_lyrics_candidates)
         payload["stem_kind"] = stem_kind
         official = payload.pop("official_lyrics", None)
         if official:
@@ -3813,13 +4005,23 @@ class MusicSynthPlugin(NekoPluginBase):
         stem = str(payload.get("stem") or "")
         duration = float(payload.get("duration") or track.get("duration_s") or 0.0)
         lyrics, timed, _src = lipsync.track_lyrics(track)
+        # 口型轨对歌词做过整体平移（录音开头和原版歌词时间差几秒）：舞台歌词用同一个平移，
+        # 否则字幕会和嘴、和歌声差几秒
+        try:
+            shift = float(payload.get("align") or 0.0)
+        except (TypeError, ValueError):
+            shift = 0.0
+        if abs(shift) < 0.25:
+            shift = 0.0
         lines: list[dict] = []
         for row in (timed or []):
             if not isinstance(row, dict) or row.get("at_s") is None:
                 continue
             try:
-                at = float(row.get("at_s"))
+                at = float(row.get("at_s")) + shift
             except (TypeError, ValueError):
+                continue
+            if at < 0:
                 continue
             lines.append({"t0": at, "text": str(row.get("text") or "")})
         lyrics_key = lipsync.lyrics_key(lyrics) if str(lyrics or "").strip() else ""
@@ -3827,7 +4029,7 @@ class MusicSynthPlugin(NekoPluginBase):
             "audio": audio,
             "stem": stem,
             "duration": duration,
-            "cues": list(payload.get("cues") or []),
+            "cues": [c for c in (payload.get("cues") or []) if not (isinstance(c, dict) and c.get("_env_only"))],
             "env": list(payload.get("env") or []),
             "hop": float(payload.get("hop") or 0.05),
             "lines": lines,
@@ -3883,6 +4085,11 @@ class MusicSynthPlugin(NekoPluginBase):
         track_id = str((track or {}).get("id") or "")
         if not track_id:
             return {"ok": False, "error": "没有曲目 id"}
+        # 口型那一步可能刚改过曲目记录（补抓到歌词 / 拒用对不上的歌词）：按最新记录编排
+        try:
+            track = self._pipeline.store.get(track_id) or track
+        except Exception:  # noqa: BLE001
+            pass
         artifacts = (track or {}).get("artifacts") or {}
         audio = str(artifacts.get("final") or target or "")
         if not audio or not Path(audio).is_file():
@@ -3915,9 +4122,18 @@ class MusicSynthPlugin(NekoPluginBase):
         folder.mkdir(parents=True, exist_ok=True)
         script = self._plugin_dir / "workers" / "choreo_worker.py"
         try:
-            result = runtime.run_worker(
-                self._show_python(), script, job, cwd=folder, timeout=900,
-                log_path=folder / "show.log")
+            # 第四十八轮：编排里读歌词要本地大模型（14B，约 11 GB）——占 GPU，进单线程队列；
+            # 用完立刻卸载（以前 keep_alive 30 分钟，唱歌时显存一直被它占着）
+            with gpu_sched.gpu_slot("show_llm", logger=self.logger):
+                gpu_sched.make_room("show_llm", logger=None,
+                                    soft_yield=lambda: self._apply_perception_priority_sync(True))
+                try:
+                    result = runtime.run_worker(
+                        self._show_python(), script, job, cwd=folder, timeout=900,
+                        log_path=folder / "show.log")
+                finally:
+                    gpu_sched.ollama_unload(logger=self.logger)
+                    self._apply_perception_priority_sync(False)
         except Exception as exc:  # noqa: BLE001 - 编排失败不挡唱歌
             return {"ok": False, "track_id": track_id,
                     "error": f"{type(exc).__name__}: {exc}"}
@@ -3927,6 +4143,14 @@ class MusicSynthPlugin(NekoPluginBase):
                     "error": str(result.get("error") or "编排失败"),
                     "trace": str(result.get("trace") or "")[-1500:]}
         path = str(result.get("path") or job.get("out") or "")
+        # 第四十四轮：用户在舞台工作室选定了风格 → 标记 style.chosen（舞台整首一个主题）；没选 → 舞台走「融合」
+        try:
+            if str(track.get("show_preset") or "").strip() and track.get("show_chosen"):
+                sj = json.loads(Path(path).read_text(encoding="utf-8"))
+                sj.setdefault("style", {})["chosen"] = True
+                Path(path).write_text(json.dumps(sj, ensure_ascii=False), encoding="utf-8")
+        except (OSError, ValueError):
+            pass
         lips_server.set_show(track_id, path)
         try:
             self._pipeline.store.update(
@@ -3966,6 +4190,12 @@ class MusicSynthPlugin(NekoPluginBase):
     def _show_worker_run(self, track_id: str, track: dict, payload: dict,
                          target: str, seed, preset: str) -> None:
         try:
+            if track.get("show_locked"):
+                path = self._show_file(track_id)
+                if path.is_file():
+                    lips_server.set_show(track_id, str(path))
+                    self.logger.info("[show] %s 已锁定，复用现有编排", track_id)
+                    return
             result = self._build_show_sync(track, payload, target,
                                            seed=seed, preset=preset)
             if result.get("ok"):
@@ -3996,6 +4226,175 @@ class MusicSynthPlugin(NekoPluginBase):
                       flags=re.IGNORECASE)
         return re.sub(r"\s+", " ", text).strip()
 
+    def _perception_asr_paths(self) -> dict | None:
+        """「为她所听」的歌声识别环境（只读借用）：私有 Python + 已下载的模型目录。"""
+        roots = []
+        try:
+            roots.append(self._data_dir.parent.parent / "music_perception" / "data")
+        except Exception:  # noqa: BLE001
+            pass
+        for base in (self._plugin_dir.parent.parent.parent / "plugins" / "music_perception" / "data",
+                     self._plugin_dir.parent / "music_perception" / "data"):
+            roots.append(base)
+        code = self._plugin_dir.parent / "music_perception"
+        for data in roots:
+            py = data / "environment" / "singing_asr_venv" / "Scripts" / "python.exe"
+            if not py.is_file():
+                continue
+            # 优先带逐段时间戳的 whisper 歌声模型；没有再退通用 whisper
+            for sub in ("singing_specialist/sing-whisper-large-v3", "whisper_multilingual/large-v3-turbo",
+                        "whisper_multilingual/small"):
+                mdir = data / "models" / sub
+                if (mdir / "model.bin").is_file() and (mdir / "config.json").is_file():
+                    return {"python": py, "model_dir": mdir, "code": code}
+        return None
+
+    def _asr_lyrics(self, track: dict, stem: str) -> dict:
+        """干声 → 带时间的歌词句（识别结果）。同一份干声只识别一次，缓存到曲目目录。"""
+        track_id = str((track or {}).get("id") or "")
+        stem_p = Path(str(stem or ""))
+        if not track_id or not stem_p.is_file():
+            return {}
+        cache = self._show_dir(track_id) / "lyrics_asr.json"
+        key = f"{stem_p.stat().st_size}:{int(stem_p.stat().st_mtime)}"
+        if cache.is_file():
+            try:
+                data = json.loads(cache.read_text(encoding="utf-8"))
+                if data.get("key") == key:
+                    return data
+            except (OSError, ValueError):
+                pass
+        # 第四十八轮：要识别就借「为她所听」——它关着就先打开（识别完还原成关）
+        opened = False
+        try:
+            opened = gpu_sched.ensure_perception_running(logger=self.logger)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.info("[lyrics-asr] 打开「为她所听」失败：%s", exc)
+        env = self._perception_asr_paths()
+        if not env:
+            self.logger.info("[lyrics-asr] 没找到「为她所听」的歌声识别环境，跳过兜底识别")
+            if opened:
+                gpu_sched.stop_perception(logger=self.logger, why="识别完：「为她所听」还原成原来的关闭状态")
+            return {}
+        # 识别时「为她所听」自己的分离/歌词常驻模型先让位，本地大模型卸掉，单线程用 GPU
+        try:
+            self._apply_perception_priority_sync(True)
+        except Exception:  # noqa: BLE001
+            pass
+        gpu_sched.ollama_unload(logger=self.logger)
+        lang = str((track or {}).get("vocal_language") or "auto").lower()
+        job = {"stem": str(stem_p), "perception_root": str(env["code"]),
+               "model_dir": str(env["model_dir"]),
+               "language": lang if lang in ("zh", "ja", "en") else "auto", "device": "auto"}
+        try:
+            result = runtime.run_worker(
+                env["python"], self._plugin_dir / "workers" / "lyrics_asr_worker.py", job,
+                cwd=self._show_dir(track_id), timeout=900,
+                log_path=self._show_dir(track_id) / "lyrics_asr.log")
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("[lyrics-asr] %s 识别失败：%s", track_id, exc)
+            result = {}
+        finally:
+            if opened:
+                gpu_sched.stop_perception(logger=self.logger, why="识别完：「为她所听」还原成原来的关闭状态")
+        if not result.get("ok"):
+            self.logger.warning("[lyrics-asr] %s 识别失败：%s", track_id, result.get("error"))
+            return {}
+        result["key"] = key
+        try:
+            cache.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+        self.logger.info("[lyrics-asr] %s 识别出 %d 句（%s，%s，%.1fs）", track_id,
+                         len(result.get("lines") or []), result.get("model"),
+                         result.get("device"), float(result.get("seconds") or 0))
+        return result
+
+    _CREDIT_RE = re.compile(r"^[^：:]{0,14}(词|曲|编|混|母|唱|和声|制作|监制|出品|策划|企划|吉他|贝斯|鼓|录|美术|题字|调校|调教|PV|pv|OP|SP)[^：:]{0,10}[：:]")
+
+    def _platform_lrc(self, title: str, artist: str) -> tuple[str, str]:
+        """「为她所控」official_lyrics_v1 → 带时间戳的 LRC（去掉制作人员行）。失败回 ("", "")。"""
+        query = (str(title or "") + " " + str(artist or "").replace("/", " ")).strip()
+        if not query:
+            return "", ""
+        box: dict = {}
+
+        def run():
+            try:
+                box["r"] = asyncio.run(self._call_entry(
+                    "browser_history_insights:official_lyrics_v1",
+                    {"query": query[:160], "app": "cloudmusic.exe"}, timeout=20.0))
+            except Exception as exc:  # noqa: BLE001
+                box["e"] = exc
+        th = threading.Thread(target=run, name="ms-platform-lrc", daemon=True)
+        th.start()
+        th.join(25.0)
+        res = box.get("r")
+        if isinstance(res, dict) and isinstance(res.get("data"), dict):
+            res = res["data"]
+        if not isinstance(res, dict) or not res.get("ok"):
+            if box.get("e") is not None or isinstance(res, dict):
+                self.logger.info("[playback] 平台歌词没取到 query=%r：%s", query,
+                                 box.get("e") or (res or {}).get("reason"))
+            return "", ""
+        rows = [r for r in (res.get("timed") or []) if isinstance(r, dict) and str(r.get("text") or "").strip()]
+        out = []
+        for r in rows:
+            text = str(r["text"]).strip()
+            if self._CREDIT_RE.match(text):
+                continue
+            t = float(r.get("at_s") or 0.0)
+            out.append("[%02d:%05.2f]%s" % (int(t // 60), t - 60 * int(t // 60), text))
+        if not out:
+            return "", ""
+        from . import lyrics_fetch
+        lrc = lyrics_fetch.clean_lrc(chr(10).join(out), artist)
+        if not lrc:
+            return "", ""
+        how = "platform:" + str(res.get("provider") or "platform")
+        self.logger.info("[playback] 平台歌词：%s 《%s》%s，%d 行", how, res.get("title"), res.get("artist"), len(out))
+        return lrc, how
+
+    def _web_lyrics_candidates(self, track: dict, asr_lines: list) -> list:
+        """网上搜歌词的候选（给「识别为主、搜索为辅」融合用）：[(lrc, 来源)]，最多 4 个。
+        按歌名搜（网易云/lrclib）+ 按识别出的歌词片段搜（网易云歌词搜索）。失败返回 []。"""
+        try:
+            from . import lyrics_fetch
+        except Exception:  # noqa: BLE001
+            return []
+        out: list = []
+        seen: set = set()
+        title = self._clean_song_title(track.get("title"))
+        artist = str(track.get("artist") or "")
+        m = re.match(r"^(.+?)\s+[-–—]\s+(.+)$", title or "")
+        guesses = [(title, artist)]
+        if m:
+            guesses.append((m.group(2).strip(), artist or m.group(1).strip()))
+        for gt, ga in guesses:
+            if not gt or len(out) >= 4:
+                continue
+            try:
+                lrc, how = lyrics_fetch.fetch_official_lrc(gt, ga, None, timeout=6.0, web=True)
+            except Exception:  # noqa: BLE001
+                lrc, how = None, ""
+            if lrc and lrc not in seen:
+                seen.add(lrc)
+                out.append((lrc, "web:" + str(how)))
+        try:
+            text = chr(10).join(str(r.get("text") or "") for r in (asr_lines or []) if isinstance(r, dict))
+            _lrc, _how, cands = lyrics_fetch.fetch_lrc_by_lyric(text, timeout=8.0)
+        except Exception:  # noqa: BLE001
+            cands = []
+        for c in cands or []:
+            if len(out) >= 4:
+                break
+            lrc = c.get("lrc")
+            if lrc and lrc not in seen:
+                seen.add(lrc)
+                out.append((lrc, "web:netease_lyric:" + str(c.get("id"))))
+        self.logger.info("[lyrics-web] %s 网上找到 %d 份候选歌词（辅助识别）", track.get("id"), len(out))
+        return out
+
     def _fetch_lyrics(self, track: dict, force: bool = False) -> tuple[str, str]:
         """标题/歌手 → 带时间戳的官方 LRC。同一首每次进程只试一次。"""
         track_id = str(track.get("id") or "")
@@ -4004,6 +4403,8 @@ class MusicSynthPlugin(NekoPluginBase):
             tried = self._lrc_tried = set()
         if not force and track_id and track_id in tried:
             return "", ""
+        if (track.get("official_lyrics") or {}).get("rejected") and not force:
+            return "", ""   # 网上抓来的这首已判定对不上，别再每次抓同一份回来
         if track_id:
             tried.add(track_id)
         try:
@@ -4014,7 +4415,15 @@ class MusicSynthPlugin(NekoPluginBase):
         title = self._clean_song_title(track.get("title"))
         artist = str(track.get("artist") or "")
         src = str(track.get("source") or "")
-        for guess_title, guess_artist in ((title, artist), (title, "")):
+        guesses = [(title, artist), (title, "")]
+        # 文件名式标题「歌手 - 歌名」（本地/网易云下载的默认命名）：拆开再试，歌名单独再试一次
+        m = re.match(r"^(.+?)\s+[-–—]\s+(.+)$", title or "")
+        if m:
+            a_part, t_part = m.group(1).strip(), m.group(2).strip()
+            guesses += [(t_part, artist or a_part), (t_part, "")]
+        seen = set()
+        guesses = [g for g in guesses if not (g in seen or seen.add(g))]
+        for guess_title, guess_artist in guesses:
             if not guess_title:
                 continue
             try:
@@ -4024,6 +4433,14 @@ class MusicSynthPlugin(NekoPluginBase):
                 lrc, how = None, f"error:{exc}"
             if lrc:
                 return lrc, how
+        # 本地没有：问「为她所控」要音乐软件平台（网易云/QQ音乐）上这首的歌词——
+        # 和「为她所听」记原版歌词用的是同一个查询；为她所听没开时也能拿到。
+        for guess_title, guess_artist in guesses:
+            if not guess_title:
+                continue
+            lrc, how = self._platform_lrc(guess_title, guess_artist)
+            if lrc:
+                return lrc, how
         self.logger.info("[playback] 没取到官方歌词 title=%r artist=%r", title, artist)
         return "", ""
 
@@ -4031,6 +4448,36 @@ class MusicSynthPlugin(NekoPluginBase):
         """有成品而且文件还在，才算「能唱」。"""
         target = str(((track or {}).get("artifacts") or {}).get("final") or "")
         return bool(target) and Path(target).is_file()
+
+    def _defer_play_until_idle(self, track_id: str) -> None:
+        """等 GPU 重活做完再演；同一首只挂一个等待线程。"""
+        waiting = getattr(self, "_deferred_play", None)
+        if waiting is None:
+            waiting = self._deferred_play = set()
+        if track_id in waiting:
+            return
+        waiting.add(track_id)
+
+        def wait_then_play():
+            try:
+                t0 = time.time()
+                while not getattr(self, "_shutdown", False) and time.time() - t0 < 3600:
+                    if not self._gpu_heavy_running():
+                        break
+                    time.sleep(3.0)
+                if track_id not in self._pending_play:
+                    return    # 期间被取消或已经由处理线程自动播放
+                self._pending_play.discard(track_id)
+                fresh = self._pipeline.store.get(track_id) or {}
+                if self._finished(fresh):
+                    info = self._sing_track(fresh)
+                    self.logger.info("[playback] 处理完，开始排队的演出 track=%s ok=%s", track_id, info.get("ok"))
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("[playback] 排队演出失败：%s", exc)
+            finally:
+                waiting.discard(track_id)
+
+        self._thread(f"ms-defer-{track_id}", wait_then_play)
 
     def _processing_others(self, track_id: str) -> list:
         """除这首以外还在处理的歌。AI 回话时要把「别的歌在排队」和「这首」分开说。"""
@@ -4046,11 +4493,38 @@ class MusicSynthPlugin(NekoPluginBase):
             return []
         return out[:5]
 
+    def _gpu_heavy_running(self) -> str:
+        """第四十八轮：有没有正在占 GPU 的处理（唱歌处理 / 作曲 / 训练）。返回说明，空串=没有。"""
+        holder = gpu_sched.busy()
+        if holder in ("sing", "ace"):
+            return {"sing": "正在处理别的歌（分离/变声）", "ace": "正在作曲"}[holder]
+        try:
+            if self._training_active():
+                return "正在训练声音"
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
     def _sing_track(self, track: dict) -> dict:
         """播放一首已经做好的歌，并把口型轨一起发出去（AI 和面板共用）。"""
+        # 第四十八轮：演出和处理不同时进行——后台正在处理/作曲/训练时，演出排到它做完再开始
+        heavy = self._gpu_heavy_running()
+        if heavy:
+            track_id = str(track.get("id") or "")
+            self._pending_play.add(track_id)
+            self._defer_play_until_idle(track_id)
+            self.logger.info("[playback] %s，演出排队 track=%s", heavy, track_id)
+            return {"ok": True, "deferred": True, "track_id": track_id, "title": track.get("title"),
+                    "reason": heavy,
+                    "note": heavy + "；演出和处理不能同时进行（普通电脑会很卡），处理完会自动开始演唱"}
         target = str((track.get("artifacts") or {}).get("final") or "")
         if not target or not Path(target).is_file():
             return {"ok": False, "error": "这首还没有成品", "track_id": track.get("id")}
+        # 纯音乐不上演唱台：原创里勾了「纯音乐」、或可用性检查判成纯音乐的，没有词就没法唱
+        if bool(track.get("instrumental")) or str(track.get("status") or "") == "instrumental":
+            return {"ok": False, "track_id": track.get("id"), "title": track.get("title"),
+                    "instrumental": True,
+                    "error": "这首是纯音乐，没有歌词，不能上演唱台"}
         try:
             how = self._start_singing(target)
         except OSError as exc:
@@ -4169,13 +4643,478 @@ class MusicSynthPlugin(NekoPluginBase):
         return Ok({"ok": True, "track_id": track_id, "title": track.get("title"),
                    "file": str(path), **payload})
 
+    # 第五十三轮：以前只有「唱」的 AI 工具，没有「停」——用户说「停止演唱」时她只能回「停不了」。
+    # 这里同时停三路：ffplay/winsound、主窗口里的 <audio>（撤掉口型轨后桥会自己 pause）、舞台（随口型轨结束退出）。
+    @llm_tool(
+        name="music_synth_stop",
+        description=("停止唱歌/停止播放。用户说「停」「别唱了」「停止演唱」「关掉」时调用。"
+                     "会同时停掉系统播放器、主窗口里的播放器和舞台演出。"
+                     "返回 stopped=true 才算停了；停完如实告诉用户已经停了。"),
+        parameters={"type": "object", "properties": {}}, timeout=15.0,
+    )
     @plugin_entry(id="ms_stop_playback", name="为她而唱 · 停止播放",
-                  description="停止当前正在播放的成品",
+                  description="停止当前正在播放的成品（系统播放器 + 主窗口播放器 + 舞台）",
                   input_schema={"type": "object", "properties": {}})
     @error_log.logged_entry
     async def ms_stop_playback(self, **_):
+        before = lips_server.status() or {}
+        was = bool(before.get("active"))
         self._stop_playback()
-        return Ok({"ok": True})
+        # 撤掉自动播放排队（处理完会自动唱的那些），避免停了又自己唱起来
+        try:
+            self._pending_play.clear()
+        except Exception:  # noqa: BLE001
+            pass
+        after = lips_server.status() or {}
+        return Ok({"ok": True, "stopped": not bool(after.get("active")), "was_playing": was,
+                   "speech": "已经停了。" if was else "现在本来就没在唱。"})
+
+    # ---------------------------------------------------------------- 素材库（第四十轮）
+    def _publish_assets(self) -> None:
+        """效果库 → asset_lib/pub/learned_effects.json（舞台加载器从 /stage/learned_effects.json 读）。"""
+        if not getattr(self, "_assets", None):
+            return
+        lib = self._assets.effects()
+        out = {"learned": lib.get("learned") or [], "templates": lib.get("templates") or [],
+               "frames": lib.get("frames") or [], "tags": lib.get("tags") or {}, "updated_at": lib.get("updated_at")}
+        tmp = self._assets_pub / "learned_effects.json.tmp"
+        tmp.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, self._assets_pub / "learned_effects.json")
+
+    @staticmethod
+    def _system_idle_seconds() -> float:
+        """Windows：距离上次键鼠输入的秒数（GetLastInputInfo，只读）。"""
+        try:
+            import ctypes
+
+            class _LII(ctypes.Structure):
+                _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+            lii = _LII(); lii.cbSize = ctypes.sizeof(_LII)
+            if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+                return 0.0
+            return (ctypes.windll.kernel32.GetTickCount() - lii.dwTime) / 1000.0
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def _learn_idle_state(self) -> dict:
+        """现在能不能做后台学习：电脑真正空闲才学（用户在用、在唱歌/处理/训练、显卡或 CPU 忙都不学）。"""
+        reasons = []
+        idle_s = self._system_idle_seconds()
+        if idle_s < 600:
+            reasons.append("电脑在使用（%d 分钟内有键鼠操作）" % max(1, int((600 - idle_s) / 60) or 1))
+        try:
+            if lips_server.status().get("active"):
+                reasons.append("正在唱歌")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if any(str(t.get("status") or "") in ("running", "queued") for t in self._pipeline.store.all()):
+                reasons.append("有歌在处理")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if self._active_train_run_ids():
+                reasons.append("在训练声音")
+        except Exception:  # noqa: BLE001
+            pass
+        gpu_util, gpu_mem = 0, 0
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True, timeout=8, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+            gpu_util, gpu_mem = [int(float(x)) for x in out.strip().splitlines()[0].split(",")[:2]]
+        except Exception:  # noqa: BLE001
+            pass
+        if gpu_util >= 15:
+            reasons.append("显卡忙（%d%%）" % gpu_util)
+        if gpu_mem >= 9000:
+            reasons.append("显存被别的任务占用（%d MB）" % gpu_mem)
+        cpu = self._cpu_load_pct()
+        if cpu >= 30:
+            reasons.append("CPU 忙（%d%%）" % cpu)
+        return {"can_learn": not reasons, "reason": "；".join(reasons), "idle_s": int(idle_s), "gpu_util": gpu_util,
+                "gpu_mem": gpu_mem, "cpu": cpu}
+
+    @staticmethod
+    def _unload_vision_model() -> None:
+        """学完立刻把看图模型从显存卸掉（keep_alive=0），不占着显卡。"""
+        try:
+            import urllib.request as _ur
+            body = json.dumps({"model": "qwen2.5vl:7b", "keep_alive": 0}).encode()
+            _ur.urlopen(_ur.Request("http://127.0.0.1:11435/api/generate", data=body, headers={"Content-Type": "application/json"}), timeout=15).read()
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _cpu_load_pct() -> int:
+        """Windows：整机 CPU 占用（GetSystemTimes 两次采样，1 秒）。"""
+        try:
+            import ctypes
+
+            class _FT(ctypes.Structure):
+                _fields_ = [("lo", ctypes.c_uint32), ("hi", ctypes.c_uint32)]
+            def snap():
+                i, k, u = _FT(), _FT(), _FT()
+                ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(i), ctypes.byref(k), ctypes.byref(u))
+                v = lambda f: (f.hi << 32) | f.lo
+                return v(i), v(k), v(u)
+            a = snap(); time.sleep(1.0); b = snap()
+            idle, kern, user = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+            tot = kern + user
+            return int(round(100.0 * (tot - idle) / tot)) if tot > 0 else 0
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _start_idle_learner(self) -> None:
+        """空闲学习：电脑 10 分钟没人用、且没在唱歌/处理时，每 30 分钟最多学一轮
+        （从允许的来源下几张参考图 → 学成风格参数 → 原图移入回收站 → 更新效果库）。设置 asset_idle_learn=false 可关。"""
+        if getattr(self, "_idle_learner", None) or not getattr(self, "_assets", None):
+            return
+
+        def loop():
+            # 后台学习线程降到最低优先级（只在 CPU 空着时才拿时间片）
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetThreadPriority(ctypes.windll.kernel32.GetCurrentThread(), -15)   # THREAD_PRIORITY_IDLE
+            except Exception:  # noqa: BLE001
+                pass
+            last = 0.0
+            styles = ["sakura", "neon", "stage", "sky", "ocean", "forest", "pastel", "retro", "lantern", "space"]
+            k = 0
+            while not getattr(self, "_idle_stop", False):
+                time.sleep(60)
+                try:
+                    cfg = self._pipeline.store.get_config() if hasattr(self._pipeline.store, "get_config") else {}
+                except Exception:  # noqa: BLE001
+                    cfg = {}
+                if str((cfg or {}).get("asset_idle_learn", "true")).lower() in ("false", "0", "no"):
+                    continue
+                if time.time() - last < 1800:
+                    continue
+                st_idle = self._learn_idle_state()
+                self._last_idle_state = st_idle
+                if not st_idle["can_learn"]:
+                    continue
+                last = time.time()
+                try:
+                    st = styles[k % len(styles)]
+                    cats = ["frame", "background", "text_plate", "particles", "lines", None]
+                    cat = cats[k % len(cats)]; k += 1
+                    def still_idle() -> bool:
+                        # 每步之间只看「用户回来了没有 / 开始唱歌、处理、训练没有」（显卡此时可能被我们自己的看图模型占着，不算）
+                        if self._system_idle_seconds() < 60:
+                            return False
+                        try:
+                            if lips_server.status().get("active") or self._active_train_run_ids():
+                                return False
+                            if any(str(t.get("status") or "") in ("running", "queued") for t in self._pipeline.store.all()):
+                                return False
+                        except Exception:  # noqa: BLE001
+                            pass
+                        return True
+                    steps = [
+                        ("download", lambda: self._assets.download(style="" if cat else st, limit=4, category=cat or "")),
+                        ("learn", lambda: self._assets.learn(max_files=6)),
+                        ("relearn", lambda: self._assets.relearn(limit=6)),
+                        ("blend", lambda: self._assets.blend_templates(n=6)),
+                        ("evolve", lambda: self._assets.evolve_frames(n=6)),
+                        ("tag", lambda: self._assets.tag_builtins(max_items=24)),
+                        ("cleanup", lambda: self._assets.cleanup_learned(keep_days=7)),
+                    ]
+                    done = {}
+                    for name, fn in steps:
+                        if not still_idle() or gpu_sched.busy():
+                            self.logger.info("[asset-lib] 用户回来了/有任务开始，空闲学习在「%s」前停下", name)
+                            break
+                        # 第四十九轮：用到看图模型的步骤进 GPU 单线程队列，不和唱歌/编排抢显卡
+                        if name in ("learn", "relearn", "tag"):
+                            with gpu_sched.gpu_slot("vision", logger=None):
+                                done[name] = fn()
+                        else:
+                            done[name] = fn()
+                    self._publish_assets()
+                    self._unload_vision_model()
+                    self.logger.info("[asset-lib] 空闲学习：%s 完成步骤 %s", st, list(done))
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.warning("[asset-lib] 空闲学习失败：%s", exc)
+
+        self._idle_learner = threading.Thread(target=loop, name="asset-idle-learn", daemon=True)
+        self._idle_learner.start()
+
+    @plugin_entry(id="ms_assets", name="为她而唱 · 素材库",
+                  description=("舞台素材库：status 状态 / sources 来源与条款 / download 下载参考图（只从允许学习或已授权的来源） / "
+                               "learn 学风格（数值统计 + 本地视觉模型看懂设计语法；参考图留在本地参考库 refs/） / relearn 补学 / blend 两三份设计语法混合成新模板 / "
+                               "effects 效果库（带标签） / survey 挑几个风格问用户 / "
+                               "feedback 记录用户喜好（style_id + like） / authorize 用户对某站点授权（source_id + allow）"),
+                  input_schema={"type": "object", "properties": {
+                      "action": {"type": "string"}, "style": {"type": "string"}, "limit": {"type": "integer"},
+                      "category": {"type": "string"},
+                      "style_id": {"type": "string"}, "like": {"type": "boolean"},
+                      "source_id": {"type": "string"}, "allow": {"type": "boolean"}}},
+                  timeout=600.0)
+    @error_log.logged_entry
+    async def ms_assets(self, action: str = "status", style: str = "", limit: int = 6, style_id: str = "",
+                        like: bool = True, source_id: str = "", allow: bool = False, category: str = "", **_):
+        if category and not style:
+            style = category
+        lib = getattr(self, "_assets", None)
+        if not lib:
+            return Ok({"ok": False, "error": "素材库没有初始化"})
+        action = str(action or "status").strip().lower()
+        if action == "sources":
+            res = {"ok": True, "sources": lib.sources()}
+        elif action == "download":
+            cat = category if category in ("frame", "background", "lines", "particles", "sticker", "text_plate") else ""
+            res = await asyncio.to_thread(lib.download, "" if cat else str(style or ""), max(1, min(30, int(limit or 6))), None, cat)
+        elif action == "learn":
+            # 第四十九轮：手动学习也进 GPU 单线程队列（看图模型 7B），学完立刻卸掉
+            def _learn_slot():
+                with gpu_sched.gpu_slot("vision", wait_stage=self._stage_performing, logger=self.logger):
+                    try:
+                        return lib.learn()
+                    finally:
+                        self._unload_vision_model()
+            res = await asyncio.to_thread(_learn_slot)
+            self._publish_assets()
+        elif action == "relearn":
+            res = await asyncio.to_thread(lib.relearn, max(1, min(100, int(limit or 20))))
+            self._publish_assets()
+        elif action == "blend":
+            res = await asyncio.to_thread(lib.blend_templates, max(1, min(50, int(limit or 12))))
+            self._publish_assets()
+        elif action == "evolve":
+            res = await asyncio.to_thread(lib.evolve_frames, max(1, min(50, int(limit or 12))))
+            self._publish_assets()
+        elif action == "tag":
+            res = await asyncio.to_thread(lib.tag_builtins, max(1, min(400, int(limit or 60))))
+            self._publish_assets()
+        elif action == "cleanup":
+            res = await asyncio.to_thread(lib.cleanup_learned, 0)
+        elif action == "overview":
+            res = lib.overview()
+            res["idle"] = await asyncio.to_thread(self._learn_idle_state)
+        elif action == "pipeline":
+            # 一键跑通：按类别下载 → 学（数值+设计语法+类别核对）→ 模板混合 → 边框进化 → 打标签 → 发布
+            cat = str(style or "")
+            r1 = await asyncio.to_thread(lib.download, "", max(1, min(20, int(limit or 4))), None, cat)
+            r2 = await asyncio.to_thread(lib.learn)
+            r3 = await asyncio.to_thread(lib.blend_templates, 6)
+            r4 = await asyncio.to_thread(lib.evolve_frames, 8)
+            r5 = await asyncio.to_thread(lib.tag_builtins, 48)
+            self._publish_assets()
+            res = {"ok": True, "download": r1, "learn": r2, "blend": r3, "evolve": r4, "tag": r5}
+        elif action == "effects":
+            res = {"ok": True, **lib.effects()}
+        elif action == "survey":
+            res = lib.survey(max(2, min(8, int(limit or 4))))
+        elif action == "feedback":
+            res = lib.feedback(str(style_id), bool(like)); self._publish_assets()
+        elif action == "authorize":
+            res = lib.authorize(str(source_id), bool(allow))
+        else:
+            res = lib.status()
+        return Ok(res)
+
+    def _edge_path(self) -> str:
+        for c in (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                  r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+                  r"C:\Program Files\Google\Chrome\Application\chrome.exe"):
+            if Path(c).is_file():
+                return c
+        return ""
+
+    def _render_preview_sync(self, track_id: str, preset: str, seed: int, times: list) -> dict:
+        """无头浏览器打开 /stage/studio_preview.html，按这首歌的编排 + 指定风格 + 演出种子定格几个关键时刻，
+        每个时刻整页截图（人物、背景、边框、歌词都在），再拼成一张 2x2 的预演图（不播放、不出声）。"""
+        edge = self._edge_path()
+        if not edge:
+            return {"ok": False, "error": "没找到 Edge/Chrome，不能生成预演图"}
+        out_dir = self._data_dir / "asset_lib" / "pub" / "previews"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        port = (lips_server.status() or {}).get("port") or 48766
+        name = f"{track_id}_{preset or 'auto'}_{seed}.jpg"
+        target = out_dir / name
+        if target.is_file():
+            return {"ok": True, "image": "/stage/previews/" + name, "cached": True}
+        prof = self._data_dir / "asset_lib" / "_edge_profile"
+        shots, picked = [], []
+        for i, t in enumerate(times[:4]):
+            png = out_dir / f"_tmp_{track_id}_{seed}_{i}.png"
+            url = (f"http://127.0.0.1:{port}/stage/studio_preview.html?track={track_id}&preset={preset}&seed={seed}&t={round(t, 2)}")
+            # 用显卡渲染（WebGL/Canvas 走 GPU），不再用 --disable-gpu 把整页压到 CPU 上画
+            cmd = [edge, "--headless=new", "--use-angle=d3d11", "--enable-gpu-rasterization", "--ignore-gpu-blocklist",
+                   f"--user-data-dir={prof}", "--window-size=1280,720",
+                   "--virtual-time-budget=9000", "--hide-scrollbars", f"--screenshot={png}", url]
+            # 无头 --screenshot 约一半概率拍到背景画布还没合成上去的一帧（只剩人物和歌词，其余纯黑）：
+            # 按「近黑像素占比」判断（正常 <0.1，坏帧 >0.6），坏了就重拍，最多 5 次，留最好的那张
+            best, best_dark = None, 2.0
+            for attempt in range(5):
+                shot = out_dir / f"_tmp_{track_id}_{seed}_{i}_{attempt}.png"
+                cmd[-2] = f"--screenshot={shot}"
+                try:
+                    subprocess.run(cmd, timeout=90, capture_output=True,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.warning("[studio] 预演帧失败：%s", exc)
+                if not shot.is_file():
+                    continue
+                try:
+                    from PIL import Image
+                    hist = Image.open(shot).convert("L").resize((128, 72)).histogram()
+                    dark = sum(hist[:14]) / float(128 * 72)
+                except Exception:  # noqa: BLE001
+                    dark = 0.0
+                shots.append(shot)   # 所有尝试都算中间产物，最后统一移入回收站
+                if dark < best_dark:
+                    best, best_dark = shot, dark
+                if dark < 0.4:
+                    break
+            if best is not None:
+                picked.append(best)
+        if not picked:
+            return {"ok": False, "error": "预演渲染没有产出图片"}
+        try:
+            from PIL import Image
+            W, H = 640, 360
+            sheet = Image.new("RGB", (W * 2, H * 2), (17, 17, 17))
+            for i, f in enumerate(picked):
+                im = Image.open(f).convert("RGB").resize((W, H))
+                sheet.paste(im, ((i % 2) * W, (i // 2) * H))
+            sheet.save(target, quality=82)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"拼图失败：{exc}"}
+        finally:
+            trash = self._data_dir / "asset_lib" / "_trash"
+            trash.mkdir(exist_ok=True)
+            for f in shots:   # 单帧是中间产物：按约定移入回收站（写清单），不直接删
+                try:
+                    import hashlib as _hl
+                    b = f.read_bytes()
+                    dst = trash / f.name
+                    shutil.move(str(f), str(dst))
+                    with open(trash / "MANIFEST.txt", "a", encoding="utf-8") as fp:
+                        fp.write("\t".join([str(dst), str(len(b)), _hl.sha256(b).hexdigest(), "预演单帧（已拼进预演图）",
+                                            time.strftime("%Y-%m-%d %H:%M:%S")]) + "\n")
+                except OSError:
+                    pass
+        return {"ok": True, "image": "/stage/previews/" + name}
+
+    def _stage_mode_default(self) -> dict:
+        try:
+            return json.loads((self._data_dir / "stage_mode.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def _sync_stage_modes(self) -> None:
+        """把「每首歌的演出模式 / 套路」交给口型服务，/show.json 发出时写进 style（不改磁盘上的编排文件）。"""
+        dm = self._stage_mode_default()
+        table = {}
+        try:
+            for t in self._pipeline.store.all():
+                m, k = str(t.get("show_mode") or ""), str(t.get("show_kit") or "")
+                if m or k:
+                    table[str(t.get("id"))] = {"mode": m, "kit": k}
+        except Exception:  # noqa: BLE001
+            pass
+        lips_server.set_stage_modes(table, dm)
+
+    @plugin_entry(id="ms_studio", name="为她而唱 · 舞台工作室",
+                  description=("舞台工作室页面用：tracks 曲目列表+当前风格 / preview 生成预演图（track_id, preset, seed） / "
+                               "styles 一首歌的多个风格候选预演图 / choose 选定风格（track_id, preset, seed） / overview 学习总览"),
+                  input_schema={"type": "object", "properties": {
+                      "action": {"type": "string"}, "track_id": {"type": "string"},
+                      "preset": {"type": "string"}, "seed": {"type": "integer"}, "count": {"type": "integer"},
+                      "mode": {"type": "string", "enum": ["", "tegaki", "stage"]}, "kit": {"type": "string"}}},
+                  timeout=600.0)
+    @error_log.logged_entry
+    async def ms_studio(self, action: str = "tracks", track_id: str = "", preset: str = "", seed: int = 0,
+                        count: int = 4, mode: str = "", kit: str = "", **_):
+        action = str(action or "tracks").lower()
+        # 第五十二轮：演出模式——tegaki 手书分镜（人物不是主角）/ stage 原舞台（人物一直在场上、运镜）；
+        # kit 手书的套路（stitch/collage/arcade/denpa/paper/neon，空 = 按曲风自动）。存在曲目上，/show.json 发出时写进 style。
+        if action == "mode":
+            tr = self._pipeline.store.get(str(track_id)) if track_id else None
+            mode = str(mode or "").lower(); kit = str(kit or "").lower()
+            if mode not in ("", "tegaki", "stage"):
+                return Ok({"ok": False, "error": "mode 只能是 tegaki / stage / 空"})
+            if kit not in ("", "stitch", "collage", "arcade", "denpa", "paper", "neon"):
+                return Ok({"ok": False, "error": "kit 不认识：" + kit})
+            if track_id and not tr:
+                return Ok({"ok": False, "error": "曲目不存在"})
+            if tr:
+                self._pipeline.store.update(str(track_id), show_mode=mode, show_kit=kit)
+            else:   # 不带曲目 = 设全局默认
+                cfgp = self._data_dir / "stage_mode.json"
+                cfgp.write_text(json.dumps({"mode": mode, "kit": kit}, ensure_ascii=False), encoding="utf-8")
+            self._sync_stage_modes()
+            return Ok({"ok": True, "track_id": track_id or "", "mode": mode, "kit": kit,
+                       "note": "下次唱这首时生效" if tr else "已设为默认（单曲设置优先）"})
+        if action == "tracks":
+            rows = []
+            for t in self._pipeline.store.all():
+                if str(t.get("status") or "") != "done":
+                    continue
+                show_p = self._show_file(str(t.get("id")))
+                st = {}
+                try:
+                    st = json.loads(show_p.read_text(encoding="utf-8")).get("style") or {} if show_p.is_file() else {}
+                except (OSError, ValueError):
+                    st = {}
+                rows.append({"id": t.get("id"), "title": t.get("title"), "preset": st.get("preset"), "theme": st.get("theme"),
+                             "chosen": t.get("show_preset") or "", "seed": t.get("show_seed"), "has_show": show_p.is_file(),
+                             "mode": t.get("show_mode") or "", "kit": t.get("show_kit") or ""})
+            dm = self._stage_mode_default()
+            return Ok({"ok": True, "tracks": rows, "default_mode": dm.get("mode") or "", "default_kit": dm.get("kit") or "",
+                       "kits": [["stitch", "缝线甜系"], ["collage", "贴纸拼贴街头系"], ["arcade", "游戏界面系"],
+                                ["denpa", "电波窗口系"], ["paper", "稿纸手写系"], ["neon", "霓虹夜系"]],
+                       "presets": list(choreo_presets.PRESETS.keys()) if hasattr(choreo_presets, "PRESETS") else
+                       ["ballad", "pop", "edm", "rock", "cute", "ancient", "jazz", "dark"]})
+        track = self._pipeline.store.get(str(track_id)) if track_id else None
+        if action in ("preview", "styles", "choose") and not track:
+            return Ok({"ok": False, "error": "曲目不存在"})
+        if action in ("preview", "styles"):
+            show_p = self._show_file(str(track_id))
+            dur = 120.0
+            sections = []
+            try:
+                show = json.loads(show_p.read_text(encoding="utf-8"))
+                dur = float(show.get("duration") or 120)
+                sections = (show.get("music") or {}).get("sections") or []
+            except (OSError, ValueError):
+                return Ok({"ok": False, "error": "这首还没有编排，先唱一次或生成编排"})
+            # 关键时刻：主歌中段、副歌开头后 2 s、桥段/后段
+            times = []
+            for sid in ("verse", "chorus", "bridge", "final", "pre", "intro"):   # 没桥段的歌用导歌/前奏补满 4 格
+                if len(times) >= 4:
+                    break
+                sec = next((x for x in sections if x.get("id") == sid), None)
+                if sec:
+                    times.append(float(sec["t0"]) + min(6.0, (float(sec["t1"]) - float(sec["t0"])) * .4))
+            times = (times or [dur * .2, dur * .45, dur * .7])[:4]
+            if action == "preview":
+                res = await asyncio.to_thread(self._render_preview_sync, str(track_id), str(preset or ""), int(seed or 1), times)
+                return Ok(res)
+            import secrets
+            # 默认第一张是「融合」（不选风格时唱歌就是这个），其余是单一风格（整首一个主题）
+            presets = [str(preset)] if preset else ["", "ballad", "pop", "edm", "rock", "cute", "ancient", "jazz", "dark"]
+            out = []
+            n = max(1, min(8, int(count or 4)))
+            for i in range(n):
+                pz = presets[i % len(presets)]
+                sd = secrets.randbelow(0x7FFFFFFF)
+                r = await asyncio.to_thread(self._render_preview_sync, str(track_id), pz, sd, times)
+                out.append(dict(r, preset=pz, seed=sd))
+            return Ok({"ok": True, "candidates": out})
+        if action == "choose":
+            # preset 为空 = 回到「融合」（默认）
+            fields = {"show_preset": str(preset or ""), "show_seed": int(seed) if seed else None, "show_chosen": bool(preset)}
+            self._pipeline.store.update(str(track_id), **fields)
+            res = await self.ms_show_build(track_id=str(track_id), seed=int(seed) if seed else None,
+                                           force=True, preset=str(preset or ""))
+            return Ok({"ok": True, "chosen": fields, "build": getattr(res, "value", res)})
+        if action == "overview":
+            lib = getattr(self, "_assets", None)
+            return Ok(lib.overview() if lib else {"ok": False, "error": "素材库没有初始化"})
+        return Ok({"ok": False, "error": "未知操作：" + action})
 
     @plugin_entry(id="ms_lips_status", name="为她而唱 · 口型状态",
                   description=("逐字口型服务状态；带 track_id 时顺便检查/重建该曲目的口型轨"
@@ -4262,7 +5201,9 @@ class MusicSynthPlugin(NekoPluginBase):
                       "track_id": {"type": "string"},
                       "seed": {"type": "integer"},
                       "force": {"type": "boolean"},
-                      "preset": {"type": "string"}}})
+                      "preset": {"type": "string"}}},
+                  # 强制重算可能要现场识别歌声 + 网上搜词辅助 + 编排，30 s 不够
+                  timeout=180.0)
     @error_log.logged_entry
     async def ms_show_build(self, track_id: str = "", seed=None,
                             force: bool = False, preset: str = "", **_):
@@ -4270,6 +5211,21 @@ class MusicSynthPlugin(NekoPluginBase):
         track = self._pipeline.store.get(track_id) if track_id else None
         if not track:
             return Ok({"ok": False, "error": "曲目不存在", "track_id": track_id})
+        if bool(force):
+            # 强制重算：之前判「对不上」而拒用的歌词、本进程已试过的抓取都清掉，重新取一次
+            if (track.get("official_lyrics") or {}).get("rejected"):
+                self._pipeline.store.update(track_id, official_lyrics={})
+                track = self._pipeline.store.get(track_id) or track
+            (getattr(self, "_lrc_tried", None) or set()).discard(track_id)
+            try:
+                lips_cache = self._show_dir(track_id) / "lips.json"
+                if lips_cache.is_file():
+                    data0 = json.loads(lips_cache.read_text(encoding="utf-8"))
+                    if str(data0.get("source") or "") in ("estimate", "lrc:asr") or not data0.get("cues"):
+                        data0["lyrics_key"] = "force-rebuild"
+                        lips_cache.write_text(json.dumps(data0, ensure_ascii=False), encoding="utf-8")
+            except (OSError, ValueError):
+                pass
         target = str((track.get("artifacts") or {}).get("final")
                      or track.get("source") or "")
         try:
@@ -4285,6 +5241,139 @@ class MusicSynthPlugin(NekoPluginBase):
             self._build_show_sync, track, payload, target,
             seed=seed_value, preset=str(preset or ""), force=bool(force))
         return Ok({"track_id": track_id, "title": track.get("title"), **result})
+
+
+    # ---- P5 · T5-B：面板的舞台编排控制 ----------------------------------
+    def _show_summary(self, track_id: str) -> dict:
+        """读现有 show.json 给面板预览：风格、种子、段落、情绪分布、质量摘要。"""
+        path = self._show_file(track_id)
+        if not path.is_file():
+            return {"exists": False}
+        try:
+            show = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return {"exists": False, "error": f"读不了：{exc}"}
+        lines = [L for L in (show.get("lines") or []) if L.get("kind") not in ("title", "flash")]
+        emos: dict = {}
+        for L in lines:
+            k = str(L.get("emotion") or "-")
+            emos[k] = emos.get(k, 0) + 1
+        secs = [{"id": x.get("id"), "t0": round(float(x.get("t0") or 0), 1),
+                 "t1": round(float(x.get("t1") or 0), 1)}
+                for x in ((show.get("music") or {}).get("sections") or [])]
+        evs: dict = {}
+        for e in (show.get("events") or []):
+            k = str(e.get("type") or "-")
+            evs[k] = evs.get(k, 0) + 1
+        q = show.get("quality") or {}
+        return {"exists": True, "preset": (show.get("style") or {}).get("preset"),
+                "seed": show.get("seed"), "generated_at": show.get("generated_at"),
+                "duration": show.get("duration"), "lines": len(lines),
+                "emotions": emos, "sections": secs, "events": evs,
+                "first_lines": [str(L.get("text") or "")[:30] for L in lines[:4]],
+                "quality_ok": q.get("ok"), "quality_fail": q.get("hard_fail")}
+
+    @plugin_entry(id="ms_show_preview", name="为她而唱 · 舞台编排预览",
+                  description="读取曲目当前的舞台编排摘要（风格、种子、段落、情绪分布、是否锁定）",
+                  input_schema={"type": "object", "properties": {
+                      "track_id": {"type": "string"}}})
+    @error_log.logged_entry
+    async def ms_show_preview(self, track_id: str = "", **_):
+        track_id = str(track_id or "").strip()
+        track = self._pipeline.store.get(track_id) if track_id else None
+        if not track:
+            return Ok({"ok": False, "error": "曲目不存在", "track_id": track_id})
+        info = await asyncio.to_thread(self._show_summary, track_id)
+        return Ok({"ok": True, "track_id": track_id, "title": track.get("title"),
+                   "locked": bool(track.get("show_locked")),
+                   "chosen_seed": track.get("show_seed"),
+                   "chosen_preset": track.get("show_preset") or "",
+                   "show_mode": track.get("show_mode") or "", "show_kit": track.get("show_kit") or "",
+                   "default_mode": (self._stage_mode_default() or {}).get("mode") or "",
+                   "presets": list(choreo_presets.PRESETS.keys()), **info})
+
+    @plugin_entry(id="ms_show_set", name="为她而唱 · 舞台编排设置",
+                  description=("面板用：reroll=true 整首重抽（换新种子重算）；preset 切换风格"
+                               "（空串=自动）；locked 锁定/解锁（锁定后唱歌只复用现有编排）"),
+                  input_schema={"type": "object", "properties": {
+                      "track_id": {"type": "string"},
+                      "reroll": {"type": "boolean"},
+                      "preset": {"type": "string"},
+                      "locked": {"type": "boolean"},
+                      "reset": {"type": "boolean"},
+                      "mode": {"type": "string", "enum": ["", "tegaki", "stage"], "description": "舞台模式：tegaki 手书分镜 / stage 原舞台 / 空=默认"},
+                      "kit": {"type": "string", "description": "手书风格：stitch/collage/arcade/denpa/paper/neon，空=按曲风自动"}}})
+    @error_log.logged_entry
+    async def ms_show_set(self, track_id: str = "", reroll: bool = False,
+                          preset=None, locked=None, reset: bool = False, mode=None, kit=None, **_):
+        track_id = str(track_id or "").strip()
+        track = self._pipeline.store.get(track_id) if track_id else None
+        if not track:
+            return Ok({"ok": False, "error": "曲目不存在", "track_id": track_id})
+        fields: dict = {}
+        # 第五十三轮：演出模式（tegaki 手书分镜 / stage 原舞台 / 空=默认）和手书风格，和「风格」并列；不需要重建编排
+        if mode is not None or kit is not None:
+            m2 = str(mode if mode is not None else (track.get("show_mode") or "")).lower()
+            k2 = str(kit if kit is not None else (track.get("show_kit") or "")).lower()
+            if m2 not in ("", "tegaki", "stage"):
+                return Ok({"ok": False, "error": "舞台模式只能是 手书分镜 / 原舞台"})
+            if k2 not in ("", "stitch", "collage", "arcade", "denpa", "paper", "neon"):
+                return Ok({"ok": False, "error": "不认识的手书风格：" + k2})
+            if m2 == "stage":
+                k2 = ""   # 原舞台不带任何手书设置（两种模式完全分开）
+            self._pipeline.store.update(str(track_id), show_mode=m2, show_kit=k2)
+            self._sync_stage_modes()
+            track = self._pipeline.store.get(str(track_id)) or track
+            if preset is None and locked is None and not reroll and not reset:
+                info = await asyncio.to_thread(self._show_summary, track_id)
+                return Ok({"ok": True, "track_id": track_id, "rebuilt": False, "mode_only": True,
+                           "locked": bool(track.get("show_locked")), "chosen_seed": track.get("show_seed"),
+                           "chosen_preset": track.get("show_preset") or "", "show_mode": m2, "show_kit": k2, **info})
+        if locked is not None:
+            fields["show_locked"] = bool(locked)
+        rebuild = False
+        if preset is not None:
+            key = choreo_presets.normalize(str(preset)) if str(preset).strip() else ""
+            if str(preset).strip() and not key:
+                return Ok({"ok": False, "error": f"不认识的风格：{preset}"})
+            if key != str(track.get("show_preset") or ""):
+                fields["show_preset"] = key
+                rebuild = True
+        if reset:
+            # 恢复自动：去掉手动种子与风格，按默认种子 + 自动风格重算（与从未改过时一致）
+            fields["show_seed"] = None
+            fields["show_preset"] = ""
+            rebuild = True
+        if reroll:
+            import secrets
+            fields["show_seed"] = secrets.randbelow(0x7FFFFFFF)
+            rebuild = True
+        if rebuild and (track.get("show_locked") and fields.get("show_locked", True)):
+            return Ok({"ok": False, "error": "这首的编排已锁定，先解锁再重抽或换风格"})
+        if fields:
+            track = self._pipeline.store.update(track_id, **fields) or track
+        result: dict = {}
+        if rebuild:
+            target = str((track.get("artifacts") or {}).get("final") or track.get("source") or "")
+            try:
+                payload = await asyncio.to_thread(self._lips_payload, track, target)
+            except Exception as exc:  # noqa: BLE001
+                return Ok({"ok": False, "track_id": track_id,
+                           "error": f"口型轨不可用：{type(exc).__name__}: {exc}"})
+            result = await asyncio.to_thread(
+                self._build_show_sync, track, payload, target,
+                seed=track.get("show_seed"), preset=str(track.get("show_preset") or ""),
+                force=True)
+            if not result.get("ok"):
+                return Ok({"ok": False, "track_id": track_id, **result})
+        info = await asyncio.to_thread(self._show_summary, track_id)
+        return Ok({"ok": True, "track_id": track_id, "rebuilt": rebuild,
+                   "locked": bool(track.get("show_locked")),
+                   "chosen_seed": track.get("show_seed"),
+                   "chosen_preset": track.get("show_preset") or "",
+                   "show_mode": track.get("show_mode") or "", "show_kit": track.get("show_kit") or "",
+                   "build": {k: result.get(k) for k in ("seed", "preset", "lines", "seconds")} if result else None,
+                   **info})
 
     # 2026-11-03 面板「设为当前模型」：只做用户显式点击的切换，复用 ms_set_active_model。
     # 入口本体在文件末尾的 ms_set_active_model 上声明；这里再挂一个 @plugin_entry 会与它
@@ -4397,7 +5486,7 @@ class MusicSynthPlugin(NekoPluginBase):
             lp = await self._perception_lyrics()
             if lp and self._lyrics_for_track(track, lp):
                 songs = lp.get("songs") or []
-                official = lp.get("official_lyrics") or {}
+                official = self._perception_official(lp.get("official_lyrics") or {})
                 if songs or official:
                     self._pipeline.store.update(
                         track_id, lyrics_from_perception=songs, official_lyrics=official)
@@ -4410,6 +5499,20 @@ class MusicSynthPlugin(NekoPluginBase):
                    "speech": self._speech("submitted", "已提交后台处理，还没唱好", track),
                    "note": "这首还没唱过，已经开始处理（分离→变声→混音），做完会自己开始播放；"
                            "它没过完之前不算唱好了"})
+
+    @staticmethod
+    def _perception_official(official: dict) -> dict:
+        """「为她所听」记下的原版歌词 → 曲目上存的 official_lyrics（带时间就带上）。"""
+        official = dict(official or {})
+        if not official.get("ok") and not official.get("lines"):
+            return {}
+        timed = [r for r in (official.get("timed") or []) if isinstance(r, dict) and r.get("text")]
+        out = {"source": "perception_official:" + str(official.get("provider") or "platform"),
+               "title": official.get("title"), "artist": official.get("artist"),
+               "lines": [str(x) for x in (official.get("lines") or [])]}
+        if timed:
+            out["timed"] = timed
+        return out
 
     @staticmethod
     def _lyrics_for_track(track: dict, lp: dict) -> bool:
@@ -6838,7 +7941,9 @@ class MusicSynthPlugin(NekoPluginBase):
                                        "enum": ["auto", "off", "int8_weight_only",
                                                 "fp8_weight_only"],
                                        "description": "量化策略：auto=按显存自动（小卡自动 int8），off=不量化，int8=权重量化（显存减半）"},
-                      "lora": {"type": "string", "description": "ACE 音色 LoRA 名字；留空=默认音色"}}})
+                      "lora": {"type": "string", "description": "ACE 音色 LoRA 名字；留空=默认音色"},
+                      "stage_mode": {"type": "string", "enum": ["", "stage", "tegaki"], "description": "舞台模式：stage 原舞台 / tegaki 手书分镜"},
+                      "stage_kit": {"type": "string", "description": "手书风格（只在 tegaki 时用）"}}})
     @error_log.logged_entry
     async def ms_ace_generate(self, prompt: str = "", lyrics: str = "", name: str = "",
                               duration: int = 0, bpm: int = 0, language: str = "auto",
@@ -6848,7 +7953,10 @@ class MusicSynthPlugin(NekoPluginBase):
                               guidance_scale: float = 7.0,
                               seed: int = -1, candidates: int = 1,
                               quantization: str = "auto",
-                              lora: str = "", **_):
+                              lora: str = "", stage_mode: str = "", stage_kit: str = "", **_):
+        # 第五十三轮：原创歌曲面板里选的舞台模式（stage 原舞台 / tegaki 手书分镜），生成入库时记到曲目上
+        stage_mode = str(stage_mode or "").lower() if str(stage_mode or "").lower() in ("stage", "tegaki") else ""
+        stage_kit = str(stage_kit or "").lower() if str(stage_kit or "").lower() in ("stitch", "collage", "arcade", "denpa", "paper", "neon") else ""
         if not self._pipeline.paths.get("configured"):
             return Ok({"ok": False,
                        "error": "还没有选择安装位置，请先到安装向导/设置里选一个目录"})
@@ -6970,6 +8078,9 @@ class MusicSynthPlugin(NekoPluginBase):
         except (TypeError, ValueError):
             n_candidates = 1
         mem = vram_policy.snapshot(runtime.probe_hardware(force=False))
+        if str(self._pipeline.paths.get("device") or "auto") == "cpu":
+            # 第五十五轮：设置里选了「只用 CPU」，原创也走 CPU（和没显卡的机器同一条路）
+            mem = dict(mem, has_gpu=False)
         model_gib = vram_policy.estimate_runtime_gib(p["checkpoints"] / model_name)
         policy = vram_policy.ace_plan(
             mem, model_gib, is_xl=is_xl,
@@ -7048,20 +8159,33 @@ class MusicSynthPlugin(NekoPluginBase):
             if getattr(self, "_shutdown", False):
                 self._job_update(job_id, state="canceled", detail="插件已停止")
                 return
-            with self._process_lock:
+            ace_slot = gpu_sched.gpu_slot("ace", wait_stage=self._stage_performing, logger=self.logger,
+                                          on_wait=lambda d: self._job_update(job_id, state="queued", detail=d))
+            with self._process_lock, ace_slot:
+                ace_room = gpu_sched.make_room("ace", logger=self.logger,
+                                               soft_yield=lambda: self._apply_perception_priority_sync(True))
+                self._ace_room = ace_room
                 self._job_update(job_id, state="running", progress=5,
                                  detail="正在加载 ACE-Step 并生成（首次较慢，请耐心等）")
                 attempts = vram_policy.ace_attempts(job, policy, is_xl=is_xl)
                 result = None
                 for index, attempt in enumerate(attempts, 1):
                     try:
+                        # 第五十五轮：ACE 的 CPU 路线必须单线程启动（多线程在 Windows torch 上随机原生崩溃，实测）
                         result = runtime.run_worker(
                             p["python"], self._train_worker("ace_worker.py"),
                             attempt, cwd=p["output"], timeout=3600,
-                            log_path=self._pipeline.log_path)
+                            log_path=self._pipeline.log_path,
+                            env_extra=({"OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "CUDA_VISIBLE_DEVICES": "-1"}
+                                       if str(attempt.get("device") or "") == "cpu" else None))
                     except Exception as exc:  # noqa: BLE001
                         result = {"ok": False,
                                   "error": f"{type(exc).__name__}: {exc}"}
+                    if (not result.get("ok") and str(attempt.get("device") or "") == "cpu"
+                            and "3221225477" in str(result.get("error") or "")):
+                        result = dict(result, error=("这台电脑没有可用的 NVIDIA 显卡，原创生成只能走 CPU，"
+                                                     "而 ACE-Step 在 CPU 上会随机崩溃（PyTorch 原生访问冲突），这次没能出歌。"
+                                                     "可以再试一次；稳定使用需要 NVIDIA 显卡。"))
                     if (result.get("ok") or index == len(attempts)
                             or not (runtime.is_oom(result)
                                     or runtime.is_quant_failure(result))):
@@ -7101,7 +8225,12 @@ class MusicSynthPlugin(NekoPluginBase):
                         lyrics=str(lyrics or ""),
                         vocal_language=str(lang or ""),
                         instrumental=bool(job.get("instrumental")),
+                        show_mode=stage_mode, show_kit=stage_kit if stage_mode == "tegaki" else "",
                         duration_s=(float(result.get("duration") or 0) or None)) or track
+                    try:
+                        self._sync_stage_modes()
+                    except Exception:  # noqa: BLE001
+                        pass
                 # 多候选：没被自动选中的也入库，用户可以在「让她唱歌」里试听后再决定。
                 for idx, audio_path in enumerate(result.get("audios") or []):
                     if str(audio_path) == str(wav):
@@ -7113,6 +8242,7 @@ class MusicSynthPlugin(NekoPluginBase):
                         if extra and extra.get("id"):
                             self._pipeline.store.update(
                                 str(extra["id"]), origin="ace", auto_sing=False,
+                                show_mode=stage_mode, show_kit=stage_kit if stage_mode == "tegaki" else "",
                                 post_engine=engine, status="done",
                                 step="generate", progress=100, error="",
                                 lyrics=str(lyrics or ""),
@@ -7170,7 +8300,17 @@ class MusicSynthPlugin(NekoPluginBase):
                 self._job_update(job_id, state=job_state, progress=100,
                                  detail=job_detail, track_id=track_id)
 
-        self._thread(f"ms-ace-{job_id}", run)
+        def run_and_restore():
+            # 第四十八轮：作曲结束（含中途 return）后把腾出去的「为她所听」还回去
+            try:
+                run()
+            finally:
+                room = getattr(self, "_ace_room", None)
+                self._ace_room = None
+                gpu_sched.restore(room, logger=self.logger)
+                self._apply_perception_priority_sync(False)
+
+        self._thread(f"ms-ace-{job_id}", run_and_restore)
         self._job_update(job_id, vram_mode=policy["mode"],
                          vram_reason=vram_policy.describe(policy))
         return Ok({"ok": True, "job_id": job_id, "name": clean_name,

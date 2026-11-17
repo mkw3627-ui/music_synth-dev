@@ -163,7 +163,27 @@ def snapshot(probe: dict | None) -> dict:
         "gpu_compute_cap": str(gpu.get("compute_cap") or ""),
         "ram_total_gib": float(probe.get("ram_total_gib") or 0.0),
         "ram_available_gib": float(probe.get("ram_available_gib") or 0.0),
+        "commit_free_gib": _commit_free_gib(),
     }
+
+
+def _commit_free_gib() -> float:
+    """Windows 可提交内存余量（物理内存 + 页面文件 - 已提交）。读不到返回 0（不拦）。"""
+    try:
+        import ctypes
+
+        class _MS(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        st = _MS(); st.dwLength = ctypes.sizeof(_MS)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return round(st.ullAvailPageFile / 2**30, 1)
+    except Exception:  # noqa: BLE001
+        pass
+    return 0.0
 
 
 def capability_tuple(mem: dict) -> tuple[int, int]:
@@ -335,6 +355,17 @@ def ace_plan(mem: dict, model_gib: float, *, is_xl: bool,
     weights = model_gib
     warnings = []
     if not mem.get("has_gpu"):
+        # 第五十五轮实测：CPU 上 ACE 要把 bf16 权重转成 fp32（2B 模型约 9GiB，XL 约 18GiB），
+        # 加上运行时约需 2B≥14GiB、XL≥26GiB 可提交内存（物理内存空闲 + 虚拟内存余量）。
+        # 不够时 Windows 直接让进程访问冲突崩溃（不是 Python 异常），所以这里先拦下来说清楚。
+        need = 26.0 if is_xl else 14.0
+        free_commit = float(mem.get("commit_free_gib") or mem.get("ram_available_gib") or 0.0)
+        if free_commit and free_commit < need:
+            return _plan("cpu", "没有检测到可用显卡，CPU 生成",
+                         fatal=(f"用 CPU 生成原创需要约 {need:.0f}GB 可用内存（含虚拟内存），当前只有 {free_commit:.1f}GB。"
+                                "请关掉占内存的程序，或把 Windows 虚拟内存调大（系统设置 → 高级系统设置 → 性能 → 虚拟内存），"
+                                + ("或改用 2B 的 acestep-v15-turbo。" if is_xl else "再试一次。")),
+                         vae_on_cpu=True, max_candidates=1)
         return _plan("cpu", "没有检测到可用显卡，全部放内存用 CPU 生成（会很慢）",
                      vae_on_cpu=True, max_candidates=1)
     compat = gpu_compat(mem, torch_archs)

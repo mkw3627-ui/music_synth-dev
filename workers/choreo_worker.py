@@ -49,6 +49,43 @@ def _mtime(path: str) -> float:
         return 0.0
 
 
+def _clip_to_duration(show: dict, dur: float) -> None:
+    if dur <= 0:
+        return
+    end = round(dur - 0.001, 3)
+    lines = []
+    for L in show.get("lines") or []:
+        if float(L.get("t0") or 0) >= dur - 0.3:
+            continue
+        for k in ("t1", "exit_at", "fade_at", "gone_at", "kill_at"):
+            if L.get(k) is not None and float(L[k]) > end:
+                L[k] = end
+        lines.append(L)
+    show["lines"] = lines
+    show["events"] = [e for e in (show.get("events") or []) if float(e.get("t") or 0) <= end]
+    for e in show["events"]:
+        if e.get("dur") is not None and float(e["t"]) + float(e["dur"]) > dur:
+            e["dur"] = round(max(0.0, dur - float(e["t"])), 3)
+    show["camera"] = [c for c in (show.get("camera") or []) if float(c.get("t") or 0) <= end]
+    scenes = []
+    for sc in show.get("scenes") or []:
+        if float(sc.get("t0") or 0) >= end:
+            continue
+        if float(sc.get("t1") or 0) > end:
+            sc["t1"] = end
+        scenes.append(sc)
+    show["scenes"] = scenes
+    secs = []
+    for sc in ((show.get("music") or {}).get("sections") or []):
+        if float(sc.get("t0") or 0) >= end:
+            continue
+        if float(sc.get("t1") or 0) > end:
+            sc["t1"] = end
+        secs.append(sc)
+    if show.get("music") is not None:
+        show["music"]["sections"] = secs
+
+
 def main() -> int:
     job_path = Path(sys.argv[1])
     out_path = Path(sys.argv[2])
@@ -68,7 +105,7 @@ def main() -> int:
         if str(plugin_root) not in sys.path:
             sys.path.insert(0, str(plugin_root))
         from choreo import analyze as analyze_mod
-        from choreo import director, presets, schema, semantics
+        from choreo import director, presets, quality, schema, semantics
 
         audio = str(job.get("audio") or "")
         stem = str(job.get("stem") or "")
@@ -134,10 +171,23 @@ def main() -> int:
             stem_mtime=_mtime(stem), semantics=str(sem.get("tag") or ""))
 
         progress("direct")
-        show = director.build(
-            track, analysis, lines, cues, line_moods, seed=seed,
-            preset_name=chosen, input_hash=input_hash, semantics=sem)
+        # P5 · T5-A：质量评分器不合格就换种子重抽，挑硬性项全过、软分最高的一份。
+        # 最终种子不一定是原种子，缓存指纹要按最终种子重算，才与内容一致。
+        show, qrep, qattempts = quality.build_best(
+            lambda s: director.build(
+                track, analysis, lines, cues, line_moods, seed=s,
+                preset_name=chosen, input_hash="", semantics=sem),
+            seed)
+        seed = int(show.get("seed", seed))
+        input_hash = director.input_fingerprint(
+            audio=audio, stem=stem, lyrics_key=lyrics_key, cues=len(cues),
+            seed=seed, preset=chosen, audio_mtime=_mtime(audio),
+            stem_mtime=_mtime(stem), semantics=str(sem.get("tag") or ""))
+        show["input_hash"] = input_hash
         show["duration"] = round(duration, 3)
+        # 通用兜底：歌词/分析可能来自完整版（比成品音频长）——超出曲长的行、事件、镜头、场景一律剪掉或收到曲长内，
+        # 不能因为几条尾部数据让整首编排校验失败（失败 = 舞台没歌词、嘴也不动）
+        _clip_to_duration(show, float(show["duration"]))
 
         progress("validate")
         report = schema.validate(show)

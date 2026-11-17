@@ -170,24 +170,55 @@
       pal, I: v.intensity, pulse: v.pulse, bpm: show.music.bpm,
       cx: 1 - cam.cx, dens: sc.density || 1, v: v.sceneVar
     };
-    const prog = U.clamp((t - sc.t0) / bar);
-    if (prog < 1 && i > 0) {
+    // 第三十九轮：转场时长至少 1.4 s；遮罩边缘羽化（canvas blur）；转场期间旧背景慢慢推远、新背景从放大推回原位（运镜式过渡）
+    const tdur = Math.max(1.4, Math.min(2.4, bar));
+    const prog = U.clamp((t - sc.t0) / tdur);
+    if (prog < 1 && i > 0 && prev.scene !== sc.scene && !sc.stingerCut) {
       const Pp = Object.assign({}, P, { dens: prev.density || 1, v: v.prevSceneVar });
+      const ep = U.easeInOut(prog);
+      c.save(); c.translate(W / 2, H / 2); c.scale(1 + .08 * ep, 1 + .08 * ep); c.translate(-W / 2, -H / 2);
       drawScene(prev.scene, c, W, H, t, Pp);
+      c.restore();
       offCtx.clearRect(0, 0, W, H);
+      offCtx.save(); offCtx.translate(W / 2, H / 2); offCtx.scale(1.12 - .12 * ep, 1.12 - .12 * ep); offCtx.translate(-W / 2, -H / 2);
       drawScene(sc.scene, offCtx, W, H, t, P);
-      offCtx.globalCompositeOperation = 'destination-in';
-      offCtx.fillStyle = '#fff';
-      const e = sc.entry, cxp = (1 - cam.cx) * W;
-      if (e === 'iris') { offCtx.beginPath(); offCtx.arc(cxp, H * .45, U.easeInOut(prog) * W * 1.2, 0, 6.283); offCtx.fill(); }
-      else if (e === 'sweepL') offCtx.fillRect(0, 0, U.easeInOut(prog) * W, H);
-      else if (e === 'sweepR') offCtx.fillRect(W - U.easeInOut(prog) * W, 0, W, H);
+      offCtx.restore();
+      // 第四十九轮：遮罩改在 1/4 分辨率小画布上画（羽化也在小图上做，再放大用），
+      // 以前整张背景分辨率上做 canvas blur，转场那一两秒每帧 30~90 ms → 明显卡顿
+      const MK = drawBackground._mk || (drawBackground._mk = document.createElement('canvas'));
+      const mw = Math.max(16, Math.round(W / 4)), mh = Math.max(9, Math.round(H / 4));
+      if (MK.width !== mw || MK.height !== mh) { MK.width = mw; MK.height = mh; }
+      const m = MK.getContext('2d');
+      m.setTransform(1, 0, 0, 1, 0, 0); m.clearRect(0, 0, mw, mh);
+      m.setTransform(mw / W, 0, 0, mh / H, 0, 0);
+      m.fillStyle = '#fff';
+      m.filter = 'blur(' + Math.max(1, Math.round(H * .025 * mh / H)) + 'px)';
+      let e = sc.entry, cxp = (1 - cam.cx) * W;
+      if (e === 'flash' || e === 'fade') e = 'split';   // 硬切/整体淡入改成「从中间展开」
+      if (e === 'iris') { m.beginPath(); m.arc(cxp, H * .45, U.easeInOut(prog) * W * 1.2, 0, 6.283); m.fill(); }
+      else if (e === 'sweepL') m.fillRect(0, 0, U.easeInOut(prog) * W, H);
+      else if (e === 'sweepR') m.fillRect(W - U.easeInOut(prog) * W, 0, W, H);
       else if (e === 'columns') {
         const n = 12;
-        for (let k = 0; k < n; k++) if (prog > U.h01(k * 3.7 + v.sceneVar) * .8) offCtx.fillRect(k * W / n, 0, W / n + 1, H);
-      } else if (e === 'flash') offCtx.fillRect(0, 0, W, H);
-      else { offCtx.globalCompositeOperation = 'source-over'; c.globalAlpha = U.easeInOut(prog); }
+        for (let k = 0; k < n; k++) if (prog > U.h01(k * 3.7 + v.sceneVar) * .8) m.fillRect(k * W / n, 0, W / n + 1, H);
+      } else if (e === 'flash') m.fillRect(0, 0, W, H);
+      // 第三十八轮：更多背景转场（只换背景，人物和歌词不动）
+      else if (e === 'sweepU') m.fillRect(0, H - U.easeInOut(prog) * H, W, H);
+      else if (e === 'sweepD') m.fillRect(0, 0, W, U.easeInOut(prog) * H);
+      else if (e === 'diag') { const q = U.easeInOut(prog) * (W + H) * 1.05; m.beginPath(); m.moveTo(0, 0); m.lineTo(q, 0); m.lineTo(q - H, H); m.lineTo(0, H); m.fill(); }
+      else if (e === 'diamond') { const r = U.easeInOut(prog) * (W + H) * .6, cx0 = W / 2, cy0 = H / 2; m.beginPath(); m.moveTo(cx0, cy0 - r); m.lineTo(cx0 + r, cy0); m.lineTo(cx0, cy0 + r); m.lineTo(cx0 - r, cy0); m.fill(); }
+      else if (e === 'blinds') { const n = 10, bh = H / n; for (let k = 0; k < n; k++) m.fillRect(0, k * bh, W, bh * U.easeInOut(prog)); }
+      else if (e === 'dots') { const cs = H / 8; for (let y = 0; y <= H / cs + 1; y++) for (let x = 0; x <= W / cs + 1; x++) { const d = (x * cs / W + y * cs / H) / 2; const r = cs * .75 * U.clamp(prog * 1.8 - d * .8); if (r > 0) { m.beginPath(); m.arc(x * cs, y * cs, r, 0, 6.283); m.fill(); } } }
+      else if (e === 'split') { const q = U.easeInOut(prog) * W / 2; m.fillRect(W / 2 - q, 0, q * 2, H); }
+      else if (e === 'clock') { const a = U.easeInOut(prog) * 6.283; m.beginPath(); m.moveTo(W / 2, H / 2); m.arc(W / 2, H / 2, W + H, -Math.PI / 2, -Math.PI / 2 + a); m.closePath(); m.fill(); }
+      else { m.fillRect(0, 0, W, H); }
+      m.filter = 'none';
+      offCtx.globalCompositeOperation = 'destination-in';
+      offCtx.imageSmoothingEnabled = true;
+      offCtx.drawImage(MK, 0, 0, W, H);
       offCtx.globalCompositeOperation = 'source-over';
+      // 转场开头 15% 再叠一点整体淡入，避免第一帧突然出现一块
+      c.globalAlpha = U.clamp(prog / .15);
       c.drawImage(off, 0, 0);
       c.globalAlpha = 1;
     } else {
@@ -203,7 +234,7 @@
     }
 
     // 模糊和亮度跟着段落走：主歌朦胧、副歌「灯亮了」
-    const pb = prev.blur, k = U.clamp((t - sc.t0) / (60 / show.music.bpm));
+    const pb = prev.blur, k = U.clamp((t - sc.t0) / Math.max(1.4, 2 * 60 / show.music.bpm));
     const blur = U.lerp(i > 0 ? pb : sc.blur, sc.blur, U.easeInOut(k));
     const lum = sc.lum * (1 + .12 * v.pulse * v.intensity);
     return { scene: sc.scene, entry: sc.entry, density: sc.density || 1, blur, lum, section: sc.section };

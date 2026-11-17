@@ -237,13 +237,18 @@
    * decor 来自 typeface.rules.decor；没有 sticker 时只保留很小的空气感闪光。
    */
   function drawDecor(v) {
-    const { ctx: c, W, H, t, skin, pal, intensity: I, pulse: pu, seed } = v;
+    const { ctx: c, W, H, t, pal, intensity: I, pulse: pu, seed } = v;
+    let skin = v.skin;
     const decor = v.decor || [];
     const sticker = decor.indexOf('sticker') >= 0;
     const glow = decor.indexOf('glow') >= 0 || decor.indexOf('softglow') >= 0 || decor.indexOf('soft_glow') >= 0;
     const hot = (pal && pal.hot) || '#ffe066';
     const c1 = (pal && pal.c1) || '#ffb3d9';
     const c2 = (pal && pal.c2) || '#b9e2ff';
+    // 第四十四轮：有美术指导时，皮肤自带的贴纸（樱花/爱心…）不再固定，改由当前段落主题决定，避免霓虹/宇宙场景里飘樱花
+    const ART = global.__NEKO_ART;
+    const stk = ART ? ({ sakura_dream: 'sakura', pastel_pop: 'hearts', forest_breeze: 'sakura', idol_stage: 'stars', crystal_space: 'stars', starry_night: 'stars' })[ART.themeAt(t).name] || 'spark' : skin.stickers;
+    skin = Object.assign({}, skin, { stickers: stk });
 
     if (skin.stickers === 'hearts') {
       const n = sticker ? 10 : 5;

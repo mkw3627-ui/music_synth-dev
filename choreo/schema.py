@@ -39,7 +39,8 @@ SIGNATURE_TOKENS = ({*REVEALS} | {*MATERIALS} |
                    {"outline", "glow", "softglow", "shadow", "echo", "shine",
                     "sticker", "grain", "grid", "glitch", "sparkle"})
 SHOT_KINDS = {"close", "medium", "base", "wide"}
-ENTRIES = {"iris", "sweepL", "sweepR", "columns", "flash", "fade"}
+ENTRIES = {"iris", "sweepL", "sweepR", "columns", "flash", "fade",
+           "sweepU", "sweepD", "diag", "diamond", "blinds", "dots", "split", "clock"}
 
 
 class _Ctx:

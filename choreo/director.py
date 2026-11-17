@@ -8,12 +8,13 @@
 """
 from __future__ import annotations
 
+import bisect
 import math
 import random
 import re
 import time
 
-from . import GENERATOR, presets
+from . import GENERATOR, presets, quality
 from . import typeface as typeface_mod
 
 # 歌词入场的提前量 / 入场时长（演示页 leadBy / dur）
@@ -196,6 +197,9 @@ def _extract_lines(timed: list[dict], cues: list, duration: float,
         text = str(row.get("text") or "").strip()
         if not text or _is_metadata(text):
             continue
+        # 歌词文件比音频长（拿到的是完整版/别的版本的歌词）：超出曲长的行丢掉，不能让整首编排校验失败
+        if duration and t0 >= duration - 0.5:
+            continue
         if not re.search(r"[A-Za-z0-9㐀-鿿぀-ヿ]", text):
             continue
         rows.append({"t0": t0, "text": text})
@@ -300,21 +304,29 @@ def _line_chars(text: str, cues: list[dict], t0: float, t1: float,
     total = sum(weights) or 1.0
     onsets = [float(c["start"]) for c in cues]
     cursor = span_start
+    prev_end = span_start - 1.0
     for i, ch in enumerate(chars):
         share = (span_end - span_start) * weights[i] / total
         start = cursor
-        # 附近有真实起音就吸附过去，让逐字点亮跟着唱
+        # 附近有真实起音就吸附过去，让逐字点亮跟着唱。只吸附到上一个字之后的起音：
+        # 以前会吸回同一个（更早的）起音，英文一句里每个字母都挤在同一 0.1 s，后面整句嘴不动
+        best = None
         for onset in onsets:
-            if abs(onset - start) <= 0.16:
-                start = onset
-                break
+            if onset < prev_end - 0.01:
+                continue
+            if abs(onset - start) <= 0.16 and (best is None or abs(onset - start) < abs(best - start)):
+                best = onset
+        if best is not None:
+            start = best
+        start = max(start, prev_end)
         end = min(span_end, start + share * 0.94)
         if end <= start:
             end = start + 0.12
+        prev_end = end
         on_beat = abs(_fract((start - t0) / max(0.1, beat))) < 0.12
         stress = _clamp(0.28 + (0.32 if on_beat else 0.0) + 0.4 * kw_flags[i])
         out.append([ch, _fmt_sec(start), _fmt_sec(end), round(stress, 3), kw_flags[i]])
-        cursor = start + share
+        cursor = max(cursor + share, start + share * 0.5)
     return out
 
 
@@ -498,10 +510,14 @@ def build(track: dict, analysis: dict, timed: list[dict], cues: list,
             if combo.get("exit") == "sink":
                 combo["exit"] = "burst"
             if line["_idxInSec"] == 0:
+                # 前半首（非 final）的副歌入口不用最强 reveal（slam），最强的留给 final
+                entry_early = float(line["t0"]) < duration * 0.5 and line["section"] != "final"
+                entry_reveal = "rise" if entry_early else (
+                    "slam" if preset["signature"] == "rise" else preset["signature"])
                 combo.update({
                     "layout": "giant",
                     "front": True,
-                    "reveal": "slam" if preset["signature"] == "rise" else preset["signature"],
+                    "reveal": entry_reveal,
                     "stagger": "cue",
                 })
         elif line["section"] == "bridge" and line["_idxInSec"] == 0:
@@ -509,10 +525,16 @@ def build(track: dict, analysis: dict, timed: list[dict], cues: list,
                      "material": "solid", "exit": "dissolve",
                      "slow": True, "front": True}
         else:
-            combo = _choose_combo(rng, preset, line, hist)
+            early = float(line["t0"]) < duration * 0.5 and line["section"] != "final"
+            combo = _choose_combo(rng, preset, line, hist, early=early)
             if line["section"] in ("chorus", "final") and line["_idxInSec"] == 0:
                 combo["layout"] = "giant"
-                combo["reveal"] = preset["signature"]
+                # 前半首（非 final）的副歌入口不用 signature（有的预设 signature 就是 slam），
+                # 否则会绕过 _choose_combo 的前半首预算
+                if float(line["t0"]) < duration * 0.5 and line["section"] != "final":
+                    combo["reveal"] = "rise"
+                else:
+                    combo["reveal"] = preset["signature"]
                 if combo["reveal"] == "type":
                     combo["stagger"] = "cue"
         _constrain_layout(line, combo, tf_rules)
@@ -707,7 +729,7 @@ def _gaze_for(rng: random.Random, preset: dict, section: str, index: int,
 
 
 def _choose_combo(rng: random.Random, preset: dict, line: dict,
-                  hist: list[dict]) -> dict:
+                  hist: list[dict], early: bool = False) -> dict:
     weights = preset["weights"]
     signature = preset["signature"]
     last = None
@@ -728,6 +750,10 @@ def _choose_combo(rng: random.Random, preset: dict, line: dict,
         }
         if combo["reveal"] == "type":
             combo["stagger"] = "cue"
+        # v2 §5.1 新鲜感预算：前半首（非 final 段）只花掉冲击力 < 4 的元素，
+        # 最强的（glitch/slam，冲击力 ≥ 4）留给后半首与最后一次副歌
+        if early and quality.IMPACT.get("reveal:" + combo["reveal"], 0) >= 4:
+            continue
         last = combo
         if line["intensity"] < 0.45 and combo["exit"] == "burst":
             continue
@@ -739,8 +765,12 @@ def _choose_combo(rng: random.Random, preset: dict, line: dict,
         if any(item.get("reveal") == combo["reveal"] for item in hist[-2:]):
             continue
         return combo
-    return last or {"stagger": "cue", "reveal": signature, "layout": "h",
-                    "material": "solid", "exit": "sink"}
+    fallback = last or {"stagger": "cue", "reveal": signature, "layout": "h",
+                        "material": "solid", "exit": "sink"}
+    # 循环耗尽也不能违反前半首预算：兜底换成冲击力 < 4 的 reveal
+    if early and quality.IMPACT.get("reveal:" + fallback["reveal"], 0) >= 4:
+        fallback = dict(fallback, reveal="rise")
+    return fallback
 
 
 # ---------------------------------------------------------------- 特殊行
@@ -838,7 +868,7 @@ def _apply_entrance(line: dict, clears: list[float], rng: random.Random,
     stagger = "cue" if reveal == "type" else combo.get("stagger", "char")
     spread = max(0.05, lead - dur * 0.5)
     for i, ch in enumerate(chars):
-        cs = float(ch[1])
+        cs, ce = float(ch[1]), float(ch[2])
         if line.get("kind") == "title":
             es, ed = cs - 0.5, 1.3
         elif stagger == "cue":
@@ -916,11 +946,23 @@ def _scenes(sections: list[dict], preset: dict, rng: random.Random,
     pool = list(preset["scenePool"])
     chosen: dict[str, str] = {}
     prev = None
-    entries = {
-        "intro": "iris", "verse": "sweepL" if rng.random() < 0.5 else "columns",
-        "pre": "sweepR" if rng.random() < 0.5 else "iris", "chorus": "flash",
-        "bridge": "fade", "final": "flash", "outro": "fade",
+    # 第三十八轮：背景转场 14 种，每段按候选随机挑（同一首相邻段不重复）
+    ENTRY_CAND = {
+        "intro": ["iris", "diamond", "clock", "fade"],
+        "verse": ["sweepL", "sweepR", "columns", "diag", "blinds", "dots", "sweepU"],
+        "pre": ["sweepR", "iris", "split", "diag", "sweepD", "dots"],
+        "chorus": ["flash", "diamond", "split", "clock", "iris"],
+        "final": ["flash", "diamond", "clock", "split"],
+        "bridge": ["fade", "blinds", "sweepD", "dots"],
+        "outro": ["fade", "iris", "sweepU"],
     }
+    entries_seq = []
+    def _entry_for(sid):
+        cand = [e for e in ENTRY_CAND.get(sid, ["fade"]) if not entries_seq or e != entries_seq[-1]] or ["fade"]
+        e = cand[int(rng.random() * len(cand)) % len(cand)]
+        entries_seq.append(e)
+        return e
+    entries = {}
     out = []
     for seg in sections:
         sid = seg["id"]
@@ -933,8 +975,9 @@ def _scenes(sections: list[dict], preset: dict, rng: random.Random,
             candidates = [x for x in pool if x != prev and x not in used]
             scene = candidates[int(rng.random() * len(candidates)) % len(candidates)] \
                 if candidates else pool[int(rng.random() * len(pool)) % len(pool)]
-        if sid in ("chorus", "final") and scene not in ("beams", "led", "tunnel", "rings"):
-            preferred = [x for x in pool if x in ("beams", "led", "tunnel", "rings") and x != prev]
+        # 副歌要「灯亮了」的场景：演唱会 / 彩带 / 夜城 / 光束类
+        if sid in ("chorus", "final") and scene not in ("concert", "confetti", "skyline", "beams", "led", "tunnel", "starstage", "neoncity", "lantern"):
+            preferred = [x for x in pool if x in ("concert", "confetti", "skyline", "beams", "led", "tunnel", "starstage", "neoncity", "lantern") and x != prev]
             if preferred:
                 scene = preferred[0]
         chosen[sid] = scene
@@ -944,7 +987,7 @@ def _scenes(sections: list[dict], preset: dict, rng: random.Random,
             "t0": _fmt_sec(seg["t0"]),
             "t1": _fmt_sec(seg["t1"]),
             "scene": scene,
-            "entry": entries.get(sid, "fade"),
+            "entry": _entry_for(sid),
             "blur": float(preset["secBlur"].get(sid, 12)),
             "lum": float(preset["secLum"].get(sid, 0.8)),
             "density": 1.45 if sid == "final" else (1.1 if sid == "chorus" else 1.0),
@@ -1139,6 +1182,7 @@ def _events(analysis: dict, lines: list[dict], sections: list[dict],
     for line in lines:
         if line.get("kind") in ("title", "flash"):
             continue
+        text = str(line.get("text") or "")
         for i, ch in enumerate(line.get("chars") or []):
             if len(ch) >= 5 and ch[4]:
                 events.append({"t": round(float(ch[1]), 3), "type": "keyword",
@@ -1175,6 +1219,12 @@ def _events(analysis: dict, lines: list[dict], sections: list[dict],
                                "dur": 0.0, "amp": 0.035 if preset["key"] == "ballad" else 0.05,
                                "arg": ""})
     final = next((seg for seg in sections if seg["id"] == "final"), None)
+    # 开场钩子兜底：第一句太早（< 2.4 s）时歌名浮出放不下，就在曲首放一个短黑场
+    # （v2 §5.2 ①：前 5 秒一个反常规画面）。它在第一句之前，不压歌词。
+    first_line_t = min((float(line["t0"]) for line in lines), default=duration)
+    if first_line_t < 2.4:
+        events.append({"t": 0.0, "type": "black", "dur": round(beat * 0.5, 3),
+                       "amp": 1.0, "arg": ""})
     if final:
         events.append({"t": round(max(0.0, float(final["t0"]) - beat * 0.5), 3),
                        "type": "black", "dur": round(beat * 0.5, 3),
@@ -1201,13 +1251,16 @@ def _events(analysis: dict, lines: list[dict], sections: list[dict],
                        "dur": 0.0, "amp": 0.7, "arg": ""})
 
     # 手势：桌面档按脚本触发；同一时刻只给一个主要动作
+    # 段落起点不一定在拍上：时刻吸到最近一拍（P5，对拍率），仍限在本段内
     whitelist = list(preset.get("desk", {}).get("gesture_whitelist") or ["nod"])
+    beats = sorted(float(x) for x in (analysis.get("beats") or []))
     for seg in sections:
         if seg["id"] in ("intro", "outro"):
             continue
         count = max(1, int((float(seg["t1"]) - float(seg["t0"])) / max(1.0, bar * 4)))
         for k in range(count):
-            t = float(seg["t0"]) + k * bar * 4
+            t = _snap_to_beat(float(seg["t0"]) + k * bar * 4, beats,
+                              float(seg["t0"]), float(seg["t1"]))
             if t >= duration:
                 break
             arg = whitelist[(k + int(seed)) % len(whitelist)]
@@ -1232,6 +1285,14 @@ def _events(analysis: dict, lines: list[dict], sections: list[dict],
             continue
         deduped.append(event)
     return deduped
+
+
+def _snap_to_beat(t: float, beats: list[float], lo: float, hi: float) -> float:
+    """最近的一拍（只取 [lo, hi) 里的）；没有拍点就原样返回。"""
+    i = bisect.bisect_left(beats, t)
+    near = [beats[j] for j in (i - 1, i)
+            if 0 <= j < len(beats) and lo <= beats[j] < hi]
+    return min(near, key=lambda b: abs(b - t)) if near else t
 
 
 # ---------------------------------------------------------------- 其它

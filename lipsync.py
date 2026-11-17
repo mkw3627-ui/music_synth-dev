@@ -480,6 +480,360 @@ def vocal_syllable_onsets(env: dict, *, floor: float = 0.12, delta: float = 0.05
     return out
 
 
+def _norm_text(t: str) -> str:
+    return re.sub(r"[\W_]+", "", str(t or "").lower())
+
+
+def _sim(a: str, b: str) -> float:
+    """两段文字的相似度 0..1（按字符二元组重合，不怕识别器错一两个字）。"""
+    a, b = _norm_text(a), _norm_text(b)
+    if not a or not b:
+        return 0.0
+    if len(a) < 2 or len(b) < 2:
+        return 1.0 if a == b else 0.0
+    ga = {a[i:i + 2] for i in range(len(a) - 1)}
+    gb = {b[i:i + 2] for i in range(len(b) - 1)}
+    return 2 * len(ga & gb) / (len(ga) + len(gb))
+
+
+def _vocal_phrases(env: dict | None, *, gap: float = 0.6, min_len: float = 0.4) -> list:
+    """干声包络 → 唱的短语起点列表（间隔 ≥gap 秒的无声才算断句）。"""
+    amp = list((env or {}).get("amp") or [])
+    hop = float((env or {}).get("hop") or 0.05)
+    if not amp or hop <= 0:
+        return []
+    peak = max(amp) or 1.0
+    on = [v > peak * 0.12 for v in amp]
+    starts, i, n = [], 0, len(on)
+    while i < n:
+        if on[i]:
+            j = i
+            while j < n and (on[j] or any(on[j:j + int(gap / hop)])):
+                j += 1
+            if (j - i) * hop >= min_len:
+                starts.append(round(i * hop, 3))
+            i = j
+        else:
+            i += 1
+    return starts
+
+
+def align_user_lyrics(user_lyrics: str, asr_lines: list, duration: float = 0.0,
+                      env: dict | None = None) -> list:
+    """用户写的歌词（无时间）+ 识别出的带时间行 → 带时间的用户歌词行。
+
+    文字一律用用户写的（识别只提供时间）。用动态规划做全局单调对齐（类似编辑距离）：
+    用户句 i 对识别句 k 的得分 = 文字相似度；允许跳过（识别漏句 / 多出幻觉句）、
+    允许一句识别对应用户的连续几句（识别把两句并成一句：按字数在该识别句时长里分配）。
+    没对上的句子按前后已定位的句子插值。对上的比例 <30% 返回空，宁可不用。
+    """
+    lines = split_lines(user_lyrics)
+    asr = [r for r in (asr_lines or []) if isinstance(r, dict) and str(r.get("text") or "").strip()]
+    n, m = len(lines), len(asr)
+    if not n or not m:
+        return []
+    NEG = -1e9
+    # 覆盖判定：用户句 i 是不是识别句 k 的一部分（识别合并句）
+    def score(i, k):
+        a, b = lines[i], asr[k]["text"]
+        sc = _sim(a, b)
+        na, nb = _norm_text(a), _norm_text(b)
+        if na and nb and (na in nb or nb in na):
+            sc = max(sc, 0.75)
+        return sc
+    S = [[score(i, k) for k in range(m)] for i in range(n)]
+    # dp[i][k]：前 i 句用户歌词、前 k 句识别已处理的最高分；允许一个识别句被连续多句用户歌词共用
+    dp = [[NEG] * (m + 1) for _ in range(n + 1)]
+    bt = [[None] * (m + 1) for _ in range(n + 1)]
+    for k in range(m + 1):
+        dp[0][k] = 0.0
+    for i in range(1, n + 1):
+        dp[i][0] = 0.0
+        bt[i][0] = ("skip_u", i - 1, 0)
+        for k in range(1, m + 1):
+            best, how = dp[i - 1][k], ("skip_u", i - 1, k)          # 用户句没对上
+            if dp[i][k - 1] > best:
+                best, how = dp[i][k - 1], ("skip_a", i, k - 1)      # 识别句是多余的
+            sc = S[i - 1][k - 1]
+            if sc >= 0.4:
+                v = dp[i - 1][k - 1] + sc                           # 一对一
+                if v > best:
+                    best, how = v, ("match", i - 1, k - 1)
+                v2 = dp[i - 1][k] + sc * 0.9                         # 与上一句共用同一识别句
+                if bt[i - 1][k] and bt[i - 1][k][0] in ("match", "share") and v2 > best:
+                    best, how = v2, ("share", i - 1, k)
+            dp[i][k], bt[i][k] = best, how
+    pairs = {}
+    i, k = n, m
+    while i > 0 and k >= 0:
+        how = bt[i][k]
+        if how is None:
+            break
+        kind, pi, pk = how
+        if kind in ("match", "share"):
+            pairs[i - 1] = k - 1 if kind == "match" else k - 1
+        i, k = (pi, pk) if kind != "match" else (pi, pk)
+        if kind == "share":
+            i, k = pi, pk
+    if len(pairs) < max(2, 0.3 * n):
+        return []
+    # 同一识别句被几句用户歌词共用：按字数在该识别句时长里分配起点
+    out: list = [None] * n
+    by_k: dict = {}
+    for ui, ak in pairs.items():
+        by_k.setdefault(ak, []).append(ui)
+    for ak, uis in by_k.items():
+        uis.sort()
+        a0 = float(asr[ak].get("at_s") or 0)
+        a1 = float(asr[ak].get("end_s") or a0 + 2.0)
+        w = [max(1, len(_norm_text(lines[u]))) for u in uis]
+        tot = float(sum(w))
+        acc = 0.0
+        for u, ww in zip(uis, w):
+            out[u] = a0 + (a1 - a0) * acc / tot
+            acc += ww
+    known = [(i, t) for i, t in enumerate(out) if t is not None]
+    end = float(duration or 0) or (float(asr[-1].get("end_s") or asr[-1].get("at_s") or 0) + 2.0)
+    # 没对上的句子：先按干声的「唱的短语」逐句往后排（在前后已定位句之间，按顺序取短语起点）
+    phrases = _vocal_phrases(env)
+    if phrases:
+        i = 0
+        while i < n:
+            if out[i] is not None:
+                i += 1
+                continue
+            j = i
+            while j < n and out[j] is None:
+                j += 1
+            lo = (out[i - 1] + 0.8) if i > 0 and out[i - 1] is not None else 0.0
+            hi = out[j] - 0.3 if j < n and out[j] is not None else end
+            cand = [p for p in phrases if lo <= p < hi]
+            need = j - i
+            if len(cand) >= need:
+                # 按顺序一句接一句取短语起点（唱歌是连着唱的，句子跟着下一个短语走）
+                for t in range(need):
+                    out[i + t] = cand[t]
+            i = j
+        known = [(i, t) for i, t in enumerate(out) if t is not None]
+    for i in range(n):
+        if out[i] is not None:
+            continue
+        prev = max((x for x in known if x[0] < i), default=None, key=lambda x: x[0])
+        nxt = min((x for x in known if x[0] > i), default=None, key=lambda x: x[0])
+        if prev and nxt:
+            out[i] = prev[1] + (nxt[1] - prev[1]) * (i - prev[0]) / (nxt[0] - prev[0])
+        elif prev:
+            out[i] = min(end - 1.0, prev[1] + 3.0 * (i - prev[0]))
+        elif nxt:
+            out[i] = max(0.0, nxt[1] - 3.0 * (nxt[0] - i))
+    rows = []
+    last = -1.0
+    for line, at in zip(lines, out):
+        at = max(float(at), last + 0.3)
+        rows.append({"at_s": round(at, 3), "text": line})
+        last = at
+    return rows
+
+
+# 歌声识别在没人声/纯伴奏处常「编」出来的句子（视频平台片尾、字幕组署名之类）
+_ASR_HALLU = re.compile(r"(独播|獨播|剧场|劇場|字幕|订阅|訂閱|点赞|點贊|关注|關注|转发|轉發|感谢观看|謝謝觀看|谢谢观看|"
+                        r"谢谢收看|謝謝收看|感谢收看|感謝收看|下期再见|下期再見|Television|Exclusive|subtitles?|"
+                        r"Thank(s| you) for watching|请不吝|請不吝|明镜|明鏡|栏目|欄目|本节目|本節目|未经授权|未經授權|ご視聴)", re.I)
+
+
+def _voiced_frac(env: dict | None, t0: float, t1: float) -> float:
+    amp = list((env or {}).get("amp") or [])
+    hop = float((env or {}).get("hop") or 0.05)
+    if not amp or hop <= 0 or t1 <= t0:
+        return 1.0
+    peak = max(amp) or 1.0
+    seg = amp[max(0, int(t0 / hop)):max(1, int(t1 / hop))]
+    return sum(1 for v in seg if v > peak * 0.12) / max(1, len(seg))
+
+
+def clean_asr_lines(asr_lines, env: dict | None = None) -> list:
+    """去掉识别的幻觉句：命中常见片尾/字幕套话，或这句的时间里干声基本没有声音。"""
+    out = []
+    for r in asr_lines or []:
+        if not isinstance(r, dict) or not str(r.get("text") or "").strip():
+            continue
+        text = str(r["text"])
+        if _ASR_HALLU.search(text):
+            continue
+        a0 = float(r.get("at_s") or 0.0)
+        a1 = float(r.get("end_s") or a0 + 2.0)
+        if env and _voiced_frac(env, a0, a1) < 0.12:
+            continue
+        out.append(r)
+    return out
+
+
+def asr_missing_frac(asr_lines, env: dict | None) -> float:
+    """有人声、但没有任何识别句覆盖的时间占全部人声时间的比例（0..1）。"""
+    amp = list((env or {}).get("amp") or [])
+    hop = float((env or {}).get("hop") or 0.05)
+    if not amp or hop <= 0:
+        return 0.0
+    peak = max(amp) or 1.0
+    spans = [(float(r.get("at_s") or 0) - 0.5,
+              float(r.get("end_s") or (float(r.get("at_s") or 0) + 2.0)) + 0.5)
+             for r in asr_lines or [] if isinstance(r, dict)]
+    voiced = miss = 0
+    for i, v in enumerate(amp):
+        if v <= peak * 0.12:
+            continue
+        voiced += 1
+        t = i * hop
+        if not any(a <= t <= b for a, b in spans):
+            miss += 1
+    return miss / voiced if voiced else 0.0
+
+
+# 歌词文件里的制作人员行（「词曲：xxx」「混音/母带：xxx」）
+_CREDIT_LINE = re.compile(r"^[^：:]{0,16}(词|曲|编|混|母|唱|和声|制作|监制|出品|策划|企划|统筹|营销|吉他|贝斯|鼓|录|美术|题字|调校|调教|PV|OP|SP)[^：:]{0,10}[：:]")
+
+
+def fuse_asr_reference(asr_lines, ref_lines, env: dict | None, duration: float) -> list:
+    """识别为主、搜到的歌词为辅：
+    - 时间以识别为准（它听的就是这段录音，版本/剪辑都对）；
+    - 先用文字很像的句子（锚点）量出「录音时间 - 参考歌词时间」的差（就近取，录音有剪辑也能跟上）；
+    - 每个识别句：参考歌词里按时间差落在这句时间段内的句子，文字合起来和识别句相像 → 换成参考歌词
+      （修错字；识别把两句并成一句时，会换成两句并按参考时间分开）；
+    - 参考歌词里有、识别漏掉的句子 → 放进去，但只放在真有人声、又没有识别句的地方（补缺句）；
+    - 识别有、参考对不上的句子保留（翻唱改词/即兴）。
+    锚点太少（<3）说明不是同一首，返回 []。"""
+    asr = [r for r in (asr_lines or []) if isinstance(r, dict) and str(r.get("text") or "").strip()]
+    ref = [r for r in (ref_lines or []) if isinstance(r, dict) and str(r.get("text") or "").strip()
+           and r.get("at_s") is not None and not _CREDIT_LINE.match(str(r.get("text") or "").strip())]
+    if len(asr) < 3 or len(ref) < 3:
+        return []
+    # 1) 锚点：文字很像的识别句 ↔ 参考句（单调往后找；歌会重复，所以每次从上个锚点往后）
+    anchors = []
+    j0 = 0
+    for k, a in enumerate(asr):
+        best, bj = 0.0, -1
+        for j in range(j0, min(len(ref), j0 + 25)):
+            sc = _sim(a["text"], ref[j]["text"])
+            na, nb = _norm_text(a["text"]), _norm_text(ref[j]["text"])
+            if na and nb and len(min(na, nb, key=len)) >= 3 and (na in nb or nb in na):
+                sc = max(sc, 0.7)
+            if sc > best:
+                best, bj = sc, j
+        if bj >= 0 and best >= 0.34:
+            anchors.append((float(a["at_s"]), float(a["at_s"]) - float(ref[bj]["at_s"])))
+            j0 = bj + 1
+    if len(anchors) < 3:
+        return []
+
+    def shift_at(t: float) -> float:
+        # 就近 3 个锚点的时间差取中位数
+        near = sorted(anchors, key=lambda x: abs(x[0] - t))[:3]
+        ds = sorted(d for _, d in near)
+        return ds[len(ds) // 2]
+
+    used = set()
+    rows = []
+    for a in asr:
+        a0 = float(a["at_s"])
+        a1 = float(a.get("end_s") or a0 + 2.0)
+        sh = shift_at(a0)
+        inside = [j for j, r in enumerate(ref) if j not in used and a0 - 0.8 <= float(r["at_s"]) + sh < a1 - 0.2]
+        take = []
+        if inside:
+            joined = "".join(ref[j]["text"] for j in inside)
+            single = max(inside, key=lambda j: _sim(a["text"], ref[j]["text"]))
+            if _sim(a["text"], joined) >= 0.25:
+                take = inside
+            elif _sim(a["text"], ref[single]["text"]) >= 0.34:
+                take = [single]
+        if take:
+            for n, j in enumerate(take):
+                at = a0 if n == 0 else min(max(float(ref[j]["at_s"]) + sh, a0 + 0.3), a1 - 0.3)
+                rows.append({"at_s": round(at, 3), "text": ref[j]["text"], "from": "asr+ref"})
+                used.add(j)
+        elif rows and rows[-1]["from"] == "asr+ref" and _sim(a["text"], rows[-1]["text"]) >= 0.3:
+            continue      # 识别把参考歌词的一句拆成了两段：后半段已经包含在上一句里
+        else:
+            rows.append({"at_s": a0, "text": a["text"], "from": "asr"})
+    spans = [(float(a["at_s"]) - 0.3, float(a.get("end_s") or float(a["at_s"]) + 2.0) + 0.3) for a in asr]
+    dur = float(duration or 0.0) or 1e9
+    for j, r in enumerate(ref):
+        if j in used:
+            continue
+        at = float(r["at_s"]) + shift_at(float(r["at_s"]) + anchors[0][1])
+        nxt = at + 3.0
+        if j + 1 < len(ref):
+            nxt = float(ref[j + 1]["at_s"]) + (at - float(r["at_s"]))
+        end = max(at + 0.8, min(nxt, at + 6.0))
+        if at < 0 or at >= dur - 0.5:
+            continue
+        if any(a < end - 0.4 and at + 0.4 < b for a, b in spans):
+            continue      # 这段已经有识别句了（识别听到的版本和参考不同），不硬塞
+        if env and _voiced_frac(env, at, end) < 0.3:
+            continue      # 这里没唱（录音剪掉了这段 / 参考是完整版）
+        rows.append({"at_s": round(at, 3), "text": r["text"], "from": "ref"})
+        spans.append((at - 0.3, end + 0.3))
+    rows.sort(key=lambda r: r["at_s"])
+    out, last = [], -1.0
+    for r in rows:
+        at = max(r["at_s"], last + 0.3)
+        out.append({"at_s": round(at, 3), "text": r["text"], "from": r["from"]})
+        last = at
+    return out
+
+
+def text_match_rate(heard, lyric_lines) -> float | None:
+    """识别出的句子里有多少「二字片段」出现在歌词里（0..1；字太少返回 None）。
+    同一首歌即使识别错字多也有 0.3~0.6；不同的歌通常 <0.05。"""
+    def grams(text):
+        t = re.sub(r"[\W_]+", "", str(text or "").lower())
+        return [t[i:i + 2] for i in range(len(t) - 1)]
+    ref = set()
+    for line in lyric_lines or []:
+        ref.update(grams(line))
+    got = [g for line in (heard or []) for g in grams(line)]
+    if len(got) < 20 or not ref:
+        return None
+    return sum(1 for g in got if g in ref) / len(got)
+
+
+def lyric_match_rate(env: dict, lines, *, tol: float = 0.5) -> float | None:
+    """歌词和这首歌的人声对不对得上（0..1，越高越可信；行太少或没起音返回 None）。
+
+    两项取小：① 行首落在干声起音 tol 秒内的比例；② 「首句之前」干声基本无声
+    （首句前 >4 s 时，那段的人声占比要 <0.15，否则说明歌词比人声晚一大截——多半不是这首，
+    或者是完整版歌词配了剪过的音频）。② 不满足时返回 ① 与 0.3 的较小值。
+    """
+    onsets = vocal_onsets(env)
+    dur = float(env.get("duration") or 0.0) or 1e9
+    starts = []
+    for row in lines or []:
+        try:
+            at = float(row.get("at_s"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if 0 <= at < dur:
+            starts.append(at)
+    if len(starts) < 6 or len(onsets) < 6:
+        return None
+    hits = 0
+    for at in starts:
+        i = bisect.bisect_left(onsets, at)
+        if any(abs(c - at) <= tol for c in onsets[max(0, i - 1):i + 2]):
+            hits += 1
+    rate = hits / len(starts)
+    first = min(starts)
+    amp = list(env.get("amp") or [])
+    hop = float(env.get("hop") or 0.05)
+    if first > 4.0 and amp and hop > 0:
+        peak = max(amp) or 1.0
+        seg = amp[: max(1, int((first - 1.0) / hop))]
+        pre_voiced = sum(1 for v in seg if v > peak * 0.12) / max(1, len(seg))
+        if pre_voiced >= 0.15:
+            rate = min(rate, 0.3)
+    return rate
+
+
 def align_offset(env: dict, lines, *, max_shift: float = 15.0,
                  step: float = 0.05, tol: float = 0.25) -> float:
     """歌词时间轴相对录音的整体平移量（秒）。
@@ -1213,6 +1567,8 @@ def track_lyrics(track: dict) -> tuple[str, list, str]:
             source = "perception_timed"
             break
     official = track.get("official_lyrics")
+    if isinstance(official, dict) and official.get("rejected"):
+        official = None   # 和人声对不上、已拒用的网上歌词：当作没有
     if not timed and isinstance(official, dict) and isinstance(official.get("timed"), list):
         timed = official["timed"]
         # 存下来的官方歌词带着抓取来源（lrclib.net / qq …），标签沿用，
@@ -1326,7 +1682,7 @@ def line_moods(timed: list, duration: float) -> list[list]:
 
 
 def build_track_payload(track: dict, *, stem: str = "", duration: float | None = None,
-                        lrc_fetcher=None) -> dict:
+                        lrc_fetcher=None, asr_fetcher=None, web_fetcher=None) -> dict:
     """一首歌的完整口型包：逐字 cue 轨 + 起音对齐 + （没有歌词时）响度包络。
 
     处理曲目时跑一次、存成 ``lips.json``；唱的时候直接拿来用，不再现场
@@ -1338,7 +1694,9 @@ def build_track_payload(track: dict, *, stem: str = "", duration: float | None =
     track = track or {}
     lyrics, timed, lrc_source = track_lyrics(track)
     official_saved: dict = {}
-    if not timed and lrc_fetcher is not None:
+    # 原创歌（用户自己写的歌词）不去网上搜：按「原创_xxxx」这种名字只会搜到别人的歌
+    is_original = str(track.get("origin") or "") == "ace" and bool(lyrics.strip())
+    if not timed and lrc_fetcher is not None and not is_original:
         try:
             lrc, how = lrc_fetcher(track)
         except Exception:  # noqa: BLE001 - 网络失败只是回到「估计」路径
@@ -1355,6 +1713,71 @@ def build_track_payload(track: dict, *, stem: str = "", duration: float | None =
 
     stem = str(stem or "")
     stem_ok = bool(stem) and Path(stem).is_file()
+    # 兜底：仍然没有带时间的歌词 → 用「为她所听」的歌声识别模型识别干声。
+    #   有用户歌词（原创歌）：文字用用户写的，识别只给时间；
+    #   没有任何歌词：直接用识别出的句子（标注 asr，可能有错字）。
+    if not timed and stem_ok and asr_fetcher is not None:
+        try:
+            asr = asr_fetcher(track, stem) or {}
+        except Exception:  # noqa: BLE001 - 识别失败只是回到估计路径
+            asr = {}
+        asr_lines = list(asr.get("lines") or [])
+        if asr_lines:
+            if lyrics.strip():
+                try:
+                    env_for_align = get_or_build_envelope(stem)
+                except Exception:  # noqa: BLE001
+                    env_for_align = None
+                aligned = align_user_lyrics(lyrics, asr_lines, float(duration or 0.0), env=env_for_align)
+                if aligned:
+                    timed = aligned
+                    lrc_source = "user+asr"
+                    official_saved = {"source": "user+asr", "timed": aligned,
+                                      "lines": [r["text"] for r in aligned],
+                                      "asr_model": asr.get("model")}
+            else:
+                env_asr = None
+                try:
+                    env_asr = get_or_build_envelope(stem)
+                except Exception:  # noqa: BLE001
+                    env_asr = None
+                asr_lines = clean_asr_lines(asr_lines, env_asr) or asr_lines
+                fused = []
+                fuse_src = ""
+                miss = asr_missing_frac(asr_lines, env_asr) if env_asr else 0.0
+                if web_fetcher is not None and miss >= 0.12:
+                    # 识别缺得严重（有人声的地方没认出句子）：网上搜歌词做辅助，识别为主
+                    try:
+                        cands = web_fetcher(track, asr_lines) or []
+                    except Exception:  # noqa: BLE001
+                        cands = []
+                    best_tm = 0.0
+                    for lrc_c, how_c in cands:
+                        ref = parse_lrc(lrc_c) if lrc_c else []
+                        tm = text_match_rate([r["text"] for r in asr_lines], [r["text"] for r in ref]) or 0.0
+                        if tm < 0.2 or tm <= best_tm:
+                            continue
+                        got = fuse_asr_reference(asr_lines, ref, env_asr, float(duration or 0.0))
+                        if got:
+                            fused, fuse_src, best_tm = got, how_c, tm
+                if fused:
+                    timed = [{"at_s": r["at_s"], "text": r["text"]} for r in fused]
+                    lrc_source = "asr+web"
+                    lyrics = "\n".join(r["text"] for r in timed)
+                    official_saved = {"source": "asr+web", "timed": timed,
+                                      "lines": [r["text"] for r in timed], "web_source": fuse_src,
+                                      "asr_missing": round(miss, 2),
+                                      "fused_from": {k: sum(1 for r in fused if r["from"] == k)
+                                                     for k in ("asr", "asr+ref", "ref")},
+                                      "asr_model": asr.get("model"), "asr_language": asr.get("language")}
+                else:
+                    timed = [{"at_s": r["at_s"], "text": r["text"]} for r in asr_lines]
+                    lrc_source = "asr"
+                    lyrics = "\n".join(r["text"] for r in timed)
+                    official_saved = {"source": "asr", "timed": timed,
+                                      "lines": [r["text"] for r in timed],
+                                      "asr_missing": round(miss, 2),
+                                      "asr_model": asr.get("model"), "asr_language": asr.get("language")}
     env: dict = {}
     align = 0.0
     if stem_ok:
@@ -1370,6 +1793,45 @@ def build_track_payload(track: dict, *, stem: str = "", duration: float | None =
         if abs(align) >= 0.25:
             timed = [dict(row, at_s=round(float(row["at_s"]) + align, 3))
                      for row in timed]
+        # 网上抓来的歌词可能根本不是这首（标题太泛、同名歌）：行首几乎都对不上人声起音就不用，
+        # 错的歌词比没有歌词更糟（字幕乱跳、嘴对不上）。本地 .lrc 和「为她所听」认出来的不判。
+        # 平台原版歌词（为她所听查到的）也要过匹配检查：同名歌/不同版本时间会对不上
+        if lrc_source and not str(lrc_source).startswith(("local:", "perception_timed", "asr", "user+asr", "asr+web")):
+            rate = lyric_match_rate(env, timed)
+            if rate is not None and rate < 0.35 and stem_ok and asr_fetcher is not None:
+                # 时间对不上不一定是别的歌（比如录音里有一段原版歌词没写的开头）：
+                # 用歌声识别的文字再核一次，文字明显是这首就照用（识别有错字，所以看二字片段重合）
+                try:
+                    asr_chk = asr_fetcher(track, stem) or {}
+                except Exception:  # noqa: BLE001
+                    asr_chk = {}
+                tm = text_match_rate([r.get("text") for r in (asr_chk.get("lines") or []) if isinstance(r, dict)],
+                                     [r.get("text") for r in timed if isinstance(r, dict)])
+                if tm is not None and tm >= 0.2:
+                    rate = None
+            if rate is not None and rate < 0.35:
+                timed = []
+                lyrics = ""
+                official_saved = {"rejected": True, "source": lrc_source, "match_rate": round(rate, 2)}
+                lrc_source = ""
+                # 第四十八轮：网上歌词拒用后不能就此没词——改用「为她所听」歌声识别出的句子
+                # （以前这里直接落到「估计」，识别好的 51 句白白丢掉，舞台和口型都没有歌词）
+                if stem_ok and asr_fetcher is not None:
+                    try:
+                        asr_fb = asr_fetcher(track, stem) or {}
+                    except Exception:  # noqa: BLE001
+                        asr_fb = {}
+                    asr_lines_fb = list(asr_fb.get("lines") or [])
+                    if asr_lines_fb:
+                        asr_lines_fb = clean_asr_lines(asr_lines_fb, env) or asr_lines_fb
+                        timed = [{"at_s": r["at_s"], "text": r["text"]} for r in asr_lines_fb]
+                        lrc_source = "asr"
+                        lyrics = "\n".join(r["text"] for r in timed)
+                        official_saved = {"source": "asr", "timed": timed,
+                                          "lines": [r["text"] for r in timed],
+                                          "web_rejected": official_saved,
+                                          "asr_model": asr_fb.get("model"),
+                                          "asr_language": asr_fb.get("language")}
 
     dur = float(duration or 0.0) or float((env or {}).get("duration") or 0.0)
     if dur <= 0 and stem_ok:

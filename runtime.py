@@ -510,6 +510,7 @@ def resolve_paths(data_dir: Path, host_section: dict | None = None) -> dict:
         "sep_model_dir": sep_model_dir,
         "tier_override": str(pick("tier_override") or ""),
         "precision": str(pick("precision") or "auto"),
+        "device": _remember_device(str(pick("device") or "auto")),
         "sep_backend": str(pick("sep_backend") or "bs_roformer"),
         "key_shift": int(pick("key_shift") or 0) if str(pick("key_shift") or "0").lstrip("-").isdigit() else 0,
         "vocal_register_shift": max(-12, min(12, int(pick("vocal_register_shift") or 0)))
@@ -566,6 +567,17 @@ def _precision_for(gpu: dict | None, configured: str) -> str:
     return "fp16"
 
 
+# 第五十五轮：设置页「计算设备」auto / cuda / cpu。以前存了但 plan_for 从没读过——选 CPU 不生效。
+# resolve_paths 每次读配置时记下，plan_for 统一按它执行（不用改 9 处调用）。
+_DEVICE_PREF = ["auto"]
+
+
+def _remember_device(value: str) -> str:
+    value = (value or "auto").strip().lower()
+    _DEVICE_PREF[0] = value if value in ("auto", "cuda", "cpu") else "auto"
+    return _DEVICE_PREF[0]
+
+
 def plan_for(probe: dict | None = None, override: str = "",
              configured_precision: str = "auto", max_parallel: int = 0) -> dict:
     """Build the execution plan for the *current* machine state."""
@@ -594,6 +606,10 @@ def plan_for(probe: dict | None = None, override: str = "",
     parallel = int(plan["parallel"])
     max_segment = 30.0
 
+    if _DEVICE_PREF[0] == "cpu" and gpu:
+        # 用户在设置里指定「只用 CPU」：照 CPU 路线走（和没有可用显卡的机器一样）
+        gpu = None
+        warnings.append("设置里选了「只用 CPU」：分离/变声走 CPU 加速。")
     if not gpu:
         device = sep_device = "cpu"
         precision = "fp32"
@@ -784,6 +800,26 @@ def without_dead_proxy(env: dict) -> dict:
     return clean
 
 
+_CPU_ENV: dict = {}
+
+
+def cpu_thread_env() -> dict:
+    if _CPU_ENV:
+        return dict(_CPU_ENV)
+    logical = os.cpu_count() or 1
+    cores = logical
+    try:
+        out = _run_quiet(["powershell", "-NoProfile", "-Command",
+                          "(Get-CimInstance Win32_Processor | Measure-Object NumberOfCores -Sum).Sum"], timeout=8.0)
+        cores = int(out.strip() or logical)
+    except Exception:  # noqa: BLE001
+        pass
+    n = max(1, cores) if cores <= 2 else max(2, min(cores - 1 if cores <= 8 else cores - 2, 32))
+    _CPU_ENV.update({"OMP_NUM_THREADS": str(n), "MKL_NUM_THREADS": str(n),
+                     "OPENBLAS_NUM_THREADS": str(n), "KMP_BLOCKTIME": "1"})
+    return dict(_CPU_ENV)
+
+
 def _clean_env(extra: dict | None = None) -> dict:
     env = dict(os.environ)
     for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "VIRTUAL_ENV", "CONDA_PREFIX"):
@@ -796,6 +832,10 @@ def _clean_env(extra: dict | None = None) -> dict:
     ffmpeg = _find_ffmpeg()
     if ffmpeg:
         env["PATH"] = os.path.dirname(ffmpeg) + os.pathsep + env.get("PATH", "")
+    # 第五十五轮：CPU 加速——按物理核设定 OpenMP/MKL 线程（PyTorch、CTranslate2、onnxruntime 都读这几个），
+    # 留 1~2 核给系统和唱歌舞台；用户已经设过的不覆盖。
+    for key, value in cpu_thread_env().items():
+        env.setdefault(key, value)
     if extra:
         for key, value in extra.items():
             if value is None:

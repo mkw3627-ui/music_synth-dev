@@ -165,6 +165,8 @@ class Pipeline:
         # 插件构造时挂上：track -> (lrc_text, source)。流水线里预生成口型轨
         # 要用它去抓官方歌词，和播放时走同一条逻辑。
         self.lrc_fetcher = None
+        self.asr_fetcher = None
+        self.web_fetcher = None
 
     # ---------------- helpers ----------------
     def _log(self, message: str) -> None:
@@ -624,7 +626,8 @@ class Pipeline:
 
         track_id = str(track.get("id") or "")
         payload = lipsync.build_track_payload(
-            track, stem=stem, duration=duration, lrc_fetcher=self.lrc_fetcher)
+            track, stem=stem, duration=duration, lrc_fetcher=self.lrc_fetcher,
+            asr_fetcher=self.asr_fetcher, web_fetcher=self.web_fetcher)
         payload["stem_kind"] = str(stem_kind or "")
         target = out_dir / "lips.json"
         tmp = target.with_suffix(".json.part")

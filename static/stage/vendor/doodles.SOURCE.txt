@@ -1,0 +1,2 @@
+oreo-design/doodle-icons main 分支（MIT），2026-11-17 第53轮下载；icons/*.svg 转成路径数据 doodles.json
+zip sha256 174f43bd2ca3183614eba18f1ed5e9f584e5a8173b94a3b0b49d8b7ef1a8c851

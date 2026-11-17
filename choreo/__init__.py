@@ -12,6 +12,6 @@ P1 阶段：只做规则导演，不接本地大模型。
 """
 from __future__ import annotations
 
-GENERATOR = "choreo 0.1"
+GENERATOR = "choreo 0.2"
 
 __all__ = ["GENERATOR"]

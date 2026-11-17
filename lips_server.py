@@ -75,7 +75,8 @@ _LAST_ERROR = ""
 # 也可以随时用 ?track=<id> 点播。路径都限制在插件的 work 目录里。
 _SHOWS: dict[str, str] = {}      # track_id -> show.json 绝对路径
 _SHOW_ROOT = ""                  # <work>；兜底找 <work>/tracks/<id>/show.json
-_STATIC_ROOTS: list[str] = []    # static/stage、static/fonts（绝对路径）
+_STATIC_ROOTS: list[str] = []
+_MODEL_ROOT = ""                  # 舞台工作室预演图用的角色模型目录（只读）    # static/stage、static/fonts（绝对路径）
 # 试听缓存：放在插件数据目录的 preview/ 下，不放插件安装目录。
 # 插件目录里的文件在宿主升级替换时可能被占用，导致「替换文件」失败。
 _PREVIEW_ROOT = ""
@@ -85,6 +86,7 @@ _MIME = {
     ".mjs": "text/javascript; charset=utf-8",
     ".css": "text/css; charset=utf-8",
     ".json": "application/json; charset=utf-8",
+    ".moc3": "application/octet-stream",
     ".html": "text/html; charset=utf-8",
     ".svg": "image/svg+xml",
     ".png": "image/png",
@@ -339,6 +341,19 @@ def clear() -> None:
         _POS["live"] = False
 
 
+_STAGE_MODES: dict[str, dict] = {}      # track_id -> {"mode": "tegaki"|"stage"|"", "kit": "..."}
+_STAGE_MODE_DEFAULT: dict = {}
+
+
+def set_stage_modes(table: dict, default: dict | None = None) -> None:
+    """登记每首歌的演出模式/套路和全局默认（/show.json 发出时写进 style）。"""
+    with _LOCK:
+        _STAGE_MODES.clear()
+        _STAGE_MODES.update({str(k): dict(v) for k, v in (table or {}).items()})
+        _STAGE_MODE_DEFAULT.clear()
+        _STAGE_MODE_DEFAULT.update(dict(default or {}))
+
+
 def set_show_root(root: str | os.PathLike) -> None:
     """登记 show.json 的根（插件 work 目录）；``?track=<id>`` 靠它兜底找文件。"""
     global _SHOW_ROOT
@@ -346,6 +361,14 @@ def set_show_root(root: str | os.PathLike) -> None:
         _SHOW_ROOT = str(Path(root).expanduser()) if str(root or "").strip() else ""
     except (OSError, ValueError):
         _SHOW_ROOT = ""
+
+
+def set_model_root(path: str | os.PathLike) -> None:
+    global _MODEL_ROOT
+    try:
+        _MODEL_ROOT = str(Path(path).resolve()) if str(path or "").strip() else ""
+    except (OSError, ValueError):
+        _MODEL_ROOT = ""
 
 
 def set_static_roots(*roots: str | os.PathLike) -> None:
@@ -474,9 +497,26 @@ class _Handler(BaseHTTPRequestHandler):
         except OSError:
             self._send(404, b'{"ok": false, "error": "show unreadable"}')
             return
+        # 第五十二轮：演出模式（手书分镜 / 原舞台）和手书套路是「播放设置」，不写进编排文件——发出时现加
+        with _LOCK:
+            sm = dict(_STAGE_MODES.get(tid) or {})
+            dm = dict(_STAGE_MODE_DEFAULT)
+        mode = sm.get("mode") or dm.get("mode") or ""
+        kit = sm.get("kit") or dm.get("kit") or ""
+        if mode or kit:
+            try:
+                doc = json.loads(body.decode("utf-8"))
+                st = doc.setdefault("style", {})
+                if mode:
+                    st["mode"] = mode
+                if kit:
+                    st["kit"] = kit
+                body = json.dumps(doc, ensure_ascii=False).encode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                pass
         self._send_blob(200, body, "application/json; charset=utf-8")
 
-    def _serve_stage(self, rel: str) -> None:
+    def _serve_stage(self, rel: str, roots_override=None) -> None:
         """``/stage/<file>``：只发 static/stage 和 static/fonts 里的文件。"""
         decoded = unquote(str(rel or ""))
         parts = decoded.split("/")
@@ -486,8 +526,11 @@ class _Handler(BaseHTTPRequestHandler):
                 or re.match(r"^[A-Za-z]:", decoded)):
             self._send(403, b'{"ok": false, "error": "bad path"}')
             return
-        with _LOCK:
-            roots = list(_STATIC_ROOTS)
+        if roots_override is not None:
+            roots = list(roots_override)
+        else:
+            with _LOCK:
+                roots = list(_STATIC_ROOTS)
         target = ""
         for root in roots:
             try:
@@ -655,6 +698,9 @@ class _Handler(BaseHTTPRequestHandler):
                     "polled_s_ago": round(time.time() - float(_HITS["last"]), 1)
                     if _HITS["last"] else None,
                     "client_version": int(_HITS.get("version") or 0),
+                    # 观测用（第十九轮D）：网页 /audio_play 或 /audio_fail 的最近一次上报，只读
+                    "audio_seq": int(_HITS.get("audio_seq") or 0),
+                    "audio_state": _HITS.get("audio_state") or "",
                     "face": _HITS.get("face") or "",
                     "face_writes": int(_HITS.get("face_writes") or 0),
                     "face_hooked": int(_HITS.get("face_hooked", -1)),
@@ -688,6 +734,13 @@ class _Handler(BaseHTTPRequestHandler):
         if route.startswith("/preview/"):
             self._serve_preview(route[len("/preview/"):])
             return
+        if route.startswith("/model/"):
+            # 舞台工作室预演图用：当前角色模型文件（只读，根限定在登记的模型目录）
+            with _LOCK:
+                mroot = _MODEL_ROOT
+            if mroot:
+                self._serve_stage(route[len("/model/"):], roots_override=[mroot])
+                return
         self._send(404, b'{"ok": false, "error": "not found"}')
 
 
@@ -745,6 +798,9 @@ def status() -> dict:
             "mode": _STATE["mode"],
             "polls": int(_HITS["polls"]),
             "client_version": int(_HITS.get("version") or 0),
+            # 观测用（第十九轮D）：网页 /audio_play 或 /audio_fail 的最近一次上报，只读
+            "audio_seq": int(_HITS.get("audio_seq") or 0),
+            "audio_state": _HITS.get("audio_state") or "",
             "face": _HITS.get("face") or "",
             "face_writes": int(_HITS.get("face_writes") or 0),
             "face_hooked": int(_HITS.get("face_hooked", -1)),

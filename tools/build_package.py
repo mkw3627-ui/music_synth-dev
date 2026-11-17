@@ -35,6 +35,9 @@ PID = 'music_synth'
 EXCLUDE_DIR_NAMES = {
     '__pycache__', '.pytest_cache', '.venv', 'node_modules', '.git',
     '_trash', 'claude-backups', 'NEKO_PLUGIN_BACKUPS', 'dist', 'tools',
+    # host/：宿主页面的舞台加载器 + 安装脚本，用户单独运行，不进插件包
+    # .github/.vscode：仓库配置
+    'host', '.github', '.vscode',
 }
 
 

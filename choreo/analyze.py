@@ -177,6 +177,13 @@ def _label_sections(segments: list[dict], duration: float) -> list[str]:
                               if energies[i] >= max(0.55 * top, 0.6 * max_e)][:3]
             chorus_members.sort()
     chorus_set = set(chorus_members)
+    # 全曲最强的段若够强、又没被选进副歌组，纳入副歌（v2 §5.2：最后一次副歌是全曲最强）
+    if chorus_members:
+        middle = list(range(1, max(1, n - 1)))
+        strongest = max(middle, key=lambda i: energies[i])
+        if strongest not in chorus_set and energies[strongest] >= 0.92 * max(energies[i] for i in chorus_members):
+            chorus_members = sorted(chorus_members + [strongest])
+            chorus_set = set(chorus_members)
     chorus_e = float(np.mean([energies[i] for i in chorus_members])) if chorus_members else max_e
 
     labels = ["verse"] * n
@@ -483,6 +490,7 @@ def _pitch_events(stem: str, lines: list[dict], sr: int = 22050) -> dict:
         if vals.size < 8:
             continue
         med = float(np.median(vals))
+        p85 = float(np.percentile(vals, 85))
         if med <= 0:
             continue
         # 高音：比本句中位数高 3 个半音以上，持续 >= 0.12s

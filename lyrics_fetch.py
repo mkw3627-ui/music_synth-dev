@@ -273,22 +273,31 @@ def _netease_search_by_lyric(lyric_text: str, timeout: float, limit: int = 6) ->
     取官方 LRC，绝不把 ASR 文本当歌词。
     """
     plain = re.sub(r"\[[^\]]*\]", " ", str(lyric_text or ""))
-    han = re.findall(r"[\u3400-\u9fff]+", plain)
-    # 跳过开头 1 段（常是上一句残尾/幽灵字），取接下来最长的几段
-    picks = [h for h in han[1:] if len(h) >= 3][:3] or [h for h in han if len(h) >= 2][:3]
-    if not picks:
+    han = re.findall(r"[㐀-鿿぀-ヿ]+", plain)
+    # 识别结果错字多：几段拼在一起搜，一个错字就搜不到。改成逐句搜（均匀取几句），
+    # 每句的结果按名次投票——同一首歌会被多句命中
+    pool = [h for h in han[1:] if 5 <= len(h) <= 16] or [h for h in han if len(h) >= 4]
+    if not pool:
         return []
-    q = urllib.parse.quote(" ".join(picks))
-    url = f"https://music.163.com/api/search/get?s={q}&type=1006&limit={limit}&offset=0"
-    try:
-        data = _http_json(url, timeout=timeout)
-    except Exception:
-        return []
-    out = []
-    for s in ((data.get("result") or {}).get("songs")) or []:
-        out.append({"id": str(s.get("id")), "name": str(s.get("name") or ""),
-                    "artists": [str(a.get("name") or "") for a in (s.get("artists") or [])]})
-    return out
+    step = max(1, len(pool) // 5)
+    picks = pool[::step][:5]
+    votes: dict = {}
+    info: dict = {}
+    for q0 in picks:
+        for typ in (1006, 1):
+            q = urllib.parse.quote(q0)
+            url = f"https://music.163.com/api/search/get?s={q}&type={typ}&limit={limit}&offset=0"
+            try:
+                data = _http_json(url, timeout=timeout)
+            except Exception:
+                continue
+            for rank, s in enumerate(((data.get("result") or {}).get("songs")) or []):
+                sid = str(s.get("id"))
+                votes[sid] = votes.get(sid, 0.0) + 1.0 / (1 + rank)
+                info.setdefault(sid, {"id": sid, "name": str(s.get("name") or ""),
+                                      "artists": [str(a.get("name") or "") for a in (s.get("artists") or [])]})
+    ranked = sorted(votes, key=lambda k: -votes[k])
+    return [info[k] for k in ranked[:limit] if votes[k] >= 1.0]
 
 
 def _drop_name_lines(lrc: str, names: "list[str]") -> str:
@@ -372,7 +381,7 @@ def clean_lrc(lrc_text: str, artist: str = "") -> str:
 
 
 def fetch_official_lrc(title: str, artist: str, source_path: str | None = None,
-                       timeout: float = 15.0) -> tuple[str | None, str]:
+                       timeout: float = 15.0, web: bool = False) -> tuple[str | None, str]:
     """拉官方带时间戳 LRC。返回 (lrc_text, source) 或 (None, reason)。
 
     lrc_text 为清洗后、保留 ``[时间戳] 歌词`` 的 LRC；source/reason 描述成败，
@@ -395,7 +404,12 @@ def fetch_official_lrc(title: str, artist: str, source_path: str | None = None,
                 if cleaned:
                     return cleaned, f"local:{cand.name}"
 
-    # 2) 网易云公开接口
+    # 2026-11-16 用户决定：不再上网搜歌词（容易搜到同名别的歌）。歌词只来自
+    # 本地 .lrc、「为她所听」记下的原版歌词、原创歌用户填的歌词，兜底是歌声识别。
+    if not web:
+        return None, "no_local_lrc"
+
+    # 2) 网易云公开接口（web=True 时才用，默认不用）
     if env_flag("MUSIC_SYNTH_LYRICS_ALLOW_NETEASE", True):
         try:
             sid = _netease_search(title, artist, timeout)

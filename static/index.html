@@ -3577,6 +3577,8 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const [audio, setAudio] = useState(null);
     const [audioBusy, setAudioBusy] = useState("");
     const [confirm, setConfirm] = useState(null);
+    const [showOpen, setShowOpen] = useState("");
+    const [showInfo, setShowInfo] = useState(null);
     const [model, setModel] = useState("");
     const [targets, setTargets] = useState([]);
     const [targetPid, setTargetPid] = useState("");
@@ -3620,6 +3622,24 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       const r = await callEntry(api, "ms_import", { path: p, split: importSplit }, 3e5);
       setNotice({ tone: r.ok ? "info" : "error", text: r.ok ? importSplit ? "已切成 " + (r.tracks || []).length + " 首" : "已导入 1 首" : "没导入成功：" + (r.error || "") });
       onRefresh();
+    });
+    // P5 · T5-B：舞台编排（预览 / 整首重抽 / 切换风格 / 锁定）
+    const SHOW_PRESET_CN = { ballad: "抒情", pop: "流行", edm: "电子", rock: "摇滚", cute: "可爱", ancient: "古风", jazz: "爵士", dark: "暗黑" };
+    const SHOW_EMO_CN = { joy: "喜悦", tender: "温柔", longing: "思念", sad: "伤感", proud: "昂扬", determined: "坚定", playful: "俏皮" };
+    const SHOW_SEC_CN = { intro: "前奏", verse: "主歌", pre: "预副歌", chorus: "副歌", bridge: "桥段", final: "最后副歌", outro: "尾声" };
+    const showToggle = (t) => {
+      if (showOpen === t.id) { setShowOpen(""); setShowInfo(null); return; }
+      setShowOpen(t.id); setShowInfo(null);
+      run("show:" + t.id, async () => {
+        const r = await callEntry(api, "ms_show_preview", { track_id: t.id }, 3e4);
+        setShowInfo(r);
+      });
+    };
+    const showSet = (t, args, msg) => run("showset:" + t.id, async () => {
+      setNotice({ tone: "info", text: msg });
+      const r = await callEntry(api, "ms_show_set", Object.assign({ track_id: t.id }, args), 9e5);
+      setShowInfo(r);
+      setNotice({ tone: r && r.ok ? "info" : "error", text: r && r.ok ? (r.rebuilt ? "编排已重新生成，下次唱这首就用新的" : "已保存") : "没成功：" + (r && r.error || "") });
     });
     const preview = (t) => run("audio:" + t.id, async () => {
       setAudioBusy("正在读取成品…");
@@ -3806,7 +3826,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           const st = tagOf(PHASE, t.status);
           const pct = Math.max(0, Math.min(100, Number(t.progress || 0)));
           const art = t.artifacts || {};
-          return /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "flex-start", gap: 14, flexWrap: "wrap", background: "#fff", border: "1px solid " + LINE, borderRadius: 16, padding: 14, boxShadow: "0 4px 14px rgba(142,159,187,0.06)" }, children: [
+          return /* @__PURE__ */ jsxs(Fragment, { children: [/* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "flex-start", gap: 14, flexWrap: "wrap", background: "#fff", border: "1px solid " + LINE, borderRadius: 16, padding: 14, boxShadow: "0 4px 14px rgba(142,159,187,0.06)" }, children: [
             /* @__PURE__ */ jsx("span", { style: { width: 44, height: 44, borderRadius: 13, background: "linear-gradient(150deg,#ffe5ef,#f4d6ea)", color: BRAND_DEEP, display: "grid", placeItems: "center", fontSize: 18, flex: "0 0 auto" }, children: "♪" }),
             /* @__PURE__ */ jsxs("div", { style: { flex: "1 1 240px", minWidth: 180, display: "flex", flexDirection: "column", gap: 6 }, children: [
               /* @__PURE__ */ jsxs(Row, { style: { gap: 8 }, children: [
@@ -3829,10 +3849,47 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
             ] }),
             /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap", flex: "0 0 auto" }, children: [
               t.playable === false ? /* @__PURE__ */ jsx(Muted, { children: "成品文件不在了" }) : art.final ? /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: () => preview(t), children: busy === "audio:" + t.id ? "读取中…" : "试听" }) : null,
+              art.final ? /* @__PURE__ */ jsx(Btn, { disabled: !!busy && busy !== "show:" + t.id, onClick: () => showToggle(t), children: showOpen === t.id ? "收起编排" : "舞台编排" }) : null,
               t.status !== "running" ? /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: () => processTrack(t, !!art.final), children: busy === "proc:" + t.id ? "启动中…" : art.final ? "重新唱一遍" : t.resumable || art.vocal_wav || art.vocal_clean || art.vocals ? "继续唱" : "让她唱" }) : null,
               /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: () => identify(t), children: busy === "id:" + t.id ? "识别中…" : "校准歌名" }),
               /* @__PURE__ */ jsx(Btn, { style: { color: "#c93c3c", borderColor: "rgba(201,60,60,0.28)" }, onClick: () => remove(t), children: "删除" })
             ] })
+          ] }, t.id),
+          showOpen === t.id ? /* @__PURE__ */ jsx("div", { style: { margin: "-6px 0 4px 58px", padding: 12, borderRadius: 14, background: "rgba(248,250,252,0.95)", border: "1px solid " + LINE, fontSize: 12.5, color: INK_2, lineHeight: 1.8 }, children: !showInfo ? /* @__PURE__ */ jsx(Muted, { children: busy === "show:" + t.id ? "读取编排…" : "" }) : !showInfo.ok ? /* @__PURE__ */ jsx(Err, { children: showInfo.error || "读取失败" }) : /* @__PURE__ */ jsxs(Col, { style: { gap: 8 }, children: [
+            showInfo.exists ? /* @__PURE__ */ jsxs("div", { children: [
+              "风格：", SHOW_PRESET_CN[showInfo.preset] || showInfo.preset || "-",
+              showInfo.chosen_preset ? "（手动）" : "（自动）",
+              " · 种子 ", String(showInfo.seed),
+              " · ", String(showInfo.lines), " 句",
+              showInfo.locked ? " · 已锁定" : "",
+              /* @__PURE__ */ jsx("br", {}),
+              "段落：", (showInfo.sections || []).map((x) => (SHOW_SEC_CN[x.id] || x.id) + " " + x.t0 + "s").join(" → "),
+              /* @__PURE__ */ jsx("br", {}),
+              "情绪：", Object.entries(showInfo.emotions || {}).map(([k, v]) => (SHOW_EMO_CN[k] || k) + " " + v).join("、"),
+              /* @__PURE__ */ jsx("br", {}),
+              "开头几句：", (showInfo.first_lines || []).join(" / ")
+            ] }) : /* @__PURE__ */ jsx(Muted, { children: "这首还没有舞台编排，第一次唱的时候会自动生成；也可以在这里先生成。" }),
+            /* @__PURE__ */ jsxs(Row, { style: { gap: 6, flexWrap: "wrap" }, children: [
+              /* @__PURE__ */ jsx(Btn, { disabled: !!busy || showInfo.locked, onClick: () => showSet(t, { reroll: true }, "正在整首重抽编排（约 20~60 秒）…"), children: busy === "showset:" + t.id ? "处理中…" : showInfo.exists ? "整首重抽" : "生成编排" }),
+              /* @__PURE__ */ jsxs("select", { disabled: !!busy || showInfo.locked, value: showInfo.chosen_preset || "", onChange: (e) => showSet(t, { preset: e.target.value }, "正在按新风格生成编排…"), style: { fontSize: 12.5, padding: "4px 8px", borderRadius: 10, border: "1px solid " + LINE, background: "#fff", color: INK }, children: [
+                /* @__PURE__ */ jsx("option", { value: "", children: "风格：自动" }),
+                (showInfo.presets || []).map((k) => /* @__PURE__ */ jsx("option", { value: k, children: "风格：" + (SHOW_PRESET_CN[k] || k) }, k))
+              ] }),
+              /* 第五十三轮：舞台模式（和「风格」并列）——原舞台：人物在场上 + 运镜；手书分镜：画面为主，人物偶尔出现 */
+              /* @__PURE__ */ jsxs("select", { disabled: !!busy, value: showInfo.show_mode || "", onChange: (e) => showSet(t, { mode: e.target.value }, "正在保存舞台模式…"), style: { fontSize: 12.5, padding: "4px 8px", borderRadius: 10, border: "1px solid " + LINE, background: "#fff", color: INK }, children: [
+                /* @__PURE__ */ jsx("option", { value: "", children: "舞台模式：默认（" + ((showInfo.default_mode || "stage") === "stage" ? "原舞台" : "手书分镜") + "）" }),
+                /* @__PURE__ */ jsx("option", { value: "stage", children: "舞台模式：原舞台" }),
+                /* @__PURE__ */ jsx("option", { value: "tegaki", children: "舞台模式：手书分镜" })
+              ] }),
+              (showInfo.show_mode || showInfo.default_mode || "stage") !== "stage" ? /* @__PURE__ */ jsxs("select", { disabled: !!busy, value: showInfo.show_kit || "", onChange: (e) => showSet(t, { kit: e.target.value }, "正在保存手书风格…"), style: { fontSize: 12.5, padding: "4px 8px", borderRadius: 10, border: "1px solid " + LINE, background: "#fff", color: INK }, children: [
+                /* @__PURE__ */ jsx("option", { value: "", children: "手书：按曲风自动" }),
+                [["stitch", "缝线甜系"], ["collage", "贴纸拼贴"], ["arcade", "游戏界面"], ["denpa", "电波窗口"], ["paper", "稿纸手写"], ["neon", "霓虹夜"]].map((k) => /* @__PURE__ */ jsx("option", { value: k[0], children: "手书：" + k[1] }, k[0]))
+              ] }) : null,
+              /* @__PURE__ */ jsx(Btn, { disabled: !!busy || !showInfo.exists, onClick: () => showSet(t, { locked: !showInfo.locked }, showInfo.locked ? "正在解锁…" : "正在锁定…"), children: showInfo.locked ? "解锁" : "锁定这版" }),
+              showInfo.chosen_preset || showInfo.chosen_seed != null ? /* @__PURE__ */ jsx(Btn, { disabled: !!busy || showInfo.locked, onClick: () => showSet(t, { reset: true }, "正在恢复自动编排…"), children: "恢复自动" }) : null
+            ] }),
+            /* @__PURE__ */ jsx(Muted, { children: "锁定后，再唱这首会一直用这一版编排；想换就先解锁。单句重抽暂不提供（编排是整首一起排的，单改一句会和前后句的避重规则冲突）。" })
+          ] }) }) : null
           ] }, t.id);
         }) }),
         audioBusy && !audio ? /* @__PURE__ */ jsx(Muted, { children: audioBusy }) : null,
@@ -3922,6 +3979,9 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const [advGuidance, setAdvGuidance] = useState("7");
     const [advSeed, setAdvSeed] = useState("-1");
     const [candidates, setCandidates] = useState("4");
+    // 第五十三轮：舞台模式（和「风格 / 编曲」并列）——原舞台 / 手书分镜，两种完全分开
+    const [stageMode, setStageMode] = useState("stage");
+    const [stageKit, setStageKit] = useState("");
     const [model, setModel] = useState("");
     const modelTouched = useRef(false);
     const loraTouched = useRef(false);
@@ -4110,7 +4170,9 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           seed: String(advSeed).trim() === "" ? -1 : Number(advSeed),
           candidates: Math.max(1, Math.min(6, Number(candidates) || 1)),
           model,
-          lora
+          lora,
+          stage_mode: stageMode,
+          stage_kit: stageMode === "tegaki" ? stageKit : ""
         }, 6e4);
         if (r && r.ok && r.job_id) {
           setJobId(String(r.job_id));
@@ -4311,6 +4373,16 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
                 onChange: (e) => setPrompt(e.target.value)
               }
             ) }),
+            /* @__PURE__ */ jsxs(Grid, { cols: 2, min: 180, gap: 14, children: [
+              /* @__PURE__ */ jsx(Field, { label: "舞台模式（唱的时候怎么演）", children: /* @__PURE__ */ jsxs(Select, { value: stageMode, onChange: (e) => setStageMode(e.target.value), children: [
+                /* @__PURE__ */ jsx("option", { value: "stage", children: "原舞台：人物在场上，运镜 + 背景 + 歌词" }),
+                /* @__PURE__ */ jsx("option", { value: "tegaki", children: "手书分镜：画面为主，人物偶尔出现" })
+              ] }) }),
+              stageMode === "tegaki" ? /* @__PURE__ */ jsx(Field, { label: "手书风格", children: /* @__PURE__ */ jsxs(Select, { value: stageKit, onChange: (e) => setStageKit(e.target.value), children: [
+                /* @__PURE__ */ jsx("option", { value: "", children: "按曲风自动" }),
+                [["stitch", "缝线甜系"], ["collage", "贴纸拼贴街头系"], ["arcade", "游戏界面系"], ["denpa", "电波窗口系"], ["paper", "稿纸手写系"], ["neon", "霓虹夜系"]].map((k) => /* @__PURE__ */ jsx("option", { value: k[0], children: k[1] }, k[0]))
+              ] }) }) : /* @__PURE__ */ jsx(Field, { label: " ", children: /* @__PURE__ */ jsx(Muted, { children: "做好后也能在「让她唱歌」里每首单独改。" }) })
+            ] }),
             /* @__PURE__ */ jsx(Field, { label: "歌词（留空或勾选纯音乐则生成纯伴奏）", children: /* @__PURE__ */ jsx(
               "textarea",
               {
@@ -5412,6 +5484,81 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       /* @__PURE__ */ jsx("path", { d: "M8.4 12h.01M12 12h.01M15.6 12h.01", strokeWidth: "2.2" })
     ] });
   }
+  // 第五十五轮：整个插件要部署的东西 + 每个下载源实测速度 + 本机硬件适配方案（只读，不安装）
+  function DeployOverview(props) {
+    const [data, setData] = useState(null);
+    const [busy, setBusy] = useState("");
+    const [err, setErr] = useState("");
+    const load = async (speed) => {
+      setBusy(speed ? "speed" : "load");
+      setErr("");
+      try {
+        const r = await callEntry(props.api, "ms_deploy_overview", { speed: !!speed }, speed ? 24e4 : 9e4);
+        setData((old) => speed ? r : Object.assign({}, r, { speed: old && old.speed }));
+      } catch (e) {
+        setErr(String(e && e.message || e));
+      }
+      setBusy("");
+    };
+    useEffect(() => { load(false); }, []);
+    const items = data && data.items || [];
+    const groups = [];
+    items.forEach((i) => { let g = groups.find((x) => x.name === i.group); if (!g) { g = { name: i.group, rows: [] }; groups.push(g); } g.rows.push(i); });
+    const ad = data && data.adapt;
+    const sp = data && data.speed;
+    const vtone = (v) => v === "很快" || v === "快" ? "success" : v === "一般" ? "neutral" : "warning";
+    const box = { padding: "12px 14px", borderRadius: 15, background: "rgba(248,250,252,0.9)", border: "1px solid " + LINE, display: "flex", flexDirection: "column", gap: 7 };
+    return /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 10 }, children: [
+      /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between", alignItems: "center" }, children: [
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 13.5, fontWeight: 700, color: INK }, children: "整个插件要装什么 · 下载快不快 · 这台电脑怎么跑" }),
+        /* @__PURE__ */ jsxs(Row, { style: { gap: 8 }, children: [
+          /* @__PURE__ */ jsx(Btn, { style: { ...ghostBtn, padding: "6px 12px", fontSize: 12 }, disabled: !!busy, onClick: () => load(false), children: busy === "load" ? "检测中…" : "重新检测" }),
+          /* @__PURE__ */ jsx(Btn, { style: { ...ghostBtn, padding: "6px 12px", fontSize: 12 }, disabled: !!busy, onClick: () => load(true), children: busy === "speed" ? "测速中（约 1 分钟）…" : "测下载速度" })
+        ] })
+      ] }),
+      err ? /* @__PURE__ */ jsx(Alert, { tone: "warning", children: err }) : null,
+      ad ? /* @__PURE__ */ jsxs("div", { style: box, children: [
+        /* @__PURE__ */ jsxs(Row, { style: { gap: 8, alignItems: "center" }, children: [
+          /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, fontWeight: 700, color: INK }, children: "本机适配" }),
+          /* @__PURE__ */ jsx(Pill, { tone: ad.backend === "cuda" ? "success" : "neutral", children: ad.backend === "cuda" ? "显卡加速" : "CPU 加速" })
+        ] }),
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_2, lineHeight: 1.6 }, children: ad.summary }),
+        Object.keys(ad.features || {}).map((k) => { const f = ad.features[k];
+          return /* @__PURE__ */ jsxs("div", { style: { fontSize: 11.5, color: INK, lineHeight: 1.6 }, children: [
+            /* @__PURE__ */ jsx("b", { children: k === "stage" ? "唱歌舞台" : f.label }),
+            "：",
+            k === "stage" ? f.label : (String(f.device).toUpperCase() + " · " + (f.quality_note || "")),
+            f.supported === false ? "（这台电脑不建议用）" : ""
+          ] }, k); }),
+        (ad.notes || []).map((n, i) => /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11.5, lineHeight: 1.6 }, children: "· " + n }, i))
+      ] }) : busy ? /* @__PURE__ */ jsx(Muted, { children: "正在检测这台电脑…" }) : null,
+      groups.map((g) => /* @__PURE__ */ jsxs("div", { style: box, children: [
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, fontWeight: 700, color: INK }, children: g.name }),
+        g.rows.map((i) => /* @__PURE__ */ jsxs("div", { style: { display: "grid", gridTemplateColumns: "minmax(0,1fr) auto", gap: "2px 10px", alignItems: "center" }, children: [
+          /* @__PURE__ */ jsxs("div", { style: { minWidth: 0 }, children: [
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 12, color: INK, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: i.label }),
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 11, color: INK_3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: "来源：" + i.source + (i.size_gb ? " · 约 " + i.size_gb + "GB" : "") })
+          ] }),
+          /* @__PURE__ */ jsx(Pill, { tone: i.ready ? "success" : i.required ? "warning" : "neutral", children: i.ready ? "已就绪" : i.required ? "需要安装" : "可选" })
+        ] }, i.key))
+      ] }, g.name)),
+      sp ? /* @__PURE__ */ jsxs("div", { style: box, children: [
+        /* @__PURE__ */ jsxs(Row, { style: { gap: 8, alignItems: "center" }, children: [
+          /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, fontWeight: 700, color: INK }, children: "下载测速" }),
+          /* @__PURE__ */ jsx(Pill, { tone: sp.all_ok ? "success" : "warning", children: sp.all_ok ? "全部能下" : "有下载源不通" }),
+          /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11 }, children: sp.ts + " · 每个源实下 " + sp.probe_mb + "MB" })
+        ] }),
+        (sp.groups || []).map((g) => /* @__PURE__ */ jsxs("div", { style: { display: "grid", gridTemplateColumns: "minmax(0,1fr) auto", gap: 10, alignItems: "center" }, children: [
+          /* @__PURE__ */ jsxs("div", { style: { fontSize: 12, color: INK }, children: [g.group, /* @__PURE__ */ jsx("span", { style: { color: INK_3, fontSize: 11 }, children: g.ok ? "  最快：" + g.best + " · " + g.mb_per_s + " MB/s" : "  所有源都不通" })] }),
+          /* @__PURE__ */ jsx(Pill, { tone: vtone(g.verdict), children: g.verdict })
+        ] }, g.group)),
+        /* @__PURE__ */ jsxs("details", { children: [
+          /* @__PURE__ */ jsx("summary", { style: { fontSize: 11.5, color: INK_2, cursor: "pointer" }, children: "每个下载源的明细" }, "s"),
+          (sp.rows || []).map((r, i) => /* @__PURE__ */ jsx("div", { style: { fontSize: 11, color: r.ok ? INK_2 : "#c93c3c", lineHeight: 1.6 }, children: (r.ok ? r.verdict + " " + r.mb_per_s + " MB/s · 首包 " + r.ttfb_ms + " ms" : "不通") + " · " + r.label + (r.error ? " · " + r.error : "") }, i))
+        ] })
+      ] }) : null
+    ] });
+  }
   function Onboarding(props) {
     const [step, setStep] = useState(() => {
       const n = Number(props.startAt || 1);
@@ -6335,7 +6482,8 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         "安装过程中可以继续用电脑；关掉这个窗口不会中断下载，下次打开会接着装。",
         /* @__PURE__ */ jsx("br", {}),
         "可以先去忙别的：关掉窗口不会中断，回来还能接着看。"
-      ] })
+      ] }),
+      mockMode ? null : /* @__PURE__ */ jsx(DeployOverview, { api: props.api })
     ] });
     const page5 = /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 18, alignItems: "center", textAlign: "center", padding: "14px 0 6px" }, children: [
       /* @__PURE__ */ jsx("span", { style: { width: 58, height: 58, borderRadius: 999, background: "#e8f7ef", color: "#1c8a58", display: "grid", placeItems: "center", boxShadow: "0 8px 20px rgba(28,138,88,0.12)" }, children: /* @__PURE__ */ jsx("svg", { width: "30", height: "30", viewBox: "0 0 24 24", children: /* @__PURE__ */ jsx("path", { d: "M5 12.5 9.6 17 19 7.2", fill: "none", stroke: "currentColor", strokeWidth: "2.4", strokeLinecap: "round", strokeLinejoin: "round" }) }) }),
@@ -6434,6 +6582,237 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     } catch (e) {
     }
   }
+  // ===================== 第四十三轮：舞台工作室（并入「为她而唱」侧栏，与其它页同一套卡片/按钮样式） =====================
+  var STAGE_ORIGIN = "http://127.0.0.1:48766";
+  var ST_CN = { pending: "待学习", learning: "学习中", learned: "已学完", removed: "已清理", rejected: "类别不符" };
+  var ST_TONE = { pending: "warning", learning: "neutral", learned: "success", removed: "neutral", rejected: "error" };
+  var GRP_CN = { scenes: "背景", bg_transitions: "背景转场", stingers: "全屏转场", frames: "边框", frames_ext: "边框（扩展）", filters: "滤镜", masks: "蒙版", lyric_in: "歌词入场", lyric_out: "歌词退场", camera: "运镜", lyric_plates: "歌词打底框", particles: "浮动粒子" };
+  var CAT_OPTS = [["frame", "框子 / 边框"], ["background", "背景"], ["text_plate", "文字底框 / 对话框"], ["particles", "浮动粒子 / 闪光"], ["lines", "线条"], ["sticker", "贴纸"]];
+  var PRESET_CN = { "": "融合（默认）", ballad: "抒情", pop: "流行", edm: "电子", rock: "摇滚", cute: "可爱", ancient: "古风", jazz: "爵士", dark: "暗黑" };
+  var stageLibsP = null;
+  function loadStageLibs() {
+    if (stageLibsP) return stageLibsP;
+    const files = ["stage-scenes.js", "stage-templates.js", "stage-frames.js"];
+    stageLibsP = files.reduce((p, f) => p.then(() => new Promise((res) => {
+      const s = document.createElement("script"); s.src = STAGE_ORIGIN + "/stage/" + f; s.onload = res; s.onerror = res; document.head.appendChild(s);
+    })), Promise.resolve());
+    return stageLibsP;
+  }
+  function StatTile(props) {
+    return /* @__PURE__ */ jsxs("div", { style: { padding: "12px 14px", borderRadius: 16, background: "rgba(255,246,250,0.86)", border: "1px solid rgba(224,45,118,0.07)", minWidth: 0 }, children: [
+      /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_3 }, children: props.label }),
+      /* @__PURE__ */ jsx("div", { style: { fontSize: 22, fontWeight: 700, color: props.color || INK, marginTop: 2 }, children: props.value })
+    ] });
+  }
+  function SubTabs(props) {
+    return /* @__PURE__ */ jsx("div", { style: { display: "flex", gap: 6, padding: 4, borderRadius: 14, background: "rgba(224,45,118,0.06)", width: "fit-content", flexWrap: "wrap" }, children: props.items.map(([k, label]) => /* @__PURE__ */ jsx("button", {
+      type: "button", onClick: () => props.onChange(k),
+      style: { border: 0, borderRadius: 10, padding: "7px 14px", fontSize: 13, fontFamily: FONT2, cursor: "pointer", fontWeight: props.value === k ? 700 : 500,
+        background: props.value === k ? "#fff" : "transparent", color: props.value === k ? BRAND_DEEP : INK_2, boxShadow: props.value === k ? "0 4px 12px rgba(224,45,118,0.14)" : "none" },
+      children: label
+    }, k)) });
+  }
+  function CanvasThumb(props) {
+    const ref = useRef(null);
+    useEffect(() => { loadStageLibs().then(() => { if (ref.current) try { props.draw(ref.current); } catch (e) { } }); }, [props.id]);
+    return /* @__PURE__ */ jsx("canvas", { ref, width: 480, height: 270, style: { width: "100%", aspectRatio: "16/9", display: "block", borderRadius: 14, background: "#1d1a2c" } });
+  }
+  function PageStage(props) {
+    const api = props.api;
+    const [tab, setTab] = useState("preview");
+    return /* @__PURE__ */ jsxs(Col, { style: { gap: 18 }, children: [
+      /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }, children: [
+        /* @__PURE__ */ jsxs("div", { children: [
+          /* @__PURE__ */ jsx("div", { style: { fontSize: 22, fontWeight: 800, color: INK }, children: "舞台工作室" }),
+          /* @__PURE__ */ jsx(Muted, { children: "唱歌时的舞台怎么演：先预演挑风格；素材在电脑空闲时自动学习、进化出新的边框和背景。" })
+        ] }),
+        /* @__PURE__ */ jsx(SubTabs, { value: tab, onChange: setTab, items: [["preview", "预演 · 选风格"], ["assets", "素材学习"], ["evolve", "学到的新素材"], ["library", "效果库与标签"]] })
+      ] }),
+      tab === "preview" ? /* @__PURE__ */ jsx(StagePreview, { api }) : null,
+      tab === "assets" ? /* @__PURE__ */ jsx(StageAssets, { api }) : null,
+      tab === "evolve" ? /* @__PURE__ */ jsx(StageEvolve, { api }) : null,
+      tab === "library" ? /* @__PURE__ */ jsx(StageLibrary, { api }) : null
+    ] });
+  }
+  function StagePreview(props) {
+    const api = props.api;
+    const [tracks, setTracks] = useState([]);
+    const [presets, setPresets] = useState([]);
+    const [tid, setTid] = useState("");
+    const [preset, setPreset] = useState("");
+    const [count, setCount] = useState(4);
+    const [busy, setBusy] = useState(false);
+    const [cands, setCands] = useState([]);
+    const [msg, setMsg] = useState("");
+    const [chosen, setChosen] = useState("");
+    const [kits, setKits] = useState([]);
+    const [defMode, setDefMode] = useState("");
+    useEffect(() => { callEntryLoose(api, "ms_studio", { action: "tracks" }).then((d) => { setTracks(d.tracks || []); setPresets(d.presets || []); setKits(d.kits || []); setDefMode(d.default_mode || ""); if ((d.tracks || [])[0]) setTid(d.tracks[0].id); }).catch((e) => setMsg(String(e.message || e))); }, []);
+    const cur = tracks.find((t) => t.id === tid);
+    // 第五十二轮：演出模式（手书分镜 / 原舞台）和手书套路，按歌保存
+    const setMode = async (mode, kit) => {
+      if (!tid) return;
+      try {
+        await callEntryLoose(api, "ms_studio", { action: "mode", track_id: tid, mode, kit });
+        setTracks(tracks.map((t) => t.id === tid ? { ...t, mode, kit } : t));
+        setMsg("已保存：" + (mode === "stage" ? "原舞台（人物一直在场上）" : "手书分镜" + (kit ? " · " + ((kits.find((k) => k[0] === kit) || [0, kit])[1]) : " · 按曲风自动")) + "，下次唱这首时生效");
+      } catch (e) { setMsg("保存失败：" + (e.message || e)); }
+    };
+    const curMode = (cur && cur.mode) || defMode || "stage";
+    const gen = async () => {
+      setBusy(true); setCands([]); setMsg("正在生成预演图（每张约 10 秒，不出声）…");
+      try { const d = await callEntryLoose(api, "ms_studio", { action: "styles", track_id: tid, preset, count }, 9e5); setCands(d.candidates || []); setMsg(""); }
+      catch (e) { setMsg("生成失败：" + (e.message || e)); }
+      setBusy(false);
+    };
+    const choose = async (c) => {
+      setChosen(c.preset + c.seed); setMsg("正在应用这个风格…");
+      try { await callEntryLoose(api, "ms_studio", { action: "choose", track_id: tid, preset: c.preset, seed: c.seed }, 3e5); setMsg("已选用：" + (PRESET_CN[c.preset] || c.preset) + "（这首歌下次唱就用这个舞台）"); setTracks(tracks.map((t) => t.id === tid ? { ...t, chosen: c.preset } : t)); }
+      catch (e) { setMsg("应用失败：" + (e.message || e)); }
+    };
+    return /* @__PURE__ */ jsxs(Col, { style: { gap: 16 }, children: [
+      /* @__PURE__ */ jsx(Panel, { title: "选一首歌，看看它在舞台上的样子", extra: cur ? /* @__PURE__ */ jsxs(Row, { children: [/* @__PURE__ */ jsx(Pill, { children: "自动：" + (PRESET_CN[cur.preset] || cur.preset || "-") }), cur.chosen ? /* @__PURE__ */ jsx(Pill, { tone: "success", children: "已选：" + (PRESET_CN[cur.chosen] || cur.chosen) }) : /* @__PURE__ */ jsx(Pill, { tone: "success", children: "当前：融合" })] }) : null, children: /* @__PURE__ */ jsxs(Col, { style: { gap: 12 }, children: [
+        /* @__PURE__ */ jsxs("div", { style: { display: "grid", gridTemplateColumns: "minmax(220px,2fr) minmax(150px,1fr) minmax(110px,.7fr) auto", gap: 10, alignItems: "center" }, children: [
+          /* @__PURE__ */ jsx(Select, { value: tid, onChange: (e) => setTid(e.target.value), children: tracks.map((t) => /* @__PURE__ */ jsx("option", { value: t.id, children: t.title }, t.id)) }),
+          /* @__PURE__ */ jsxs(Select, { value: preset, onChange: (e) => setPreset(e.target.value), children: [/* @__PURE__ */ jsx("option", { value: "", children: "融合 + 几种单一风格" }), presets.map((p) => /* @__PURE__ */ jsx("option", { value: p, children: PRESET_CN[p] || p }, p))] }),
+          /* @__PURE__ */ jsx(Select, { value: count, onChange: (e) => setCount(+e.target.value), children: [2, 4, 6].map((n) => /* @__PURE__ */ jsx("option", { value: n, children: n + " 张" }, n)) }),
+          /* @__PURE__ */ jsx(Btn, { style: PRIMARY_BTN, disabled: busy || !tid, onClick: gen, children: busy ? "生成中…" : "生成预演图" })
+        ] }),
+        /* @__PURE__ */ jsxs("div", { style: { display: "grid", gridTemplateColumns: "auto minmax(180px,1fr) minmax(180px,1fr)", gap: 10, alignItems: "center" }, children: [
+          /* @__PURE__ */ jsx(Muted, { children: "演出方式" }),
+          /* @__PURE__ */ jsxs(Select, { value: curMode, onChange: (e) => setMode(e.target.value, e.target.value === "stage" ? "" : ((cur && cur.kit) || "")), children: [
+            /* @__PURE__ */ jsx("option", { value: "tegaki", children: "手书分镜（画面为主，人物偶尔出现）" }),
+            /* @__PURE__ */ jsx("option", { value: "stage", children: "原舞台（人物一直在场上、运镜）" })
+          ] }),
+          /* @__PURE__ */ jsxs(Select, { value: (cur && cur.kit) || "", disabled: curMode === "stage", onChange: (e) => setMode("tegaki", e.target.value), children: [
+            /* @__PURE__ */ jsx("option", { value: "", children: "手书风格：按曲风自动" })
+          ].concat(kits.map((k) => /* @__PURE__ */ jsx("option", { value: k[0], children: "手书风格：" + k[1] }, k[0]))) })
+        ] }),
+        /* @__PURE__ */ jsx(Muted, { children: "不选也行：默认用「融合」——主歌、副歌、桥段各用一套互相搭配的主题，副歌每次回到同一套，既有变化又统一。想整首固定一种风格，就在下面挑一张点「用这个」。" }),
+        msg ? /* @__PURE__ */ jsx(Soft, { style: { padding: "10px 14px", fontSize: 12.5, color: INK_2 }, children: msg }) : null
+      ] }) }),
+      cands.length ? /* @__PURE__ */ jsx(Grid, { min: 360, gap: 16, children: cands.map((c) => /* @__PURE__ */ jsx(Panel, { hover: true, style: { padding: 12, outline: chosen === c.preset + c.seed ? "2px solid " + BRAND : "none" }, children: c.ok ? /* @__PURE__ */ jsxs(Col, { style: { gap: 10 }, children: [
+        /* @__PURE__ */ jsx("img", { src: STAGE_ORIGIN + c.image + "?v=" + c.seed, style: { width: "100%", aspectRatio: "16/9", objectFit: "cover", borderRadius: 14, display: "block", background: "#111" } }),
+        /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between" }, children: [
+          /* @__PURE__ */ jsxs(Row, { children: [/* @__PURE__ */ jsx(Pill, { children: PRESET_CN[c.preset] || c.preset }), /* @__PURE__ */ jsx(Muted, { children: "种子 " + c.seed })] }),
+          /* @__PURE__ */ jsx(Btn, { style: chosen === c.preset + c.seed ? {} : PRIMARY_BTN, onClick: () => choose(c), children: chosen === c.preset + c.seed ? "已选用" : "用这个" })
+        ] })
+      ] }) : /* @__PURE__ */ jsx(Err, { children: (c.preset || "") + "：" + (c.error || "失败") }) }, c.preset + c.seed)) }) : (!busy ? /* @__PURE__ */ jsx(Empty, { children: "还没有预演图。选好歌，点「生成预演图」。" }) : null)
+    ] });
+  }
+  function StageAssets(props) {
+    const api = props.api;
+    const [ov, setOv] = useState(null);
+    const [cat, setCat] = useState("frame");
+    const [n, setN] = useState(4);
+    const [busy, setBusy] = useState(false);
+    const [log, setLog] = useState([]);
+    const load = () => callEntryLoose(api, "ms_assets", { action: "overview" }).then(setOv).catch(() => { });
+    useEffect(() => { load(); }, []);
+    const add = (t) => setLog((l) => [new Date().toLocaleTimeString() + "  " + t].concat(l).slice(0, 30));
+    const run = async () => {
+      setBusy(true); add("开始：" + (CAT_OPTS.find((x) => x[0] === cat) || [0, cat])[1]);
+      try {
+        const r = await callEntryLoose(api, "ms_assets", { action: "pipeline", category: cat, limit: n }, 18e5);
+        add("下载 " + (r.download && r.download.downloaded) + " 张 → 学到 " + (r.learn && r.learn.learned) + " 条 → 混合模板 " + (r.blend && r.blend.made) + " 个 → 进化边框 " + (r.evolve && r.evolve.made) + " 个（第 " + (r.evolve && r.evolve.generations) + " 代）→ 标签 " + (r.tag && r.tag.tagged) + " 个");
+      } catch (e) { add("失败：" + (e.message || e)); }
+      setBusy(false); load();
+    };
+    const s = (ov && ov.states) || {};
+    const idle = ov && ov.idle;
+    return /* @__PURE__ */ jsxs(Col, { style: { gap: 16 }, children: [
+      /* @__PURE__ */ jsx(Panel, { title: "学习进度", extra: idle ? /* @__PURE__ */ jsx(Pill, { tone: idle.can_learn ? "success" : "warning", children: idle.can_learn ? "电脑空闲，会自动学习" : "暂不学习：" + (idle.reason || "电脑在用") }) : null, children: /* @__PURE__ */ jsxs(Col, { style: { gap: 12 }, children: [
+        /* @__PURE__ */ jsxs(Grid, { min: 120, gap: 10, children: [
+          /* @__PURE__ */ jsx(StatTile, { label: "待学习", value: s.pending || 0, color: "#b9750f" }),
+          /* @__PURE__ */ jsx(StatTile, { label: "学习中", value: s.learning || 0, color: BRAND }),
+          /* @__PURE__ */ jsx(StatTile, { label: "已学完", value: s.learned || 0, color: "#1c8a58" }),
+          /* @__PURE__ */ jsx(StatTile, { label: "已清理", value: (s.removed || 0) + (s.rejected || 0) }),
+          /* @__PURE__ */ jsx(StatTile, { label: "学到的风格", value: ov ? ov.styles : "-" }),
+          /* @__PURE__ */ jsx(StatTile, { label: "进化出的边框", value: ov ? ov.frame_genomes : "-" })
+        ] }),
+        /* @__PURE__ */ jsx(Muted, { children: "参考图只放在本地，本地看图模型（在显卡上跑）只读它的设计结构：版式、卡片做法、装饰种类、纹理、配色气质、适合的曲风和段落。类别不对的挪走；学完并已进化出新素材的移入回收站。只在电脑空闲（10 分钟没操作、没在唱歌/训练/跑模型、显卡空闲）时自动学。" })
+      ] }) }),
+      /* @__PURE__ */ jsx(Panel, { title: "手动跑一轮", children: /* @__PURE__ */ jsxs(Col, { style: { gap: 10 }, children: [
+        /* @__PURE__ */ jsxs("div", { style: { display: "grid", gridTemplateColumns: "minmax(180px,1.4fr) minmax(90px,.6fr) auto", gap: 10, alignItems: "center" }, children: [
+          /* @__PURE__ */ jsx(Select, { value: cat, onChange: (e) => setCat(e.target.value), children: CAT_OPTS.map(([k, l]) => /* @__PURE__ */ jsx("option", { value: k, children: l }, k)) }),
+          /* @__PURE__ */ jsx(Select, { value: n, onChange: (e) => setN(+e.target.value), children: [3, 4, 6].map((x) => /* @__PURE__ */ jsx("option", { value: x, children: x + " 张" }, x)) }),
+          /* @__PURE__ */ jsx(Btn, { style: PRIMARY_BTN, disabled: busy, onClick: run, children: busy ? "学习中…" : "下载 → 学 → 混合 → 进化 → 打标签" })
+        ] }),
+        log.length ? /* @__PURE__ */ jsx("div", { style: { fontFamily: "Consolas,monospace", fontSize: 12, whiteSpace: "pre-wrap", padding: 12, borderRadius: 12, background: "rgba(248,244,248,0.9)", border: "1px solid " + LINE, maxHeight: 160, overflow: "auto", color: INK_2 }, children: log.join("\n") }) : null
+      ] }) }),
+      /* @__PURE__ */ jsx(Panel, { title: "参考图状态", extra: /* @__PURE__ */ jsx(Btn, { onClick: async () => { const r = await callEntryLoose(api, "ms_assets", { action: "cleanup" }); add("清理 " + r.removed + " 张已学完的参考图（移入回收站）"); load(); }, children: "清理已学完" }), children:
+        ov && (ov.items || []).length ? /* @__PURE__ */ jsx(Col, { style: { gap: 6, maxHeight: 420, overflow: "auto" }, children: (ov.items || []).slice().reverse().map((m, i) => /* @__PURE__ */ jsx(FileRow, {
+          icon: "▣", title: (m.source || "") + " · " + (m.query || m.file || ""), meta: (m.state_at || "") + (m.note ? " · " + m.note : m.want_category ? " · 想要：" + m.want_category : ""),
+          right: /* @__PURE__ */ jsx(Pill, { tone: ST_TONE[m.state || "pending"], children: ST_CN[m.state || "pending"] || m.state })
+        }, i)) }) : /* @__PURE__ */ jsx(Empty, { children: "还没有参考图" }) })
+    ] });
+  }
+  function StageEvolve(props) {
+    const api = props.api;
+    const [lf, setLf] = useState(null);
+    const [busy, setBusy] = useState("");
+    const [voted, setVoted] = useState({});
+    const load = () => fetch(STAGE_ORIGIN + "/stage/learned_effects.json?v=" + Date.now()).then((r) => r.json()).then(setLf).catch(() => setLf({ frames: [], templates: [] }));
+    useEffect(() => { load(); }, []);
+    const vote = async (id, like) => { setVoted({ ...voted, [id]: like ? "up" : "down" }); try { await callEntryLoose(api, "ms_assets", { action: "feedback", style_id: id, like }); } catch (e) { } };
+    const more = async (action, limit) => { setBusy(action); try { await callEntryLoose(api, "ms_assets", { action, limit }, 6e5); } catch (e) { } setBusy(""); load(); };
+    const frames = ((lf && lf.frames) || []).slice().sort((a, b) => (b.gen || 0) - (a.gen || 0)).slice(0, 18);
+    const tpls = ((lf && lf.templates) || []).slice(-12).reverse();
+    const maxGen = Math.max(0, ...((lf && lf.frames) || []).map((g) => g.gen || 0));
+    const voteBtns = (id) => /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 4, flex: "0 0 auto" }, children: [
+      /* @__PURE__ */ jsx(Btn, { disabled: !!voted[id], style: voted[id] === "up" ? PRIMARY_BTN : {}, onClick: () => vote(id, true), children: "👍" }),
+      /* @__PURE__ */ jsx(Btn, { disabled: !!voted[id], onClick: () => vote(id, false), children: "👎" })
+    ] });
+    const drawFrame = (g) => (cv) => {
+      const c = cv.getContext("2d"), off = document.createElement("canvas"); off.width = 480; off.height = 270;
+      window.NekoStageFrames.drawFrame(off.getContext("2d"), 480, 270, g, "示例歌名");
+      const bg = c.createLinearGradient(0, 0, 480, 270); bg.addColorStop(0, "#5a4f8a"); bg.addColorStop(1, "#2a2440"); c.fillStyle = bg; c.fillRect(0, 0, 480, 270);
+      c.fillStyle = "rgba(255,255,255,.18)"; c.beginPath(); c.ellipse(240, 175, 52, 98, 0, 0, 6.283); c.fill(); c.beginPath(); c.arc(240, 72, 34, 0, 6.283); c.fill();
+      c.drawImage(off, 0, 0);
+    };
+    return /* @__PURE__ */ jsxs(Col, { style: { gap: 16 }, children: [
+      /* @__PURE__ */ jsx(Panel, { title: "进化出的边框", extra: /* @__PURE__ */ jsxs(Row, { children: [/* @__PURE__ */ jsx(Pill, { children: ((lf && lf.frames) || []).length + " 个 · 最高第 " + maxGen + " 代" }), /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: () => more("evolve", 8), children: busy === "evolve" ? "进化中…" : "再进化 8 个" })] }), children: /* @__PURE__ */ jsxs(Col, { style: { gap: 12 }, children: [
+        /* @__PURE__ */ jsx(Muted, { children: "学到的设计结构先翻成「边框基因」（第 0 代），再两三个基因交叉、变异出下一代；代数越高越是新东西。👍👎 决定以后挑谁当父母。" }),
+        frames.length ? /* @__PURE__ */ jsx(Grid, { min: 230, gap: 14, children: frames.map((g) => /* @__PURE__ */ jsxs(Soft, { style: { padding: 10 }, children: [
+          /* @__PURE__ */ jsx(CanvasThumb, { id: g.id, draw: drawFrame(g) }),
+          /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6, marginTop: 8, flexWrap: "nowrap" }, children: [/* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: 6, minWidth: 0, overflow: "hidden" }, children: [/* @__PURE__ */ jsx(Pill, { children: "第 " + (g.gen || 0) + " 代" }), /* @__PURE__ */ jsx(Muted, { style: { whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }, children: g.kind })] }), voteBtns(g.id)] })
+        ] }, g.id)) }) : /* @__PURE__ */ jsx(Empty, { children: "还没有进化出的边框" })
+      ] }) }),
+      /* @__PURE__ */ jsx(Panel, { title: "混合出的背景模板", extra: /* @__PURE__ */ jsx(Btn, { disabled: !!busy, onClick: () => more("blend", 6), children: busy === "blend" ? "混合中…" : "再混 6 个" }), children: /* @__PURE__ */ jsxs(Col, { style: { gap: 12 }, children: [
+        /* @__PURE__ */ jsx(Muted, { children: "每个模板 = 两三张参考的设计结构各取一部分（版式、卡片做法、装饰种类、纹理、配色）重新组合，用程序重新画出来。" }),
+        tpls.length ? /* @__PURE__ */ jsx(Grid, { min: 230, gap: 14, children: tpls.map((t) => /* @__PURE__ */ jsxs(Soft, { style: { padding: 10 }, children: [
+          /* @__PURE__ */ jsx(CanvasThumb, { id: t.id, draw: (cv) => window.NekoStageTemplates.draw(t, cv.getContext("2d"), 480, 270, 3, { dens: 1, pulse: 0.3 }) }),
+          /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between", marginTop: 8 }, children: [/* @__PURE__ */ jsx(Muted, { children: [t.layout, (t.card || {}).shape, t.pattern].filter(Boolean).join(" · ") }), voteBtns(t.id)] })
+        ] }, t.id)) }) : /* @__PURE__ */ jsx(Empty, { children: "还没有背景模板" })
+      ] }) })
+    ] });
+  }
+  function StageLibrary(props) {
+    const api = props.api;
+    const [d, setD] = useState(null);
+    const [busy, setBusy] = useState(false);
+    const [grp, setGrp] = useState("all");
+    const load = () => callEntryLoose(api, "ms_assets", { action: "effects" }).then(setD).catch(() => { });
+    useEffect(() => { load(); }, []);
+    const tags = (d && d.tags) || {};
+    const rows = [];
+    Object.entries((d && d.builtin) || {}).forEach(([g, lst]) => lst.forEach((e) => { const t = tags[e.id + "@" + g] || {}; rows.push({ g, id: e.id, genres: t.genres || (e.tags || {}).genres || [], sections: t.sections || [], energy: t.energy, by: t.by }); }));
+    const groups = Object.keys((d && d.builtin) || {});
+    const shown = rows.filter((r) => grp === "all" || r.g === grp);
+    const tagged = Object.values(tags).filter((t) => t.by && t.by !== "rule").length;
+    return /* @__PURE__ */ jsx(Panel, { title: "效果库与标签", extra: /* @__PURE__ */ jsxs(Row, { children: [
+      /* @__PURE__ */ jsx(Pill, { children: rows.length + " 个效果 · 模型已打标 " + tagged }),
+      /* @__PURE__ */ jsx(Btn, { disabled: busy, onClick: async () => { setBusy(true); try { await callEntryLoose(api, "ms_assets", { action: "tag", limit: 60 }, 18e5); } catch (e) { } setBusy(false); load(); }, children: busy ? "打标签中…" : "再打 60 个标签" })
+    ] }), children: /* @__PURE__ */ jsxs(Col, { style: { gap: 12 }, children: [
+      /* @__PURE__ */ jsx(Muted, { children: "舞台按标签给每一段挑素材：这首歌的曲风、当前段落、能量高低。标签由本地模型判断，没有模型时按内置规则。" }),
+      /* @__PURE__ */ jsx(SubTabs, { value: grp, onChange: setGrp, items: [["all", "全部"]].concat(groups.map((g) => [g, GRP_CN[g] || g])) }),
+      /* @__PURE__ */ jsx(Col, { style: { gap: 6, maxHeight: 520, overflow: "auto" }, children: shown.map((r) => /* @__PURE__ */ jsx(FileRow, {
+        icon: "◆", title: (GRP_CN[r.g] || r.g) + " · " + r.id,
+        meta: "曲风：" + (r.genres.map((x) => PRESET_CN[x] || x).join("、") || "-") + "　段落：" + (r.sections.join("、") || "-") + (r.energy != null ? "　能量 " + Number(r.energy).toFixed(2) : ""),
+        right: /* @__PURE__ */ jsx(Pill, { tone: r.by && r.by !== "rule" ? "success" : "neutral", children: r.by && r.by !== "rule" ? "模型" : "规则" })
+      }, r.g + r.id)) })
+    ] }) });
+  }
   var NAV = [
     { key: "start", label: "开始", icon: "home" },
     { key: "materials", label: "准备素材", icon: "music" },
@@ -6441,6 +6820,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     { key: "models", label: "我的声音", icon: "voice" },
     { key: "sing", label: "让她唱歌", icon: "play" },
     { key: "create", label: "原创歌曲", icon: "spark" },
+    { key: "stage", label: "舞台工作室", icon: "stage" },
     { key: "settings", label: "设置与环境", icon: "gear" }
   ];
   function Icon(props) {
@@ -6471,6 +6851,11 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       /* @__PURE__ */ jsx("path", { d: "M8.4 7.4l4.4 2.6-4.4 2.6z" })
     ] });
     if (props.name === "spark") return /* @__PURE__ */ jsx("svg", { ...common, children: /* @__PURE__ */ jsx("path", { d: "M10 2.8l1.8 5 5 1.8-5 1.8-1.8 5-1.8-5-5-1.8 5-1.8z" }) });
+    if (props.name === "stage") return /* @__PURE__ */ jsxs("svg", { ...common, children: [
+      /* @__PURE__ */ jsx("path", { d: "M2.8 4.2h14.4v9.2H2.8z" }),
+      /* @__PURE__ */ jsx("path", { d: "M2.8 4.2c2.4 2.2 2.4 6.8 0 9.2M17.2 4.2c-2.4 2.2-2.4 6.8 0 9.2" }),
+      /* @__PURE__ */ jsx("path", { d: "M7 16.4h6" })
+    ] });
     return /* @__PURE__ */ jsxs("svg", { ...common, children: [
       /* @__PURE__ */ jsx("circle", { cx: "10", cy: "10", r: "2.6" }),
       /* @__PURE__ */ jsx("path", { d: "M3.2 10a6.8 6.8 0 0 1 1.3-4M16.8 10a6.8 6.8 0 0 1-1.3 4M5.4 15.4a6.8 6.8 0 0 1-1.1-1.4M14.6 4.6a6.8 6.8 0 0 0-1.1-1.4" })
@@ -6593,6 +6978,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
             page === "models" ? /* @__PURE__ */ jsx(PageModels, { api, snap: view, onRefresh: refresh, onGo: go }) : null,
             page === "sing" ? /* @__PURE__ */ jsx(PageSing, { api, snap: view, onRefresh: refresh, onGo: go }) : null,
             page === "create" ? /* @__PURE__ */ jsx(PageCreate, { api, snap: view, onRefresh: refresh, onGo: go }) : null,
+            page === "stage" ? /* @__PURE__ */ jsx(PageStage, { api, snap: view, onGo: go }) : null,
             page === "settings" ? /* @__PURE__ */ jsx(PageSettings, { api, snap: view, onRefresh: refresh, onOpenWizard: () => setWizard(true) }) : null
           ] })
         ] })

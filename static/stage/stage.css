@@ -137,6 +137,39 @@
 .ns-ch.m-neon.on { text-shadow: 0 0 6px #fff, 0 0 16px var(--hot), 0 0 40px var(--hot), 0 0 80px var(--hot); }
 .ns-ch.gl { text-shadow: -4px 0 rgba(255, 40, 90, .9), 4px 0 rgba(40, 240, 255, .9) !important; }
 
+/* ---- 第三十五轮：更多字体样式（按音乐风格成组使用） ---- */
+/* 柔光：白字 + 主色柔和外发光（抒情） */
+.ns-ch.m-soft { color: #fff; text-shadow: 0 0 10px var(--ink2), 0 0 26px rgba(255,255,255,.35), 0 2px 6px rgba(0,0,0,.25); letter-spacing: -.01em; }
+.ns-ch.m-soft.kw { color: var(--hot); }
+.ns-ch.m-soft.on { text-shadow: 0 0 14px var(--hot), 0 0 34px var(--hot), 0 0 60px rgba(255,255,255,.5); }
+/* 衬线柔光：细白字 + 细描边光晕（爵士/抒情） */
+.ns-ch.m-serifglow { color: #fff7ee; -webkit-text-stroke: .6px rgba(255,255,255,.7); text-shadow: 0 0 2px #fff, 0 0 18px var(--ink2); font-style: italic; }
+.ns-ch.m-serifglow.on { color: var(--hot); text-shadow: 0 0 4px #fff, 0 0 24px var(--hot); }
+/* 墨字：深墨色 + 纸感阴影（古风），浅背景用 */
+.ns-ch.m-ink { color: #1c1a20; text-shadow: 1px 1px 0 rgba(255,255,255,.55), 0 0 18px rgba(255,255,255,.6); }
+.ns-ch.m-ink.kw { color: #b3223a; }
+.ns-ch.m-ink.on { color: #b3223a; text-shadow: 0 0 2px #fff, 0 0 22px rgba(255,255,255,.9); }
+/* 贴纸字：白色粗描边 + 投影（流行/可爱，参考翻唱封面） */
+.ns-ch.m-sticker { color: var(--ink); paint-order: stroke fill; -webkit-text-stroke: .16em #fff; text-shadow: .05em .07em 0 rgba(0,0,0,.28); }
+.ns-ch.m-sticker.kw { color: var(--hot); }
+.ns-ch.m-sticker.on { color: var(--hot); text-shadow: .05em .07em 0 rgba(0,0,0,.28), 0 0 26px var(--hot); }
+/* 糖果字：双色渐变 + 白描边 */
+.ns-ch.m-candy { background: linear-gradient(180deg, #fff 0%, var(--ink) 45%, var(--hot) 100%); -webkit-background-clip: text; background-clip: text; color: transparent; -webkit-text-stroke: 1.5px rgba(255,255,255,.9); filter: drop-shadow(0 .06em 0 rgba(0,0,0,.25)); }
+.ns-ch.m-candy.on { filter: drop-shadow(0 0 14px var(--hot)); }
+/* 粗体流行：粗字 + 彩色偏移影（pop） */
+.ns-ch.m-pop { color: #fff; text-shadow: .06em .06em 0 var(--hot), .12em .12em 0 var(--ink2); font-weight: 900; }
+.ns-ch.m-pop.on { color: var(--hot); text-shadow: .06em .06em 0 #fff, .12em .12em 0 var(--ink2); }
+/* 金属：银色渐变 + 暗描边（摇滚/电子） */
+.ns-ch.m-chrome { background: linear-gradient(180deg, #ffffff 0%, #c9d1df 42%, #5c6474 52%, #e8ecf3 100%); -webkit-background-clip: text; background-clip: text; color: transparent; -webkit-text-stroke: 1px rgba(20,20,30,.6); filter: drop-shadow(0 2px 6px rgba(0,0,0,.5)); }
+.ns-ch.m-chrome.on { filter: drop-shadow(0 0 16px var(--hot)); }
+/* 印章块：色块底 + 反白字（摇滚/暗黑，参考 kinetic typography 的黑白块） */
+.ns-ch.m-stamp { color: #fff; background: var(--hot); padding: 0 .06em; box-shadow: .08em .08em 0 rgba(0,0,0,.6); }
+.ns-ch.m-stamp.kw { background: #111; color: var(--hot); }
+.ns-ch.m-stamp.on { background: #fff; color: var(--hot); }
+/* 故障风：青红错位常驻（电子） */
+.ns-ch.m-glitchy { color: #fff; text-shadow: -.04em 0 rgba(255,40,120,.85), .04em 0 rgba(40,240,255,.85); }
+.ns-ch.m-glitchy.on { text-shadow: -.07em 0 rgba(255,40,120,.95), .07em 0 rgba(40,240,255,.95), 0 0 20px var(--hot); }
+
 /* ------------------------------- 字幕条 ------------------------------- */
 .ns-sub {
   position: absolute;
@@ -212,3 +245,46 @@
 .ns-preview-ui input[type=range] { width: 240px; }
 .ns-preview-ui .tm { font: 12px Consolas, monospace; color: #ccd; min-width: 92px; text-align: center; }
 .ns-preview-ui.hide { display: none; }
+
+/* 第三十六轮：全屏遮挡转场（stinger），盖在背景、人物、歌词、字幕条之上 */
+.ns-stinger {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 11;
+  pointer-events: none;
+  display: none;
+}
+/* 第三十六轮：人物前景粒子层（人物之上、前排歌词之下） */
+.ns-front {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 5;   /* 宿主人物容器是 4（加载器强制），前排歌词 5 且在 DOM 后面 */
+  transform: translateZ(0);
+  pointer-events: none;
+  filter: blur(1.2px);
+}
+
+/* 第五十轮：线系主题的字（inkline）——不发光不描边，只有墨色和一个强调色；唱到的字换成强调色并落一条下划线 */
+.ns-ch.m-inkline { color: var(--ink); text-shadow: none; -webkit-text-stroke: 0; font-weight: 700; }
+.ns-ch.m-inkline.kw { color: var(--hot); }
+.ns-ch.m-inkline.on { color: var(--hot); text-shadow: none; box-shadow: 0 .12em 0 -0.04em var(--hot); }
+/* 线系主题：浅底时文字变量用墨色（覆盖调色板），深底保持白 */
+.ns-root.ns-line-paper .ns-wrap { --ink: #2f2a36 !important; --ink2: #8a8296 !important; }
+.ns-root.ns-line-paper .ns-ch { text-shadow: none !important; }
+.ns-root.ns-line-ink .ns-ch.m-inkline { color: #f4f0ff; }
+
+/* 第五十一轮：手书分镜模式——旧的叠加层全部关掉（边框、暗角、颗粒、漏光、光斑、蒙版、上下模糊、背后大字、前景粒子、飘字、字幕条、遮幅、闪白），
+   画面只剩：铺色 + 图案 + 字卡 / 人物定格 */
+.ns-root.ns-director [class*="ns-look-"],
+.ns-root.ns-director .ns-vig, .ns-root.ns-director .ns-grain, .ns-root.ns-director .ns-bars,
+.ns-root.ns-director .ns-flash, .ns-root.ns-director .ns-black, .ns-root.ns-director .ns-front,
+.ns-root.ns-director .ns-fx, .ns-root.ns-director .ns-sub, .ns-root.ns-director .ns-vgn,
+.ns-root.ns-director .ns-lyback, .ns-root.ns-director .ns-lyfront { display: none !important; }
+
+/* 第五十三轮：两种模式完全分开——手书分镜下原舞台的背景画布、全屏转场、点缀层也不画；原舞台下手书层不出现 */
+.ns-root.ns-director .ns-bg, .ns-root.ns-director .ns-stinger, .ns-root.ns-director .ns-acc { display: none !important; }
+.ns-root:not(.ns-director) .ns-dir, .ns-root:not(.ns-director) .ns-dir2, .ns-root:not(.ns-director) .ns-acc { display: none !important; }

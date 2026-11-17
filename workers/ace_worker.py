@@ -63,9 +63,24 @@ def main() -> int:
         import ace_runtime  # noqa: E402
 
         post_dtype = ""
+        cpu_mode = str(job.get("device") or "").lower() == "cpu"
         try:
             import torch
-            wanted = _default_dtype(torch)
+            # 第五十五轮：CPU 路线（AMD/Intel 显卡、没显卡、显卡太老）——权重和默认 dtype 都用 fp32，
+            # 不能按「本机有 N 卡」去设 bf16（CPU 上加载 bf16 safetensors 会原生崩溃，实测）。
+            # 线程数由 runtime._clean_env 设好的 OMP/MKL_NUM_THREADS 决定。
+            wanted = torch.float32 if cpu_mode else _default_dtype(torch)
+            if cpu_mode:
+                # 实测（i9-14900KF，torch 2.9.1+cu128 Windows 版）：ACE 走 CPU 时，
+                # ① 只要还能看到 CUDA，ACE/torchao 会去查显卡、混用 CUDA 状态 → 随机原生崩溃；
+                # ② ≥2 个 OpenMP 线程时权重加载/VAE 反卷积也会随机崩溃。
+                # 两条都关掉后连续多次稳定出歌：CPU 路线 = 屏蔽 CUDA + 单线程（10 秒片段约 1 分钟）。
+                torch.cuda.is_available = lambda: False
+                torch.cuda.device_count = lambda: 0
+                try:
+                    torch.set_num_threads(1)
+                except Exception:  # noqa: BLE001
+                    pass
             if wanted is torch.float16:
                 # 老卡（Turing/Volta）权重是 fp16，默认 dtype 也得是 fp16，
                 # 但只能在权重加载完之后设——加载前设会让 safetensors 物化

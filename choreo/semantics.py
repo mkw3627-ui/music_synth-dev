@@ -248,7 +248,7 @@ def _call_llm(texts: list, track: dict, *, endpoint: str, model: str,
         "format": RESULT_SCHEMA,
         "stream": False,
         "think": False,
-        "keep_alive": "30m",
+        "keep_alive": 0,   # 第四十八轮：读完歌词立刻卸载（以前常驻 30 分钟，约 11 GB 显存一直被占）
         "options": {
             "num_ctx": NUM_CTX,
             "temperature": 0.2,

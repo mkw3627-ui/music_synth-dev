@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>为她而唱 · 舞台预演图</title>
+<link rel="stylesheet" href="./stage.css">
+<link rel="stylesheet" href="./skins/skins.css">
+<style>
+  html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
+  #stage { position: fixed; inset: 0; }
+  #grid { position: fixed; inset: 0; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 4px; background: #111; z-index: 100; }
+  #grid canvas { width: 100%; height: 100%; display: block; }
+  #grid .cap { position: absolute; color: #fff; font: 600 14px "Microsoft YaHei", sans-serif; background: rgba(0,0,0,.55); padding: 2px 8px; border-radius: 6px; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<script src="./vendor/pixi.min.js"></script>
+<script src="./vendor/live2dcubismcore.min.js"></script>
+<script src="./vendor/cubism4.min.js"></script>
+<script src="./vendor/pixi-filters.v4.js"></script>
+<script src="./skins/skins.js"></script>
+<script src="./stage-scenes.js"></script>
+<script src="./stage-scenes-rich.js"></script>
+<script src="./stage-scenes-more.js"></script>
+<script src="./stage-scenes-pack2.js"></script>
+<script src="./stage-lines.js"></script>
+<script src="./vendor/rough.js"></script>
+<script src="./stage-director.js"></script>
+<script src="./stage-learned.js"></script>
+<script src="./stage-templates.js"></script>
+<script src="./stage-frames.js"></script>
+<script src="./stage-art.js"></script>
+<script src="./stage-stinger.js"></script>
+<script src="./stage-look.js"></script>
+<script src="./stage-planner.js"></script>
+<script src="./stage-lyrics.js"></script>
+<script src="./stage-runtime.js"></script>
+<script>
+'use strict';
+/* 舞台工作室用的预演图：?track=&preset=&seed=&times=a,b,c,d
+ * 按这首歌的编排、指定风格（preset 覆盖）和演出种子，定格到几个关键时刻，拼成 2x2 一张图（不播放、不出声）。 */
+const Q = new URLSearchParams(location.search);
+const MODEL = Q.get('m') || '/model/Blue%20cat.model3.json';
+(async function () {
+  document.title = 'loading';
+  try {
+    const show = await (await fetch('/show.json?track=' + encodeURIComponent(Q.get('track') || ''))).json();
+    const preset = Q.get('preset');
+    if (preset) { show.style = Object.assign({}, show.style, { preset, chosen: true }); } else if (show.style) { delete show.style.chosen; }
+    if (Q.get('theme')) show.style = Object.assign({}, show.style, { theme: Q.get('theme'), chosen: true });
+    if (Q.get('family')) show.style = Object.assign({}, show.style, { family: Q.get('family') });
+    if (Q.get('director') === '0') show.style = Object.assign({}, show.style, { director: false });
+    if (Q.get('kit')) show.style = Object.assign({}, show.style, { kit: Q.get('kit') });
+    if (Q.get('mode')) show.style = Object.assign({}, show.style, { mode: Q.get('mode') });
+    try {
+      const lf = await (await fetch('learned_effects.json')).json();
+      NekoStageLearned.register(lf.learned || []); NekoStageTemplates.register(lf.templates || []);
+      window.NekoStageFramesEvolved = lf.frames || [];
+    } catch (e) { }
+    window.__NEKO_STAGE_BASE = './';
+    let fonts = null; try { fonts = await NekoStage.loadFonts(show); } catch (e) { }
+    const times = (Q.get('times') || '').split(',').map(Number).filter(x => x > 0);
+    let tNow = times[0] || 10;
+    NekoStage.start({ show, fonts, root: '#stage', fps: 30, hud: false, sub: true,
+      runSeed: +(Q.get('seed') || 1), clock: { now: () => tNow, seek: t => { tNow = t; } } });
+    try {
+      const app = new PIXI.Application({ view: NekoStage.canvas, backgroundAlpha: 0, width: 1600, height: 900, antialias: true });
+      const model = await PIXI.live2d.Live2DModel.from(MODEL, { autoInteract: false });
+      app.stage.addChild(model); NekoStage.setModel(model, app.stage);
+      window.__app = app;
+    } catch (e) { console.warn('model', e); }
+    // 单帧：定格到 ?t= 那一刻（整页截图由后端做，歌词 DOM 也会拍进去）
+    tNow = +(Q.get('t') || times[0] || 10);
+    try { const sc = (show.scenes || []).find(x => x.t0 <= tNow && tNow < x.t1); if (sc && tNow - sc.t0 < 2.6) tNow = Math.min(sc.t1 - .5, sc.t0 + 2.6); } catch (e) { }
+    for (let k = 0; k < 8; k++) { NekoStage.renderAt(tNow); if (window.__app) window.__app.render(); await new Promise(r => setTimeout(r, 150)); }
+    // 无头截图在虚拟时间里跑：偶尔背景画布还没画上就被拍了（整张黑底）。量一下背景亮度，没画上就再渲染几轮
+    const bgLum = () => { try { const cv = document.querySelector('.ns-bg'), c2 = document.createElement('canvas'); c2.width = 32; c2.height = 18;
+      const x = c2.getContext('2d'); x.drawImage(cv, 0, 0, 32, 18); const d = x.getImageData(0, 0, 32, 18).data; let s = 0; for (let k = 0; k < d.length; k += 4) s += d[k] + d[k + 1] + d[k + 2]; return s / (d.length / 4) / 3; } catch (e) { return 99; } };
+    for (let k = 0; k < 30 && bgLum() < 6; k++) { NekoStage.renderAt(tNow); if (window.__app) window.__app.render(); await new Promise(r => requestAnimationFrame(() => setTimeout(r, 120))); }
+    window.__bgLum = bgLum();
+    if (Q.get('dbg')) document.body.insertAdjacentHTML('beforeend', '<pre style="position:fixed;left:8px;bottom:8px;z-index:300;color:#0f0;font:16px monospace">lum=' + window.__bgLum.toFixed(1) + ' t=' + NekoStage.info().t + '</pre>');
+    document.title = 'done';
+  } catch (e) { document.title = 'error'; document.body.insertAdjacentHTML('beforeend', '<pre style="color:#f88;position:fixed;z-index:200">' + e + '</pre>'); }
+})();
+</script>
+</body>
+</html>

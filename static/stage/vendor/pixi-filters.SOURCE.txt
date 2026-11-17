@@ -1,0 +1,4 @@
+pixi-filters（MIT，https://github.com/pixijs/filters）
+v5.3.0 → pixi-filters.v5.js（宿主 PIXI 7.4.3 用）  tgz sha256 95df50a5ad0b1879cab836057751a109458c414a71203a11352a80b495c0cdff
+v4.2.0 → pixi-filters.v4.js（预演页 PIXI 6.5.10 用）tgz sha256 8e7481e0a2350ac1a9b61fa5227b520b780d0b5864fd6c6f93eb600c50c43935
+下载源：registry.npmmirror.com，2026-11-17，第 45 轮

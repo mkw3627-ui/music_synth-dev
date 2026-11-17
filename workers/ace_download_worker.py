@@ -12,6 +12,7 @@ import sys
 import traceback
 from pathlib import Path
 
+
 _MIN_WEIGHT_BYTES = 1024 * 1024  # 真正的分片都是百 MB 级；1MB 以下只可能是残片
 
 # HuggingFace 官方在国内容易连不上；ModelScope 源失败时会回落到 HF，

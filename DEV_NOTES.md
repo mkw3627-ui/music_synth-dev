@@ -1893,3 +1893,25 @@ CPU 重试」只改 `device` 和 `CUDA_VISIBLE_DEVICES`，不改变 `torch.load`
   张量落在 `cpu`。
 - `sitecustomize.py` 编译通过；插件文件 compile 通过；CI Ruff 无新增；
   ffmpeg_winget_stub 4 用例仍全 PASS。
+
+---
+
+## 0.3.0 发布：舞台两种模式 + 硬件适配 + 部署引导（2026-11-18）
+
+把本地运行版（P6 第 30~55 轮）同步进仓库，版本 0.2.58 → 0.3.0。主要内容：
+
+- **唱歌舞台**：`static/stage/` 新增导演/观感/边框/线条/手书分镜等模块。两种演出模式完全分开：
+  原舞台（默认）和手书分镜。模式按每首歌保存（`ms_show_set` 的 mode/kit；原创页 `stage_mode`/`stage_kit`）。
+  原舞台一首歌最多两种边框，不叠框；手书分镜用开源手写字体（OFL）、Rough.js（MIT）手绘线、
+  doodle-icons（MIT）线稿。伴奏段的线稿小画（心电图等）按用户要求默认关闭。
+- **停止演唱**：LLM 工具 `music_synth_stop`。
+- **硬件适配**（`compat.py`）：检测 NVIDIA/AMD/Intel 显卡、CPU、内存。只有 NVIDIA 走 CUDA，
+  其余走 CPU 加速（按物理核设 OMP/MKL 线程）。设置页「计算设备 cpu」现在真正生效。
+  ACE-Step 在 CPU 上会随机原生崩溃（torch c10.dll 访问冲突），标为暂不支持，崩溃时给中文说明。
+  舞台画质按机器自动分 full/balanced/lite 三档，卡顿时自动降档。
+- **部署引导**：`ms_deploy_overview` 列出全插件要装的东西（5 组）并实测各下载源速度；
+  引导页第 4 步显示。入口超时 180 秒（宿主默认 30 秒不够）。
+- **宿主加载器**：舞台需要在宿主 `templates/index.html` 注入加载器，插件包装不了。
+  仓库新增 `host/`（`solo-stage-loader.js` + `apply_solo_stage.py`，可自动找 Steam 安装位置），
+  不进插件包，README 写了用法。
+- 打包：`tools/build_package.py` 排除 `host/`、`.github/`、`.vscode/`。宿主 `/plugin-cli/verify` 校验通过。
