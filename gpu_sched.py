@@ -117,14 +117,15 @@ def start_perception(logger=None) -> None:
 
 
 # ------------------------------ 腾显存 ------------------------------
-def make_room(kind: str, *, logger=None, soft_yield=None) -> dict:
+def make_room(kind: str, *, logger=None, soft_yield=None, need_gib: float | None = None) -> dict:
     """按需逐级腾显存。返回 {"stopped_perception": bool, ...} 交给 restore()。
 
     1) 先卸本地大模型（Ollama，最占也最好恢复：下次用自动加载）；
     2) 还不够 → 请「为她所听」让位（soft_yield 回调，释放分离/歌词模型，录音不停）；
     3) 还不够 → 整个停掉「为她所听」，处理完再拉起。
     """
-    need = NEED_GIB.get(kind, 6.0)
+    # 第六十轮：调用方可以按实际模型给需要量（XL 原创约 12GB，固定 8GB 时会不腾、VAE 被挤到 CPU 慢解码）
+    need = float(need_gib) if need_gib else NEED_GIB.get(kind, 6.0)
     out = {"kind": kind, "need": need, "stopped_perception": False, "steps": []}
     mem = gpu_mem()
     if not mem:

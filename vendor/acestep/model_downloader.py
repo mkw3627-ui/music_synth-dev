@@ -184,6 +184,7 @@ def _download_from_huggingface_internal(
         local_dir=str(local_dir),
         local_dir_use_symlinks="auto",
         token=token,
+        ignore_patterns=_plugin_ignore_patterns(repo_id),
     )
 
 
@@ -208,7 +209,16 @@ def _download_from_modelscope_internal(
     snapshot_download(
         model_id=repo_id,
         local_dir=str(local_dir),
+        ignore_patterns=_plugin_ignore_patterns(repo_id),
     )
+
+
+def _plugin_ignore_patterns(repo_id: str):
+    """为她而唱第六十轮：插件生成时不加载 5Hz LM（thinking=False），主仓库里那份 3.5GB 的
+    acestep-5Hz-lm-1.7B 下了也用不上；新装时跳过它，少下 3.5GB。单独下载 LM 子模型不受影响。"""
+    if repo_id == MAIN_MODEL_REPO:
+        return [f"{DEFAULT_LM_MODEL}/*", f"{DEFAULT_LM_MODEL}/**"]
+    return None
 
 
 def _smart_download(

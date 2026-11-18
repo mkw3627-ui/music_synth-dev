@@ -154,7 +154,19 @@ def load_decoder_for_training(
     model = None
     last_err: Optional[Exception] = None
 
-    for attn_impl in attn_candidates:
+    # 为她而唱第六十轮：XL（4 个 5GB 分片）走 mmap 加载在 Windows 上内存一紧就访问冲突崩溃，
+    # 训练放显卡时改成直接在显存里建模型、逐个张量读盘拷进去（和生成侧同一个加载器）。
+    if str(device).startswith("cuda"):
+        try:
+            from acestep.core.generation.handler.init_service_loader import _stream_load_to_cuda
+            model = _stream_load_to_cuda(AutoModel, str(model_dir), "sdpa", dtype)
+            print("[OK] Model streamed to CUDA with attn_implementation=sdpa")
+        except Exception as exc:
+            last_err = exc
+            logger.warning("[WARN] streaming load failed, falling back to from_pretrained: %s", exc)
+            model = None
+
+    for attn_impl in ([] if model is not None else attn_candidates):
         try:
             model = AutoModel.from_pretrained(
                 str(model_dir),

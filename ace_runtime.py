@@ -178,6 +178,11 @@ class AceStepLocalRuntime:
                 raise RuntimeError(status)
 
             if self.config.lora_path:
+                # 第六十轮：ACE 加载 LoRA 前会把整个 decoder 拷一份到内存，留着以后卸载 LoRA 用。
+                # 插件的 worker 生成完就退出、从不卸载，这份拷贝白占内存（XL 约 8GB），
+                # 内存紧时进程直接访问冲突崩溃。这里放一个空占位，让它跳过备份。
+                if getattr(dit_handler, "_base_decoder", None) is None:
+                    dit_handler._base_decoder = {}
                 dit_handler.load_lora(self.config.lora_path)
             if self.config.layer_offload:
                 # 必须放在 LoRA 之后：LoRA 会重建/替换部分层参数。

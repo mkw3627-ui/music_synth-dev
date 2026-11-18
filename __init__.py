@@ -2112,6 +2112,13 @@ class MusicSynthPlugin(NekoPluginBase):
         if target.is_file() and not _as_bool(force):
             return Ok({"ok": True, "already": True, "tier": tier,
                        "path": str(target)})
+        # 第六十轮：bases 里已经有这一档的官方 .sf_dlc 也算就绪（引导页和训练都认它），
+        # 以前这里只看 low.pt / high.pt，会把已有的底模再下一遍（高档约 1GB）。
+        if not _as_bool(force):
+            found = await asyncio.to_thread(
+                setup_mod.resolve_tier_base, self._pipeline.paths, tier, target)
+            if found:
+                return Ok({"ok": True, "already": True, "tier": tier, "path": str(found)})
         expected = float(spec.get("size_gb") or 0.0) * 1024 ** 3
         job_id = self._job_begin("ddsp-base-download")
 
@@ -8291,6 +8298,7 @@ class MusicSynthPlugin(NekoPluginBase):
                                           on_wait=lambda d: self._job_update(job_id, state="queued", detail=d))
             with self._process_lock, ace_slot:
                 ace_room = gpu_sched.make_room("ace", logger=self.logger,
+                                               need_gib=(12.0 if is_xl else None),
                                                soft_yield=lambda: self._apply_perception_priority_sync(True))
                 self._ace_room = ace_room
                 self._job_update(job_id, state="running", progress=5,
@@ -8920,6 +8928,8 @@ class MusicSynthPlugin(NekoPluginBase):
             "pytorch_wavelets", "PyWavelets", "setuptools<81",
             # 国内镜像源（download_source=mirror）走 ModelScope
             "modelscope", "modelscope-hub", "cryptography",
+            # 小显存 int8 / fp8 量化（vram_policy 的 quant 档）要用；钉住实测可用的版本
+            "torchao==0.17.0",
         ]
         env = runtime._clean_env()
         # 用户机器上的本地代理经常是关的；pip 直连失败时不要让它卡在代理上
@@ -8931,7 +8941,7 @@ class MusicSynthPlugin(NekoPluginBase):
         # 否则 importlib.metadata 仍可能读到 transformers 4.51 的版本号。
         stale = {"transformers", "tokenizers", "huggingface_hub", "peft",
                  "modelscope", "modelscope_hub", "cryptography",
-                 "pytorch_wavelets", "pywavelets", "vector_quantize_pytorch",
+                 "pytorch_wavelets", "pywavelets", "vector_quantize_pytorch", "torchao",
                  "einx", "torch_einops_utils", "frozendict"}
         for dist in p["pylibs"].glob("*.dist-info"):
             stem = dist.name.split("-", 1)[0].replace("-", "_").lower()
@@ -8952,7 +8962,36 @@ class MusicSynthPlugin(NekoPluginBase):
         if proc is None or proc.returncode != 0:
             tail = ((proc.stderr or "") + (proc.stdout or ""))[-1200:] if proc else ""
             return {"ok": False, "error": "安装失败：" + (tail.strip() or "pip 失败")}
+        self._ace_patch_diffusers(p["pylibs"])
         missing = [x for x in self._ace_problems() if x.startswith("ACE 依赖")]
         if missing:
             return {"ok": False, "error": "装完仍缺：" + "、".join(missing)}
+        # 第六十轮：真导入一次 diffusers 的 VAE，装坏了当场报出来，别等到生成时才炸
+        probe = subprocess.run(
+            [str(p["python"]), "-I", "-c",
+             f"import sys; sys.path.insert(0, r'{p['pylibs']}'); from diffusers.models import AutoencoderOobleck"],
+            capture_output=True, text=True, errors="replace", timeout=600, env=runtime._clean_env(),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if probe.returncode != 0:
+            return {"ok": False, "error": "ACE 依赖装完但导入失败：" + (probe.stderr or probe.stdout)[-600:]}
         return {"ok": True, "detail": "ACE 依赖安装完成"}
+
+    @staticmethod
+    def _ace_patch_diffusers(pylibs: Path) -> None:
+        """diffusers 0.36 的 torchao 量化模块在定义 logger 之前就调用了它：
+        装了 torchao（小显存 int8 量化要用）时，一导入 diffusers 就报「logger 未定义」，
+        原创生成全挂。把 logger 定义挪到函数调用之前（第六十轮实测）。"""
+        f = Path(pylibs) / "diffusers" / "quantizers" / "torchao" / "torchao_quantizer.py"
+        try:
+            text = f.read_text(encoding="utf-8")
+        except OSError:
+            return
+        line = "logger = logging.get_logger(__name__)\n"
+        anchor = "from ..base import DiffusersQuantizer\n"
+        if text.count(line) != 1 or anchor not in text or text.index(line) < text.index("_update_torch_safe_globals()"):
+            return
+        text = text.replace(line, "", 1).replace(anchor, anchor + "\n\n" + line, 1)
+        try:
+            f.write_text(text, encoding="utf-8")
+        except OSError:
+            pass

@@ -8,7 +8,57 @@ import torch
 from loguru import logger
 
 from acestep import gpu_config
+
 from .init_service_loader_components import InitServiceLoaderComponentsMixin
+
+_SAFETENSORS_DTYPES = {
+    "F32": torch.float32, "BF16": torch.bfloat16, "F16": torch.float16,
+    "I64": torch.int64, "I32": torch.int32, "I16": torch.int16, "I8": torch.int8,
+    "U8": torch.uint8, "BOOL": torch.bool, "F64": torch.float64,
+}
+
+
+def _stream_load_to_cuda(auto_model, checkpoint_path: str, attn: str, dtype):
+    """Build the model directly on CUDA and copy weights tensor by tensor from disk (no mmap)."""
+    import json
+    import struct
+
+    from transformers import AutoConfig
+    from transformers.modeling_utils import no_init_weights
+
+    index_path = os.path.join(checkpoint_path, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        with open(index_path, encoding="utf-8") as fh:
+            shards = sorted(set((json.load(fh).get("weight_map") or {}).values()))
+    else:
+        shards = ["model.safetensors"]
+    config = AutoConfig.from_pretrained(checkpoint_path, trust_remote_code=True)
+    config._attn_implementation = attn
+    logger.info(f"[initialize_service] Streaming {len(shards)} shard(s) straight to CUDA ({attn})")
+    with no_init_weights(), torch.device("cuda"):
+        model = auto_model.from_config(config, trust_remote_code=True, dtype=dtype, attn_implementation=attn)
+    state = model.state_dict()
+    seen = set()
+    for shard in shards:
+        with open(os.path.join(checkpoint_path, shard), "rb") as fh:
+            header_len = struct.unpack("<Q", fh.read(8))[0]
+            header = json.loads(fh.read(header_len))
+            base = 8 + header_len
+            for key, meta in header.items():
+                if key == "__metadata__" or key not in state:
+                    continue
+                start, end = meta["data_offsets"]
+                fh.seek(base + start)
+                buf = bytearray(end - start)
+                fh.readinto(buf)
+                src = torch.frombuffer(buf, dtype=_SAFETENSORS_DTYPES[meta["dtype"]]).reshape(meta["shape"])                     if end > start else torch.empty(meta["shape"], dtype=_SAFETENSORS_DTYPES[meta["dtype"]])
+                state[key].copy_(src)
+                seen.add(key)
+    missing = [k for k in state if k not in seen]
+    if missing:
+        del model, state
+        raise RuntimeError(f"checkpoint is missing {len(missing)} tensors, e.g. {missing[:3]}")
+    return model
 
 
 class InitServiceLoaderMixin(InitServiceLoaderComponentsMixin):
@@ -169,7 +219,20 @@ class InitServiceLoaderMixin(InitServiceLoaderComponentsMixin):
 
         last_attn_error = None
         self.model = None
-        for candidate in attn_candidates:
+        # 为她而唱第六十轮：Windows 上 transformers 用 mmap 一次映射 4 个 5GB 分片，
+        # 可提交内存不够时进程直接访问冲突崩溃（XL 实测必崩）。权重要常驻显存时改成
+        # 先在显存里建空模型、再一个张量一个张量读盘拷进去，内存里最多只留一个张量。
+        streamed = None
+        if device == "cuda" and (not self.offload_to_cpu or not self.offload_dit_to_cpu):
+            try:
+                streamed = _stream_load_to_cuda(AutoModel, model_checkpoint_path, attn_candidates[0], self.dtype)
+                attn_implementation = attn_candidates[0]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[initialize_service] streaming load failed, falling back to from_pretrained: {exc}")
+                streamed = None
+                torch.cuda.empty_cache()
+        self.model = streamed
+        for candidate in ([] if streamed is not None else attn_candidates):
             try:
                 logger.info(f"[initialize_service] Attempting to load model with attention implementation: {candidate}")
                 self.model = AutoModel.from_pretrained(

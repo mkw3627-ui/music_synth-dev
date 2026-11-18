@@ -2018,3 +2018,27 @@ torch 2.9.1+cu128 / numpy 2.2.6 / transformers 4.41.2 / audio-separator 0.48.0 /
 
 复测（同一份旧环境拷贝）：一键安装 142 秒，装了 DDSP 依赖更新 + audio-separator；装完 torch 仍是 2.9.1+cu128，
 numpy 2.2.6、transformers 4.41.2；引导页各项全部就绪；变声、人声分离、SoulX 变声在迁移后的环境里都正常。
+
+---
+
+## 0.3.6：全链路下载 / ACE 部署 / ACE 切换模型实测修复（2026-11-19）
+
+在测试根 `D:\NekoMSTest60`（不碰线上安装）从零走了一遍引导页下载，并在线上宿主把 ACE 每个模型 × 每个原创音色都生成了一遍。
+
+**修复**
+- **XL（4B）原创生成必崩**：transformers 用 mmap 一次映射 4 个 5GB 分片，Windows 可提交内存不够时进程直接访问冲突（0xC0000005），和环境合并无关（旧环境同样崩）。
+  改成权重要放显存时先在显存里建空模型、再逐个张量读盘拷进去（`_stream_load_to_cuda`），内存里最多留一个张量；失败自动退回原加载方式。训练加载（`training_v2/model_loader.py`）同样改了。
+- **带原创音色时多占 8GB 内存**：ACE 加载 LoRA 前会把整个 decoder 备份到内存以便以后卸载；插件 worker 生成完就退出、从不卸载，`ace_runtime` 里跳过这份备份。
+- **XL 生成时为她所听不让位**：腾显存固定按 8GB 算，XL 需要约 12GB，结果不腾、VAE 被挤到 CPU 解码卡 20 分钟。`gpu_sched.make_room` 支持按模型给需要量，XL 传 12GB。
+- **重装 ACE 依赖后原创全挂**：diffusers 0.36 的 torchao 量化模块在定义 logger 之前就用了它，装了 torchao 时一导入就报「logger 未定义」。
+  安装后自动把 logger 定义挪到前面（`_ace_patch_diffusers`），并真导入一次 VAE 校验；ACE 依赖清单补上 `torchao==0.17.0`（小显存 int8 量化要用）。
+- **底模重复下载**：训练页「下载底模」只认 low.pt / high.pt，bases 里已有官方 .sf_dlc 也会再下一遍（高档约 1GB）。改为和引导页同一套判定。
+- **ACE 基础模型少下 3.5GB**：主仓库里的 5Hz LM（acestep-5Hz-lm-1.7B）插件不用（thinking=False），新装时跳过；实测主模型下载 190 秒完成，只剩 turbo + VAE + 文本编码器。
+
+**实测结果**
+- 引导页 ACE 依赖 + 基础模型：测试根从零 359 秒装完，两项就绪；用新装的环境生成 15 秒歌曲成功。
+- ACE 切换模型：turbo / sft / xl-turbo 互切、未下载模型和非法名被拒、删当前模型被拒、坏名字下载被拒，都正常。
+- ACE 生成矩阵（宿主真跑）：turbo、sft、xl-turbo × 无音色 / 沫沫 / 梦梦op / 梦梦max 全部出歌；音色没有对应底模版本时给出明确提示。
+- XL 训练加载：流式加载 18.9 秒、显存 9.3GB，正常。
+- 翻唱模型下载：DDSP 仓库、ContentVec、声码器在测试根装好；国内镜像速度只有 0.05~0.5 MB/s，整套跑完要一个多小时。
+- 翻唱功能基线：和之前一致（只有曲目数、学到的舞台效果变多）。
