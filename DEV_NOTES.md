@@ -1960,3 +1960,22 @@ CPU 重试」只改 `device` 和 `CUDA_VISIBLE_DEVICES`，不改变 `torch.load`
 
 验证（全新目录 + Python 3.10 + 引导页同一个 `setup.install`）：合成环境、DDSP 依赖、采集组件、ACE 依赖
 78 秒全部装好，四项都显示就绪；`import modelscope, proctap._native` 正常，numpy 保持 1.26.4。
+
+---
+
+## 0.3.3：SoulX 和人声分离共用一个环境（2026-11-18）
+
+原来本地有三份 torch：envs\ddsp（2.9.1，numpy 1.26）、envs\sep（2.10，numpy 2.2.6）、envs\soulx（2.10，numpy 2.2.6）。
+sep 和 soulx 的 torch / numpy 完全一致，合并：SoulX 改用 envs\sep，省一份约 5GB。
+
+- SoulX 变声推理只需 transformers 4.41.2 / tokenizers 0.19.1 / huggingface_hub 0.36.2 / safetensors 0.8.0 /
+  omegaconf 2.3.0 / accelerate 1.15.0，装进 sep 后 `pip check` 无冲突，sep 原有 64 个包一个都没变。
+- 没装 SoulX 的 preprocess/requirements.txt：那是歌词转写/训练用的，钉了 numpy<2，会把分离环境弄坏。
+- `_soulx_paths()` 与 `pipeline._soulx_convert` 默认改指 envs\sep；`soulx_install_worker` 不再自建 torch 环境，
+  只往分离环境里补上面几个包（分离环境没装时才自己建）。
+- ddsp 环境不能合：numpy 1.26 vs 2.x、transformers 5.x vs 4.41，强合会坏翻唱。
+
+验证：同一段 30 秒歌，旧 sep 与合并后环境的分离结果逐采样完全一致（差值 0）；SoulX 变声在旧/新环境的差异
+（频谱 3.53dB、音高 4.3 音分）和旧环境自己跑两次的随机波动（3.27dB、4.6 音分）同一量级。
+插件实跑：翻唱全链路 95 秒完成；原创 75 秒 + SoulX 变声全链路完成（convert 引擎 soulx）。
+旧 envs\soulx 已整体移到 E:\NekoMusicSynth\_trash\envs_soulx_merged_20261118（带逐文件清单）。

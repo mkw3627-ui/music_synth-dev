@@ -341,7 +341,7 @@ class Pipeline:
         raw = self.paths.get("raw") or {}
         root = Path(str(self.paths.get("compute_root") or ""))
         python = Path(str(raw.get("soulx_python")
-                          or (root / "envs" / "soulx" / "Scripts" / "python.exe")))
+                          or (root / "envs" / "sep" / "Scripts" / "python.exe")))
         repo = Path(str(raw.get("soulx_repo") or (root / "soulx" / "repo")))
         model = Path(str(raw.get("soulx_model")
                          or (root / "soulx" / "models" / "model-svc.pt")))

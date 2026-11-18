@@ -127,25 +127,32 @@ def main() -> int:
         stop.set()
         status(65, "models_done", "模型下载完成")
 
-        # 3) venv
+        # 3) 运行环境：第五十八轮起和人声分离共用 envs\sep（同为 torch 2.10 + numpy 2.x），
+        #    不再单独建一个 4GB 多的 torch 环境。分离环境还没装时才自己建。
         if not venv_py.is_file():
-            status(68, "venv", "正在创建 SoulX 运行环境…")
+            status(68, "venv", "正在创建运行环境…")
             base = base_python.split()
             run(base + ["-m", "venv", str(venv_dir)], timeout=600)
-        status(70, "pip", "正在升级 pip…")
-        run([str(venv_py), "-m", "pip", "install", "--upgrade",
-             "pip", "setuptools", "wheel"], timeout=1800)
+            run([str(venv_py), "-m", "pip", "install", "--upgrade",
+                 "pip", "setuptools", "wheel"], timeout=1800)
+        probe = subprocess.run([str(venv_py), "-c", "import torch, torchaudio"],
+                               capture_output=True, timeout=300,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if probe.returncode != 0:
+            status(72, "torch", "正在安装 torch（约 2.9GB，较慢，请耐心等）…")
+            run([str(venv_py), "-m", "pip", "install", "--timeout", "120",
+                 "--retries", "20", "torch==2.10.0", "torchaudio==2.10.0",
+                 "--index-url", "https://download.pytorch.org/whl/cu128"],
+                timeout=21600)
 
-        # 4) torch + deps
-        status(72, "torch", "正在安装 torch（约 2.9GB，较慢，请耐心等）…")
-        run([str(venv_py), "-m", "pip", "install", "--timeout", "120",
-             "--retries", "20", "torch==2.10.0", "torchaudio==2.10.0",
-             "--index-url", "https://download.pytorch.org/whl/cu128"],
-            timeout=21600)
-        status(88, "deps", "torch 完成，正在安装 SoulX 依赖…")
-        run([str(venv_py), "-m", "pip", "install", "--timeout", "120",
-             "--retries", "20", "-r",
-             str(repo / "preprocess" / "requirements.txt")], timeout=21600)
+        # 4) SoulX 变声推理只要这几个包（版本和原来独立环境里的一致）。
+        #    不装 preprocess/requirements.txt：那是歌词转写/训练用的，钉 numpy<2，会把分离环境弄坏。
+        status(88, "deps", "正在安装 SoulX 依赖…")
+        run([str(venv_py), "-m", "pip", "install", "--timeout", "120", "--retries", "20",
+             "-i", "https://pypi.tuna.tsinghua.edu.cn/simple",
+             "transformers==4.41.2", "tokenizers==0.19.1", "huggingface_hub==0.36.2",
+             "safetensors==0.8.0", "omegaconf==2.3.0", "accelerate==1.15.0",
+             "librosa", "soundfile", "scipy"], timeout=21600)
         status(100, "done", "SoulX-Singer 安装完成", done=True)
         result.update({"ok": True, "venv": str(venv_py),
                        "repo": str(repo), "models": str(root / "models"),

@@ -7463,7 +7463,8 @@ class MusicSynthPlugin(NekoPluginBase):
         raw = self._pipeline.paths.get("raw") or {}
         return {
             "root": root / "soulx",
-            "python": root / "envs" / "soulx" / "Scripts" / "python.exe",
+            # 第五十八轮：SoulX 和人声分离共用 envs\sep（省一份 4GB 多的 torch）
+            "python": root / "envs" / "sep" / "Scripts" / "python.exe",
             "repo": root / "soulx" / "repo",
             "models": root / "soulx" / "models",
             "preprocess": root / "soulx" / "preprocess",
