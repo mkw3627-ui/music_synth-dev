@@ -27,6 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import runtime
@@ -574,44 +575,153 @@ def _file_ready(spec: dict, path: Path) -> bool:
     return size >= _legacy_min_bytes(spec, path.name)
 
 
+# ---------------------------------------------------------------------------
+# 第六十一轮：动态换源
+# 实测同一个国内镜像直连 2~4 MB/s，走本机代理只有 0.2~0.5 MB/s；官方 HF 反过来只有走代理能通。
+# 所以每个源按「直连 / 代理」两条线路各测一次速度（只取 1MB、6 秒封顶、并发测），从最快的开始下；
+# 下载中途速度掉到明显比备选源慢，就带着 .part 换到下一个源接着下。
+# ---------------------------------------------------------------------------
+PROBE_BYTES = 1 << 20
+PROBE_BUDGET_S = 6.0
+PROBE_TTL_S = 600.0
+SLOW_WINDOW_S = 15.0          # 下载中每 15 秒看一次速度
+SLOW_RATIO = 0.35             # 低于备选源测速的 35% 就换
+SLOW_FLOOR_BPS = 200 * 1024   # 至少慢到 200KB/s 以下才换，免得在两个都不错的源之间来回跳
+_PROBE_CACHE: dict = {}
+_ROUTE_OPENERS: dict = {}
+
+
+class _SlowSource(RuntimeError):
+    """当前源明显比备选源慢：换源（保留 .part 续传），不在同一个源上重试。"""
+
+
+def _proxy_configured() -> bool:
+    try:
+        proxies = urllib.request.getproxies()
+    except Exception:  # noqa: BLE001
+        return False
+    return any(proxies.get(k) for k in ("http", "https", "all"))
+
+
+def _routes() -> list[str]:
+    """可用线路：直连总要试；本机配了代理且代理活着时再加「代理」线路。"""
+    routes = ["direct"]
+    if _proxy_configured() and runtime.proxy_alive():
+        routes.append("proxy")
+    return routes
+
+
+def _route_opener(route: str):
+    # 不挂 _MirrorRedirectGuard：hf-mirror.com 跳到 xethub CDN 在有的宽带上连不通、有的又是最快的
+    # （2026-11-19 本机直连 3.5MB/s），交给测速决定，连不通测出来就是 0、自动排到最后。
+    if route not in _ROUTE_OPENERS:
+        handlers: list = []
+        if route == "direct":
+            handlers.append(urllib.request.ProxyHandler({}))
+        _ROUTE_OPENERS[route] = urllib.request.build_opener(*handlers)
+    return _ROUTE_OPENERS[route]
+
+
+def _probe_speed(url: str, route: str) -> float:
+    """取文件开头 1MB 测速（字节/秒）；连不上 / 不支持续传记 0。结果缓存 10 分钟。"""
+    key = (url, route)
+    hit = _PROBE_CACHE.get(key)
+    if hit and time.time() - hit[0] < PROBE_TTL_S:
+        return hit[1]
+    speed = 0.0
+    started = time.time()
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "NEKO-music-synth/0.2",
+                                                   "Range": f"bytes=0-{PROBE_BYTES - 1}"})
+        with _route_opener(route).open(req, timeout=PROBE_BUDGET_S) as resp:
+            if getattr(resp, "status", 200) == 206:
+                got = 0
+                while got < PROBE_BYTES and time.time() - started < PROBE_BUDGET_S:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    got += len(chunk)
+                speed = got / max(0.05, time.time() - started)
+    except Exception:  # noqa: BLE001 - 测不通就记 0
+        speed = 0.0
+    _PROBE_CACHE[key] = (time.time(), speed)
+    return speed
+
+
+def _rank_sources(urls: list[str]) -> list[tuple[str, str, float]]:
+    """所有 (源, 线路) 并发测速，从快到慢排；测不通的排在最后，仍留作兜底。"""
+    pairs = [(u, r) for u in urls for r in _routes()]
+    with ThreadPoolExecutor(max_workers=max(1, min(8, len(pairs)))) as pool:
+        speeds = list(pool.map(lambda pr: _probe_speed(*pr), pairs))
+    ranked = sorted(zip(pairs, speeds), key=lambda item: -item[1])
+    return [(u, r, sp) for (u, r), sp in ranked]
+
+
+def _host(url: str) -> str:
+    return (urllib.parse.urlsplit(url).hostname or "").lower()
+
+
+def _route_name(route: str) -> str:
+    return "直连" if route == "direct" else "代理"
+
+
 def _download_file(url: str, target: Path, progress, label: str,
-                   expected_bytes: int = 0, timeout: float = 120.0) -> None:
-    """Resumable download with mirrors, dead-proxy bypass and slow-source failover."""
+                   expected_bytes: int = 0, timeout: float = 120.0,
+                   alternatives: list[str] | None = None) -> None:
+    """Resumable download with mirrors, dead-proxy bypass and dynamic fastest-source selection.
+
+    ``alternatives``：同一个文件的其它地址（例如另外几个 HF 镜像），和 ``url`` 一起测速排序。
+    """
     errors: list[str] = []
     proxy_retried = False
     part = target.with_name(target.name + ".part")
     round_no = 0
+    urls: list[str] = []
+    for u in [url, *(alternatives or [])]:
+        for m in _mirror_urls(u):
+            if m not in urls:
+                urls.append(m)
     while True:
         round_no += 1
         network_only = True
-        candidates = _mirror_urls(url)
+        ranked = _rank_sources(urls)
         if part.exists() and part.stat().st_size > 0:
             # 有已下载的部分：优先挑支持 Range 的源续传，别让「不支持续传」的源
             # 用一个完整 200 响应把进度打回 0。
-            ranged = [c for c in candidates
-                      if (urllib.parse.urlsplit(c).hostname or "").lower() not in _NO_RANGE_HOSTS]
-            if ranged:
-                candidates = ranged
+            kept = [x for x in ranked if _host(x[0]) not in _NO_RANGE_HOSTS]
+            if kept:
+                ranked = kept
             else:
                 part.unlink(missing_ok=True)
                 _NO_RANGE_HOSTS.clear()
-        for candidate in candidates:
+        if ranked and ranked[0][2] > 0:
+            top = "、".join(f"{_host(u)}（{_route_name(r)} {sp / 2**20:.1f}MB/s）"
+                           for u, r, sp in ranked[:3] if sp > 0)
+            _say(f"{label}: 测速排序 {top}")
+            if progress:
+                progress(f"{label}：测速后选用 {_host(ranked[0][0])}（{_route_name(ranked[0][1])}）")
+        for idx, (candidate, route, _probe_bps) in enumerate(ranked):
             # 镜像只给一半的超时：某个镜像挂了别让用户等满 120 秒，快速换下一个。
             wait = timeout if candidate == url else min(timeout, 45.0)
+            # 比后面最快的备选源慢到 35% 以下（且低于 200KB/s）就换；后面没有能用的源时不换。
+            best_other = max((sp for _, _, sp in ranked[idx + 1:]), default=0.0)
+            min_bps = min(SLOW_FLOOR_BPS, best_other * SLOW_RATIO) if best_other > 0 else 0.0
             resume_tries = 0
             while True:
                 before = part.stat().st_size if part.exists() else 0
                 try:
-                    _download_one(candidate, target, progress, label, expected_bytes, wait)
-                    if candidate != url:
-                        _say(f"{label}: 已通过国内镜像 {urllib.parse.urlsplit(candidate).hostname} 下载")
+                    _download_one(candidate, target, progress, label, expected_bytes, wait,
+                                  route=route, min_bps=min_bps)
+                    _say(f"{label}: 已通过 {_host(candidate)}（{_route_name(route)}）下载")
                     return
                 except (OSError, urllib.error.URLError, urllib.error.HTTPError,
                         http.client.HTTPException, RuntimeError) as exc:
                     if not _network_down_error(exc):
                         network_only = False
-                    errors.append(f"{urllib.parse.urlsplit(candidate).hostname}: {exc}")
+                    errors.append(f"{_host(candidate)}[{_route_name(route)}]: {exc}")
                     _say(f"{label}: {errors[-1][:160]}，换源重试")
+                    if isinstance(exc, _SlowSource):
+                        break
                     after = part.stat().st_size if part.exists() else 0
                     # 连接被掐断（IncompleteRead / 连接重置）时 .part 已经落了一部分，
                     # 同一个源接着下比从头换源快得多。最多续传两次，避免死循环。
@@ -641,7 +751,8 @@ def _download_file(url: str, target: Path, progress, label: str,
 
 
 def _download_one(url: str, target: Path, progress, label: str,
-                  expected_bytes: int, timeout: float) -> None:
+                  expected_bytes: int, timeout: float, route: str = "",
+                  min_bps: float = 0.0) -> None:
     """One source: Range-resume into ``target.part`` then rename."""
     target.parent.mkdir(parents=True, exist_ok=True)
     part = target.with_name(target.name + ".part")
@@ -652,7 +763,7 @@ def _download_one(url: str, target: Path, progress, label: str,
     req = urllib.request.Request(url, headers=headers)
     started = time.time()
     try:
-        resp = _opener().open(req, timeout=timeout)
+        resp = (_route_opener(route) if route else _opener()).open(req, timeout=timeout)
     except urllib.error.HTTPError as exc:
         if exc.code == 416 and part.exists():
             size = part.stat().st_size
@@ -672,6 +783,7 @@ def _download_one(url: str, target: Path, progress, label: str,
         mode = "ab" if pos else "wb"
         done = pos
         base = pos
+        win_start, win_bytes = time.time(), 0
         with part.open(mode) as fh:
             while True:
                 # 连接卡死时 read() 会阻塞到 socket 超时，先按「20 秒没进度」判死。
@@ -682,6 +794,14 @@ def _download_one(url: str, target: Path, progress, label: str,
                     break
                 fh.write(chunk)
                 done += len(chunk)
+                win_bytes += len(chunk)
+                # 动态换源：每 15 秒算一次速度，明显比备选源慢就换（.part 留给下一个源续传）
+                if min_bps and time.time() - win_start >= SLOW_WINDOW_S:
+                    bps = win_bytes / max(0.001, time.time() - win_start)
+                    if bps < min_bps:
+                        _PROBE_CACHE[(url, route)] = (time.time(), bps)
+                        raise _SlowSource(f"速度只有 {bps / 1024:.0f}KB/s，比备选源慢很多，换源")
+                    win_start, win_bytes = time.time(), 0
                 if progress and total:
                     progress(f"{label}：{done / 2**20:.0f}/{total / 2**20:.0f} MB")
                 elif progress and expected_bytes:
@@ -1191,15 +1311,10 @@ def _download_http_model(paths: dict, spec: dict, progress, label: str) -> None:
         target = target_dir / filename
         if _file_ready(spec, target):
             continue
-        errors = []
-        for url in urls:
-            try:
-                _download_file(url, target, progress, label, timeout=40)
-                break
-            except (OSError, urllib.error.URLError, RuntimeError) as exc:
-                errors.append(f"{url}: {exc}")
-        else:
-            raise RuntimeError(f"{filename} 下载失败：" + "; ".join(errors)[-1200:])
+        try:
+            _download_file(urls[0], target, progress, label, timeout=40, alternatives=urls[1:])
+        except (OSError, urllib.error.URLError, RuntimeError) as exc:
+            raise RuntimeError(f"{filename} 下载失败：{exc}"[-1200:]) from exc
 
 
 def _install_dlc_model(paths: dict, spec: dict, progress, label: str, python) -> None:
@@ -1218,18 +1333,15 @@ def _install_dlc_model(paths: dict, spec: dict, progress, label: str, python) ->
         urls.insert(0, spec["url"])
     if not urls:
         urls = list(REFLOW_BASE_URLS)
-    for url in urls:
+    try:
+        _download_file(urls[0], dlc, progress, label, timeout=600, alternatives=urls[1:])
+    except (OSError, urllib.error.URLError, RuntimeError) as exc:
+        errors.append(str(exc))
         try:
-            _download_file(url, dlc, progress, label, timeout=600)
-            break
-        except (OSError, urllib.error.URLError, RuntimeError) as exc:
-            errors.append(f"{url}: {exc}")
-            try:
-                dlc.unlink(missing_ok=True)
-            except OSError:
-                pass
-    else:
-        raise RuntimeError("底模下载失败：" + "; ".join(errors)[-1200:])
+            dlc.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RuntimeError("底模下载失败：" + "; ".join(errors)[-1200:]) from exc
 
     py = Path(str(python))
     if not py.is_file():
@@ -1281,15 +1393,11 @@ def _download_sep_weights(paths: dict, progress, label: str) -> None:
         target = target_dir / filename
         if _file_ready(MODEL_ITEMS["sep_karaoke"], target):
             continue
-        errors = []
-        for url in _sep_weight_urls(filename):
-            try:
-                _download_file(url, target, progress, label, timeout=40)
-                break
-            except (OSError, urllib.error.URLError, RuntimeError) as exc:
-                errors.append(f"{url}: {exc}")
-        else:
-            raise RuntimeError(f"{filename} 下载失败：" + "; ".join(errors)[-1200:])
+        urls = _sep_weight_urls(filename)
+        try:
+            _download_file(urls[0], target, progress, label, timeout=40, alternatives=urls[1:])
+        except (OSError, urllib.error.URLError, RuntimeError) as exc:
+            raise RuntimeError(f"{filename} 下载失败：{exc}"[-1200:]) from exc
 
 
 REDOWNLOAD_KEYS = ("ddsp_contentvec", "sep_karaoke")
