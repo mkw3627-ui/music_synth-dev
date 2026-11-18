@@ -492,7 +492,9 @@ def resolve_paths(data_dir: Path, host_section: dict | None = None) -> dict:
         "base_python": Path(pick("base_python")) if pick("base_python") else "",
         "data_dir": Path(data_dir),
         "synth_python": Path(pick("synth_python") or (envs_dir / "ddsp" / "Scripts" / "python.exe")),
-        "sep_python": Path(pick("sep_python") or (envs_dir / "sep" / "Scripts" / "python.exe")),
+        # 第五十九轮：翻唱 / 原创 / 人声分离 / SoulX 共用一个环境 envs\ddsp（torch 2.9.1 + numpy 2.2.6），
+        # 省掉单独的分离环境。用户在配置里单独指定过的仍然优先。
+        "sep_python": Path(pick("sep_python") or (envs_dir / "ddsp" / "Scripts" / "python.exe")),
         "ddsp_root": ddsp_root,
         "ddsp_ckpt": ddsp_ckpt,
         "ddsp_config": ddsp_root / "configs" / "reflow.yaml",

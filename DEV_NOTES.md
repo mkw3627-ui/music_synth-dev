@@ -1979,3 +1979,26 @@ sep 和 soulx 的 torch / numpy 完全一致，合并：SoulX 改用 envs\sep，
 （频谱 3.53dB、音高 4.3 音分）和旧环境自己跑两次的随机波动（3.27dB、4.6 音分）同一量级。
 插件实跑：翻唱全链路 95 秒完成；原创 75 秒 + SoulX 变声全链路完成（convert 引擎 soulx）。
 旧 envs\soulx 已整体移到 E:\NekoMusicSynth\_trash\envs_soulx_merged_20261118（带逐文件清单）。
+
+---
+
+## 0.3.4：所有功能合并到一个运行环境（2026-11-18）
+
+0.3.3 已把 SoulX 并进分离环境；这次把翻唱 DDSP 也并进来，最终只剩一个 `envs\ddsp`：
+torch 2.9.1+cu128 / numpy 2.2.6 / transformers 4.41.2 / audio-separator 0.48.0 / onnxruntime 1.23.2，Python 3.11。
+
+- 第一次尝试以分离环境（Python 3.10）为底：变声、原创、采集都正常，但 DDSP 训练的特征提取（多进程）
+  在 3.10 下 pickle 失败（`DotDict.__getattr__` 用 `*args` 写法，3.10 的 pickle 取 `__reduce_ex__` 时拿到 None）。
+  弃用，改以原 ddsp 环境（Python 3.11）为底，往里装分离和 SoulX 的包。
+- 安装器：`DDSP_PACKAGES` 钉 numpy 2.2.6 / transformers 4.41.2 等；`sep_env` 也建在 envs\ddsp；
+  共用环境时不再重复装 torch；采集组件钉的 numpy 同步改成 2.2.6。
+- 默认路径：`sep_python`、SoulX 的 python 都指向 envs\ddsp（用户配置里单独指定的仍优先）。
+
+实测（新环境 vs 旧环境）：
+- DDSP 变声：频谱差 2.16dB、音高差 2.1 音分；旧环境自己跑两次是 2.23dB / 2.3 音分 → 在随机波动内。
+- 人声分离：与旧 sep 的 SNR 74dB（旧 sep 自己两次 248dB，即逐采样一致）；人声+伴奏还原原曲的误差两边完全相同。
+  差异来自 torch 2.10→2.9.1 的浮点细节，听不出来。
+- DDSP 训练：特征提取 20 秒完成，训练正常推进（约 15 步/秒，loss 正常下降）。
+- SoulX 变声、ACE 原创生成、采集组件导入：全部正常。
+- 插件实跑：翻唱全链路 106 秒；原创 75 秒 + SoulX 变声全链路完成；引导页 21 项、SoulX、采集均就绪。
+旧 envs\ddsp、envs\sep 及测试环境移到 E:\NekoMusicSynth\_trash\envs_merge_tests_20261118（带逐文件清单）。

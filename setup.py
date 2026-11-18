@@ -168,23 +168,26 @@ MODEL_ITEMS = {
 
 # DDSP-SVC 6.3 requirements.txt (torch is installed separately with the CUDA
 # index so we never swap a working cu128 build for a CPU wheel).
+# 第五十九轮：翻唱 / 原创 / 人声分离 / SoulX 共用一个环境（envs\ddsp）。版本按实测通过的组合钉住：
+# numpy 2.2.6（audio-separator 要 numpy>=2）、transformers 4.41.2（SoulX 要；DDSP 变声和训练在它上面实测正常）。
 DDSP_PACKAGES = [
-    "librosa", "matplotlib", "numpy==1.26.4", "praat-parselmouth", "pyworld",
+    "librosa", "matplotlib", "numpy==2.2.6", "praat-parselmouth", "pyworld",
     "PyYAML", "resampy", "scikit_learn", "scipy", "sounddevice", "soundfile",
-    "tensorboard", "torchcrepe", "torchfcpe", "tqdm", "transformers",
+    "tensorboard", "torchcrepe", "torchfcpe", "tqdm", "transformers==4.41.2",
+    "tokenizers==0.19.1", "huggingface_hub==0.36.2", "safetensors==0.8.0",
+    "omegaconf==2.3.0", "accelerate==1.15.0",
 ]
 
 SEP_PACKAGES = [
-    "audio-separator>=0.48", "soundfile", "librosa", "psutil", "pyyaml",
+    "audio-separator==0.48.0", "soundfile", "librosa", "psutil", "pyyaml", "numpy==2.2.6",
 ]
 
 # 原生扩展：市场禁止插件包带二进制，只能安装时装进合成环境。
 # proc-tap 提供逐应用 WASAPI 采集，winrt 提供系统媒体信息（SMTC）。
 CAPTURE_NATIVE_PACKAGES = [
     "proc-tap==1.1.1", "winrt-Windows.Media.Control",
-    # 第五十六轮：proc-tap 依赖 numpy/scipy，不钉住的话 pip 会把合成环境的 numpy 1.26.4 升到 2.x，
-    # torch/DDSP 随后导入失败（新机器上「采集组件装完、变声坏了」）。和 DDSP_PACKAGES 保持同一版本。
-    "numpy==1.26.4",
+    # 钉住 numpy：和 DDSP_PACKAGES 保持同一版本，免得 pip 顺手改掉共用环境的 numpy。
+    "numpy==2.2.6",
 ]
 
 
@@ -1978,7 +1981,8 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
             errors.append({"item": "base_python", "error": f"{type(exc).__name__}: {exc}"})
 
     def need_venv(key: str) -> Path | None:
-        spec = {"synth_env": ("envs_dir", "ddsp"), "sep_env": ("envs_dir", "sep")}[key]
+        # 第五十九轮：分离不再单独建环境，和合成共用 envs\ddsp
+        spec = {"synth_env": ("envs_dir", "ddsp"), "sep_env": ("envs_dir", "ddsp")}[key]
         if not base:
             errors.append({"item": key, "error": "没有可用的基础 Python，无法创建虚拟环境"})
             return None
@@ -2055,11 +2059,13 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
                                "need_restart": bool(res.get("need_restart"))})
 
     if sep_py.is_file() and ("sep_env" in requested or "audio_separator" in requested):
-        try:
-            _pip(sep_py, ["--index-url", index, "torch", "torchaudio"], progress,
-                 f"安装分离环境 torch（{torch_label}）", head="分离环境（audio-separator venv）")
-        except Exception as exc:  # noqa: BLE001
-            errors.append({"item": "sep_torch", "error": str(exc)})
+        # 和合成共用一个环境时 torch 已经装过，不再重复装
+        if sep_py.resolve() != synth_py.resolve() or "torch" not in installed:
+            try:
+                _pip(sep_py, ["--index-url", index, "torch", "torchaudio"], progress,
+                     f"安装分离环境 torch（{torch_label}）", head="分离环境（audio-separator venv）")
+            except Exception as exc:  # noqa: BLE001
+                errors.append({"item": "sep_torch", "error": str(exc)})
         try:
             _pip(sep_py, SEP_PACKAGES, progress, "安装 audio-separator 依赖", head="audio-separator")
             installed.append("audio_separator")
