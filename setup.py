@@ -876,6 +876,16 @@ def ddsp_deps_status(python) -> tuple[bool, str]:
                     miss = ["?"]
                 break
         res = (not miss, "完整" if not miss else "缺少：" + "、".join(str(m) for m in miss))
+        if not miss:
+            want = {x.split("==")[0].lower(): x.split("==")[1] for x in DDSP_PACKAGES if "==" in x}
+            have = {}
+            for name in ("numpy", "transformers"):
+                v = runtime.dist_version(p, name)
+                if v:
+                    have[name] = v
+            stale = [f"{k} {have[k]}→{want[k]}" for k in have if k in want and have[k] != want[k]]
+            if stale:
+                res = (False, "需要更新到共用环境的版本：" + "、".join(stale))
     _DEPS_CACHE[key] = res
     return res
 
@@ -885,6 +895,18 @@ def invalidate_deps_cache(python) -> None:
     for k in list(_DEPS_CACHE):
         if k[0] == target:
             _DEPS_CACHE.pop(k, None)
+
+
+def _torch_pin(python) -> str:
+    """环境里已装 torch 的版本号（含 +cu128 后缀），没装返回空。用来在补装依赖时钉住 torch，不让 pip 换掉。"""
+    try:
+        out = subprocess.run([str(python), "-c", "import importlib.metadata as m;print(m.version('torch'))"],
+                             capture_output=True, text=True, errors="replace", timeout=120,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        v = (out.stdout or "").strip().splitlines()[-1] if out.returncode == 0 and out.stdout.strip() else ""
+        return v
+    except (OSError, subprocess.SubprocessError, IndexError):
+        return ""
 
 
 def _torch_index(gpu: dict | None) -> str:
@@ -2031,7 +2053,9 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
             errors.append({"item": "torch", "error": str(exc)})
     if ("synth_env" in requested or "ddsp_deps" in requested) and synth_py.is_file():
         try:
-            _pip(synth_py, DDSP_PACKAGES, progress, "安装 DDSP-SVC 依赖", head="安装 DDSP-SVC 依赖")
+            tv = _torch_pin(synth_py)
+            extra = ([f"torch=={tv}", f"torchaudio=={tv}", "--extra-index-url", index] if tv else [])
+            _pip(synth_py, DDSP_PACKAGES + extra, progress, "安装 DDSP-SVC 依赖", head="安装 DDSP-SVC 依赖")
             installed.append("synth_deps")
             invalidate_deps_cache(synth_py)
         except Exception as exc:  # noqa: BLE001
@@ -2067,7 +2091,16 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
             except Exception as exc:  # noqa: BLE001
                 errors.append({"item": "sep_torch", "error": str(exc)})
         try:
-            _pip(sep_py, SEP_PACKAGES, progress, "安装 audio-separator 依赖", head="audio-separator")
+            shared = sep_py.resolve() == synth_py.resolve()
+            pins = list(SEP_PACKAGES)
+            tv = _torch_pin(sep_py)
+            if tv:
+                # 第五十九轮实测：不钉 torch 时 pip 会从普通 PyPI 拉 CPU 版 torch 2.15 把显卡版换掉
+                pins += [f"torch=={tv}", f"torchaudio=={tv}"]
+            if shared:
+                pins += [x for x in DDSP_PACKAGES if "==" in x and x.split("==")[0] not in {y.split("==")[0] for y in pins}]
+            _pip(sep_py, pins + (["--extra-index-url", index] if tv else []), progress,
+                 "安装 audio-separator 依赖", head="audio-separator")
             installed.append("audio_separator")
         except Exception as exc:  # noqa: BLE001
             errors.append({"item": "audio_separator", "error": str(exc)})

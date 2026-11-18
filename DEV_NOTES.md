@@ -2002,3 +2002,19 @@ torch 2.9.1+cu128 / numpy 2.2.6 / transformers 4.41.2 / audio-separator 0.48.0 /
 - SoulX 变声、ACE 原创生成、采集组件导入：全部正常。
 - 插件实跑：翻唱全链路 106 秒；原创 75 秒 + SoulX 变声全链路完成；引导页 21 项、SoulX、采集均就绪。
 旧 envs\ddsp、envs\sep 及测试环境移到 E:\NekoMusicSynth\_trash\envs_merge_tests_20261118（带逐文件清单）。
+
+---
+
+## 0.3.5：老用户升级到共用环境的迁移修复（2026-11-18）
+
+发布 0.3.4 前，用旧版翻唱环境（numpy 1.26、无 audio-separator）的拷贝模拟老用户升级，点「一键安装」后发现：
+- pip 顺着 audio-separator 从普通 PyPI 拉了 CPU 版 torch 2.15，把显卡版 torch 2.9.1+cu128 换掉了（引导页报 torch 是 CPU 版）；
+- numpy / transformers 停在旧版本，引导页却显示「完整」，SoulX / 分离会在旧版本上出错。
+
+修复（setup.py）：
+- 新增 `_torch_pin()`：补装依赖时把环境里已有的 torch / torchaudio 版本钉住，并带上 torch 官方源，不让 pip 换掉；
+- 分离依赖装进共用环境时，顺带把共用环境的版本钉（numpy 2.2.6、transformers 4.41.2 等）一起装上；
+- `ddsp_deps_status`：numpy / transformers 版本和共用环境要求不一致时判为「需要更新」，一键安装会统一过来。
+
+复测（同一份旧环境拷贝）：一键安装 142 秒，装了 DDSP 依赖更新 + audio-separator；装完 torch 仍是 2.9.1+cu128，
+numpy 2.2.6、transformers 4.41.2；引导页各项全部就绪；变声、人声分离、SoulX 变声在迁移后的环境里都正常。
