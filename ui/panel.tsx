@@ -122,7 +122,7 @@ export default function Panel(props: any) {
           .ms-side { flex: 0 0 214px; position: sticky; top: 8px; border-radius: 28px; }
           .ms-sidebar { display: flex; flex-direction: column; gap: 5px; padding: 14px 12px;
             background: linear-gradient(165deg, #ffffff 0%, #fffafc 58%, #fff3f8 100%);
-            backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+            /* 侧栏底色是实心白，背景模糊看不出来、只多耗显卡，第七十轮去掉 */
             border-radius: 28px; border: 1px solid rgba(255,255,255,0.98);
             box-shadow: 0 12px 32px rgba(142,159,187,0.16), 0 2px 6px rgba(224,45,118,0.05);
             overflow: hidden; }

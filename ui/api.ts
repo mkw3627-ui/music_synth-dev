@@ -60,11 +60,16 @@ export async function viaRuns(entryId: string, args: any, timeoutMs: number): Pr
 
 /** 跑一次入口，返回 /runs/{id}/export 的原始载荷（不剥壳）。 */
 async function runsPayload(entryId: string, args: any, timeoutMs: number): Promise<any> {
-  const resp = await fetch(ORIGIN + "/runs", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ plugin_id: PLUGIN_ID, entry_id: entryId, args: args || {} }),
-  })
+  let resp: Response
+  try {
+    resp = await fetch(ORIGIN + "/runs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ plugin_id: PLUGIN_ID, entry_id: entryId, args: args || {} }),
+    })
+  } catch (e: any) {
+    throw Error("连不上插件服务（127.0.0.1:48916）：N.E.K.O 可能还没启动完，或插件服务被关掉了")
+  }
   if (!resp.ok) throw Error("创建任务失败：HTTP " + resp.status)
   const data = await resp.json()
   const runId = data.run_id || data.id
@@ -85,12 +90,43 @@ async function runsPayload(entryId: string, args: any, timeoutMs: number): Promi
     }
     if (status === "failed" || status === "canceled" || status === "timeout") {
       const detail: any = rec && (rec.error || rec.message)
-      throw Error(typeof detail === "string" && detail
-        ? detail
-        : (detail ? JSON.stringify(detail).slice(0, 300) : ("任务" + status)))
+      throw runError(detail, status)
     }
   }
   throw Error("任务超时（" + Math.round(timeoutMs / 1000) + " 秒）")
+}
+
+/**
+ * 把 /runs 的失败原因翻成人话。插件没在跑（宿主切换角色、插件崩了、被手动停了）时宿主回
+ * NOT_FOUND / PLUGIN_NOT_RUNNING：这种错误带 notRunning 标记，面板可以直接给「启动插件」按钮，
+ * 而不是转去等一个不会回话的备用通道。
+ */
+function runError(detail: any, status: string): Error {
+  const code = String((detail && typeof detail === "object" && detail.code) || "")
+  const msg = typeof detail === "string" ? detail
+    : String((detail && detail.message) || "") || (detail ? JSON.stringify(detail).slice(0, 300) : ("任务" + status))
+  if (code === "NOT_FOUND" || code === "PLUGIN_NOT_RUNNING" || /not found\/registered|not running/i.test(msg)) {
+    const err: any = Error("「为她而唱」插件现在没有在运行（" + (code || "not running") + "）。点「启动插件」，或重启 N.E.K.O 后再试。")
+    err.notRunning = true
+    err.final = true
+    return err
+  }
+  return Error(msg)
+}
+
+/**
+ * 插件没在跑时，由面板直接让插件服务把它拉起来（和插件管理页的「启动」按钮是同一个接口）。
+ * 这个接口要 CSRF 令牌（浏览器带 Origin 时不给令牌一律 403）：和插件管理页一样先 GET 一次令牌。
+ */
+export async function startPlugin(): Promise<boolean> {
+  try {
+    const t: any = await fetch(ORIGIN + "/security/csrf-token").then((r) => r.json())
+    const token = String((t && t.csrf_token) || "")
+    const r = await fetch(ORIGIN + "/plugin/" + PLUGIN_ID + "/start", {
+      method: "POST", headers: token ? { "X-CSRF-Token": token } : {},
+    })
+    return r.ok
+  } catch (e) { return false }
 }
 
 /** 不按 ok=false 判失败地剥壳：登录/检测类入口常用 ok=false 表示「还没就绪」。 */
@@ -128,8 +164,25 @@ export async function callEntryLoose(api: Api, entryId: string, args: any = {},
   try {
     return unwrapLoose(readExportLoose(await runsPayload(entryId, args, timeoutMs)))
   } catch (first: any) {
+    // 以前这里出错就转去等宿主的备用通道，而且不限时：新版宿主根本不接那条消息，
+    // 用户要干等 3 分钟，最后只看到「宿主没有回应」，真正的原因（插件没在运行等）被吞掉了。
+    // 现在和 callEntry 一样：插件明确的失败直接抛；备用通道最多等 20 秒，失败时两条原因都带上。
+    if (first && first.final) throw first
     if (!api || typeof api.call !== "function") throw first
-    return unwrapLoose(await api.call(entryId, args, { userInitiated: true }))
+    try {
+      const fallback: any = api.call(entryId, args, { userInitiated: true })
+      try { fallback.catch(() => {}) } catch (e) { /* 非 Promise */ }
+      const cap = Math.min(Math.max(timeoutMs, 5000), 20000)
+      const got: any = await Promise.race([
+        fallback,
+        new Promise((_, reject) => setTimeout(
+          () => reject(Error("备用通道超时（" + Math.round(cap / 1000) + " 秒）")), cap)),
+      ])
+      return unwrapLoose(got)
+    } catch (second: any) {
+      throw Error(String((first && first.message) || first) + "；备用通道：" +
+        String((second && second.message) || second))
+    }
   }
 }
 

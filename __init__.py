@@ -414,12 +414,25 @@ class MusicSynthPlugin(NekoPluginBase):
         return Ok({"status": "ready", "resumed_training": resumed,
                    "resuming_tracks": len(resume_ids)})
 
+    # 第七十轮：以前这里少了 @lifecycle，宿主停插件时根本不会调到它——口型服务、录音子进程都留在后台
+    @lifecycle(id="shutdown")
     async def shutdown(self, **_):
         self._shutdown = True
+        self._idle_stop = True
         try:
             lips_server.stop()
         except Exception:  # noqa: BLE001 - 卸载时停不掉口型服务不影响退出
             pass
+        # 第七十轮：插件进程退出不会带走录音子进程（宿主切角色会把插件全停掉），
+        # 以前每停一次就在后台留下一组录音进程（venv 启动器 + 解释器 + 采集子进程共 4 个），
+        # 下次启动又起一组。这里在退出前把它结束；不留「手动关闭」记号，下次启动照常自动听。
+        try:
+            listener = getattr(self, "_song_listener", None)
+            if listener is not None:
+                await asyncio.to_thread(listener.stop, False)
+                await asyncio.to_thread(listener.cleanup_stale_worker)
+        except Exception as exc:  # noqa: BLE001 - 收不干净下次启动时 cleanup_stale_worker 还会再收一次
+            self.logger.warning("[listener] 退出时结束录音进程失败：%s", exc)
         return Ok({"status": "stopped"})
 
     # ------------------------------------------------------------------
@@ -1114,6 +1127,13 @@ class MusicSynthPlugin(NekoPluginBase):
                 detail = "安装完成" if result.get("ok") else "安装未全部完成：" + "；".join(errs)
                 self._job_update(job_id, state="done" if result.get("ok") else "failed",
                                  progress=100, detail=detail[-500:], result=result)
+                # 新机器装好环境后补起空闲学习（启动时因为没装好被跳过了）
+                if result.get("ok"):
+                    try:
+                        self._reload_paths()
+                        self._start_idle_learner()
+                    except Exception as exc:  # noqa: BLE001 - 学不了只是没有新风格，不影响安装结果
+                        self.logger.info("[asset-lib] 装好后启动空闲学习失败：%s", exc)
             except Exception as exc:  # noqa: BLE001
                 self._job_update(job_id, state="failed", progress=100,
                                  detail=f"{type(exc).__name__}: {exc}")
@@ -4745,6 +4765,10 @@ class MusicSynthPlugin(NekoPluginBase):
         idle_s = self._system_idle_seconds()
         if idle_s < 600:
             reasons.append("电脑在使用（%d 分钟内有键鼠操作）" % max(1, int((600 - idle_s) / 60) or 1))
+            # 第七十轮：用户在用电脑时直接返回，不去问显卡、不采样 CPU。
+            # 以前每分钟都跑一次 nvidia-smi + 1 秒 CPU 采样，有的机器上问驱动会让画面周期性卡一下。
+            return {"can_learn": False, "reason": "；".join(reasons), "idle_s": int(idle_s),
+                    "gpu_util": None, "gpu_mem": None, "cpu": None}
         try:
             if lips_server.status().get("active"):
                 reasons.append("正在唱歌")
@@ -4814,6 +4838,13 @@ class MusicSynthPlugin(NekoPluginBase):
         """空闲学习：电脑 10 分钟没人用、且没在唱歌/处理时，每 30 分钟最多学一轮
         （从允许的来源下几张参考图 → 学成风格参数 → 原图移入回收站 → 更新效果库）。设置 asset_idle_learn=false 可关。"""
         if getattr(self, "_idle_learner", None) or not getattr(self, "_assets", None):
+            return
+        # 第七十轮：还没装好运行环境的新机器不起空闲学习（看图模型、合成环境都没有，学不了，只会白白轮询）
+        try:
+            if not Path(str(self._pipeline.paths.get("synth_python") or "")).is_file():
+                self.logger.info("[asset-lib] 运行环境还没装好，空闲学习不启动")
+                return
+        except Exception:  # noqa: BLE001
             return
 
         def loop():

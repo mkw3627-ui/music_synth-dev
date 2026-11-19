@@ -492,11 +492,16 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     return readExport(await runsPayload(entryId, args, timeoutMs));
   }
   async function runsPayload(entryId, args, timeoutMs) {
-    const resp = await fetch(ORIGIN + "/runs", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ plugin_id: PLUGIN_ID, entry_id: entryId, args: args || {} })
-    });
+    let resp;
+    try {
+      resp = await fetch(ORIGIN + "/runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ plugin_id: PLUGIN_ID, entry_id: entryId, args: args || {} })
+      });
+    } catch (e) {
+      throw Error("连不上插件服务（127.0.0.1:48916）：N.E.K.O 可能还没启动完，或插件服务被关掉了");
+    }
     if (!resp.ok) throw Error("创建任务失败：HTTP " + resp.status);
     const data = await resp.json();
     const runId = data.run_id || data.id;
@@ -519,10 +524,34 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       }
       if (status === "failed" || status === "canceled" || status === "timeout") {
         const detail = rec && (rec.error || rec.message);
-        throw Error(typeof detail === "string" && detail ? detail : detail ? JSON.stringify(detail).slice(0, 300) : "任务" + status);
+        throw runError(detail, status);
       }
     }
     throw Error("任务超时（" + Math.round(timeoutMs / 1e3) + " 秒）");
+  }
+  function runError(detail, status) {
+    const code = String(detail && typeof detail === "object" && detail.code || "");
+    const msg = typeof detail === "string" ? detail : String(detail && detail.message || "") || (detail ? JSON.stringify(detail).slice(0, 300) : "任务" + status);
+    if (code === "NOT_FOUND" || code === "PLUGIN_NOT_RUNNING" || /not found\/registered|not running/i.test(msg)) {
+      const err = Error("「为她而唱」插件现在没有在运行（" + (code || "not running") + "）。点「启动插件」，或重启 N.E.K.O 后再试。");
+      err.notRunning = true;
+      err.final = true;
+      return err;
+    }
+    return Error(msg);
+  }
+  async function startPlugin() {
+    try {
+      const t = await fetch(ORIGIN + "/security/csrf-token").then((r2) => r2.json());
+      const token = String(t && t.csrf_token || "");
+      const r = await fetch(ORIGIN + "/plugin/" + PLUGIN_ID + "/start", {
+        method: "POST",
+        headers: token ? { "X-CSRF-Token": token } : {}
+      });
+      return r.ok;
+    } catch (e) {
+      return false;
+    }
   }
   function unwrapLoose(response) {
     let data = response;
@@ -562,8 +591,27 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     try {
       return unwrapLoose(readExportLoose(await runsPayload(entryId, args, timeoutMs)));
     } catch (first) {
+      if (first && first.final) throw first;
       if (!api || typeof api.call !== "function") throw first;
-      return unwrapLoose(await api.call(entryId, args, { userInitiated: true }));
+      try {
+        const fallback = api.call(entryId, args, { userInitiated: true });
+        try {
+          fallback.catch(() => {
+          });
+        } catch (e) {
+        }
+        const cap = Math.min(Math.max(timeoutMs, 5e3), 2e4);
+        const got = await Promise.race([
+          fallback,
+          new Promise((_, reject) => setTimeout(
+            () => reject(Error("备用通道超时（" + Math.round(cap / 1e3) + " 秒）")),
+            cap
+          ))
+        ]);
+        return unwrapLoose(got);
+      } catch (second) {
+        throw Error(String(first && first.message || first) + "；备用通道：" + String(second && second.message || second));
+      }
     }
   }
   async function callEntry(api, entryId, args = {}, timeoutMs = 12e4) {
@@ -5687,6 +5735,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const [pickNote, setPickNote] = useState("");
     const [pickManual, setPickManual] = useState(false);
     const [pathErr, setPathErr] = useState("");
+    const [notRunning, setNotRunning] = useState(false);
     const pickRun = useRef(0);
     const [job, setJob] = useState(null);
     const [prog, setProg] = useState(null);
@@ -5698,6 +5747,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const check = async () => {
       setBusy("check");
       setErr("");
+      setNotRunning(false);
       try {
         const r = await callEntryLoose(props.api, "ms_setup_check", {}, 18e4);
         if (!r || !Array.isArray(r.items)) throw Error("没有拿到清单");
@@ -5714,6 +5764,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           return m;
         }
         setReport(null);
+        setNotRunning(!!(e && e.notRunning));
         setErr("检测失败：" + String(e && e.message || e));
         return null;
       } finally {
@@ -5723,6 +5774,28 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     useEffect(() => {
       check();
     }, []);
+    const restartAndCheck = async () => {
+      setBusy("start");
+      setErr("");
+      const ok = await startPlugin();
+      if (!ok) {
+        setBusy("");
+        setErr("启动插件失败：请在插件管理里手动启动「为她而唱」，或重启 N.E.K.O。");
+        return;
+      }
+      for (let i = 0; i < 20; i++) {
+        await sleep(2e3);
+        try {
+          const r = await fetch("http://127.0.0.1:48916/plugins");
+          const d = r.ok ? await r.json() : {};
+          const list = Array.isArray(d && d.plugins) ? d.plugins : [];
+          if (list.some((x) => x && (x.id === "music_synth" || x.plugin_id === "music_synth"))) break;
+        } catch (e) {
+        }
+      }
+      setBusy("");
+      await check();
+    };
     useEffect(() => {
       if (!path) return;
       const drive = (path.match(/^[A-Za-z]:/) || [""])[0].toUpperCase();
@@ -6319,6 +6392,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       mustInstall ? /* @__PURE__ */ jsx(Alert, { tone: "warning", children: "必需的程序还没装好，先在下面把它装好才能开始使用。" }) : null,
       mockMode ? /* @__PURE__ */ jsx(Alert, { tone: "info", children: "当前是模拟演示：没有连上安装接口，进度为示例数据，只用于查看界面流程。" }) : null,
       err ? /* @__PURE__ */ jsx(Alert, { tone: "warning", children: err }) : null,
+      notRunning ? /* @__PURE__ */ jsx("div", { style: { display: "flex", gap: 10, justifyContent: "center" }, children: /* @__PURE__ */ jsx(Btn, { style: primaryBtn, disabled: busy === "start", onClick: restartAndCheck, children: busy === "start" ? "正在启动插件…" : "启动插件并重新检测" }) }) : null,
       /* @__PURE__ */ jsx("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 12 }, children: [
         ["要下载什么", "运行程序 + 声音模型 + 去伴奏模型"],
         ["大约多大", sizeText],
@@ -6546,7 +6620,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11 }, children: "安装文件只来自官方发布地址，放在你选定的目录里；不会改动系统设置。" })
     ] });
     const body = step === 1 ? page1 : step === 2 ? page2 : step === 3 ? page3 : step === 4 ? page4 : page5;
-    return /* @__PURE__ */ jsxs("div", { style: { position: "fixed", inset: 0, zIndex: 1100, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(248,250,252,0.94)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", overflow: "auto" }, children: [
+    return /* @__PURE__ */ jsxs("div", { style: { position: "fixed", inset: 0, zIndex: 1100, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(248,250,252,0.97)", overflow: "auto" }, children: [
       /* @__PURE__ */ jsx("style", { children: `
         @keyframes ms-ob-wave { 0%,100% { transform: scaleY(.35); } 50% { transform: scaleY(1); } }
         .ms-ob-scroll::-webkit-scrollbar { width: 6px; }
@@ -6974,7 +7048,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           .ms-side { flex: 0 0 214px; position: sticky; top: 8px; border-radius: 28px; }
           .ms-sidebar { display: flex; flex-direction: column; gap: 5px; padding: 14px 12px;
             background: linear-gradient(165deg, #ffffff 0%, #fffafc 58%, #fff3f8 100%);
-            backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+            /* 侧栏底色是实心白，背景模糊看不出来、只多耗显卡，第七十轮去掉 */
             border-radius: 28px; border: 1px solid rgba(255,255,255,0.98);
             box-shadow: 0 12px 32px rgba(142,159,187,0.16), 0 2px 6px rgba(224,45,118,0.05);
             overflow: hidden; }

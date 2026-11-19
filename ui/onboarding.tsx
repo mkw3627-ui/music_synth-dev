@@ -7,7 +7,7 @@
 // 依赖仍然只走既有接口：ms_setup_check / ms_setup_install / ms_setup_status。
 // 预览（?wizard= / ?bundle=）下检测不到接口时用模拟清单走完流程，页面标「模拟演示」。
 import { Alert, StatusBadge, useEffect, useRef, useState } from "@neko/plugin-ui"
-import { audioSrcOf, callEntry, callEntryLoose } from "./api"
+import { audioSrcOf, callEntry, callEntryLoose, sleep, startPlugin } from "./api"
 import { BRAND, BRAND_DEEP, Btn, INK, INK_2, INK_3, LINE, Muted, Panel, Pill, Row, Bar, fmtEta } from "./ui"
 
 type Item = { key: string; label: string; status: string; ok: boolean; required: boolean; installable: boolean; size_gb: number; detail: string; fix: string }
@@ -209,6 +209,8 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
   // 系统对话框彻底用不了时，把「手填 data\config.json」的说明摊开给人看
   const [pickManual, setPickManual] = useState(false)
   const [pathErr, setPathErr] = useState("")
+  // 插件没在运行（宿主切角色会把插件全停掉、插件崩了）：给「启动插件」按钮，不让用户干等
+  const [notRunning, setNotRunning] = useState(false)
   // 每次点「选择文件夹」/点「取消」都 +1；迟到的轮询看到代号变了就闭嘴，
   // 不会再把「选择中…」写回来。
   const pickRun = useRef(0)
@@ -223,6 +225,7 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
   const check = async (): Promise<Report | null> => {
     setBusy("check")
     setErr("")
+    setNotRunning(false)
     try {
       const r: any = await callEntryLoose(props.api, "ms_setup_check", {}, 180000)
       if (!r || !Array.isArray(r.items)) throw Error("没有拿到清单")
@@ -239,6 +242,7 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
         return m
       }
       setReport(null)
+      setNotRunning(!!(e && e.notRunning))
       setErr("检测失败：" + String((e && e.message) || e))
       return null
     } finally {
@@ -246,6 +250,29 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
     }
   }
   useEffect(() => { check() }, [])
+
+  // 拉起插件后等它注册好（最多约 40 秒），再重新检测
+  const restartAndCheck = async () => {
+    setBusy("start")
+    setErr("")
+    const ok = await startPlugin()
+    if (!ok) {
+      setBusy("")
+      setErr("启动插件失败：请在插件管理里手动启动「为她而唱」，或重启 N.E.K.O。")
+      return
+    }
+    for (let i = 0; i < 20; i++) {
+      await sleep(2000)
+      try {
+        const r = await fetch("http://127.0.0.1:48916/plugins")
+        const d: any = r.ok ? await r.json() : {}
+        const list: any[] = Array.isArray(d && d.plugins) ? d.plugins : []
+        if (list.some((x: any) => x && (x.id === "music_synth" || x.plugin_id === "music_synth"))) break
+      } catch (e) { /* 插件服务还在起 */ }
+    }
+    setBusy("")
+    await check()
+  }
 
   // 安装位置剩余空间（按安装根目录所在盘），数据来源与旧向导一致
   useEffect(() => {
@@ -805,6 +832,13 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
       {mustInstall ? <Alert tone="warning">必需的程序还没装好，先在下面把它装好才能开始使用。</Alert> : null}
       {mockMode ? <Alert tone="info">当前是模拟演示：没有连上安装接口，进度为示例数据，只用于查看界面流程。</Alert> : null}
       {err ? <Alert tone="warning">{err}</Alert> : null}
+      {notRunning ? (
+        <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+          <Btn style={primaryBtn} disabled={busy === "start"} onClick={restartAndCheck}>
+            {busy === "start" ? "正在启动插件…" : "启动插件并重新检测"}
+          </Btn>
+        </div>
+      ) : null}
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 12 }}>
         {[
@@ -1025,7 +1059,7 @@ export function Onboarding(props: { api: any; onDone: () => void; onSkip?: () =>
   const body = step === 1 ? page1 : step === 2 ? page2 : step === 3 ? page3 : step === 4 ? page4 : page5
 
   return (
-    <div style={{ position: "fixed", inset: 0, zIndex: 1100, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(248,250,252,0.94)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", overflow: "auto" }}>
+    <div style={{ position: "fixed", inset: 0, zIndex: 1100, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(248,250,252,0.97)", overflow: "auto" }}>
       <style>{`
         @keyframes ms-ob-wave { 0%,100% { transform: scaleY(.35); } 50% { transform: scaleY(1); } }
         .ms-ob-scroll::-webkit-scrollbar { width: 6px; }
