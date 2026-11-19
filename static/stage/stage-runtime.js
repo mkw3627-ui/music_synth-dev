@@ -806,6 +806,7 @@
   async function loadFxLib(model) {
     if (!model || FX_LIB.model === model || FX_LIB.loading) return;
     FX_LIB.loading = true;
+    DIAG.fxAuto = ''; DIAG.fxSynth = '';
     const cats = {};
     try {
       const mgr = global.live2dManager;
@@ -830,8 +831,101 @@
         }
       }
     } catch (e) { recordErr('fxlib', e); }
+    // 第六十八轮：主程序情绪映射里没有开心 / 难过等分类的模型（梦梦全在 neutral、白毛宝宝 / 小侦探什么都没配），
+    // 按模型自己的表情文件「表情名 + 参数显示名」自动归类，舞台的大表情（开心脸红、难过流泪、生气嘟嘴……）才在别的模型上也有。
+    try {
+      const need = ['happy', 'sad', 'angry', 'surprised'].filter(c => !cats[c]);
+      if (need.length) {
+        const auto = await autoFxCats(model);
+        for (const c of need) if (auto[c] && auto[c].length) cats[c] = auto[c];
+        DIAG.fxAuto = Object.keys(auto).map(k => k + ':' + auto[k].map(x => x.file).join('/')).join(' ');
+      }
+      const still = FX_CATS.filter(c => !cats[c]);
+      const syn = [];
+      for (const c of still) { const s = synthFx(model, c); if (s) { cats[c] = [s]; syn.push(c); } }
+      DIAG.fxSynth = syn.join(',');
+    } catch (e) { recordErr('fxauto', e); }
     FX_LIB.cats = cats; FX_LIB.model = model; FX_LIB.loading = false;
     DIAG.fxCats = Object.keys(cats).map(k => k + ':' + cats[k].length).join(',');
+  }
+  // 第六十八轮：表情自动归类。规则按「表情名 / 参数显示名」里的关键词，命中多类时按排在前面的类算；
+  // 道具、手势、开关类（挥手、比心、抱娃娃、帽子、水印……）一律不用——唱歌时突然冒出道具反而违和。
+  // 第六十九轮（通用性）：关键词补日文（kemomimi 这类日本模型：照れ / 涙 / ハート / キラ / ぐるぐる / 青ざめ / 汗）
+  const FX_KW = {
+    happy: /心心眼|爱心眼|星星眼|笑|开心|喜|脸红|害羞|照れ|ハート|キラ|笑顔|happy|smile|joy|heart|blush|sparkl/i,
+    sad: /泪|哭|难过|伤心|悲|雾|涙|泣|sad|cry|tear/i,
+    angry: /生气|怒|嘟嘴|黑脸|脸黑|ぷく|angry|mad|pout|black.?face/i,
+    surprised: /惊|慌|晕|眩晕|汗|驚|ぐるぐる|青ざめ|surprise|shock|dizzy|sweat|spiral|pale/i,
+  };
+  const FX_SKIP = /开关|挥手|比心|抱|手势|手$|^手|伞|帽|水印|游戏机|道具|发情|胸|耳朵|尾|衣|裙|动物|武器|item|prop|hand|hat|switch/i;
+  const FX_CATS = ['happy', 'sad', 'angry', 'surprised'];
+  // 表情文件里一条参数「真的改了东西」没有：Add 看 ≠0，Multiply 看 ≠1（mao_pro 睁眼写 Multiply 1 = 不变），Overwrite 一律算
+  const fxDelta = p => (p.b === 'Multiply' ? p.v - 1 : p.b === 'Overwrite' ? 1 : p.v);
+  async function autoFxCats(model) {
+    const out = {};
+    const st = model.internalModel && model.internalModel.settings;
+    if (!st || !st.url) return out;
+    const base = new URL(st.url, location.href);
+    const json = st.json || {};
+    let files = (json.FileReferences && json.FileReferences.Expressions) || [];
+    files = files.map(e => ({ name: String(e.Name || e.name || ''), file: String(e.File || e.file || '') })).filter(e => e.file);
+    let names = {};
+    try {
+      const rel = json.FileReferences && json.FileReferences.DisplayInfo;
+      if (rel) { const r = await fetch(new URL(rel, base).href, { cache: 'force-cache' }); if (r.ok) { const j = await r.json(); for (const p of (j.Parameters || [])) names[p.Id] = String(p.Name || ''); } }
+    } catch (e) { }
+    const seen = {};
+    const push = (cat, f, ps) => { const k = cat + '|' + f.file; if (seen[k]) return; seen[k] = 1; (out[cat] = out[cat] || []).push({ file: f.file, ps, auto: true }); };
+    for (const f of files) {
+      let ps = [];
+      try { const r = await fetch(new URL(f.file, base).href, { cache: 'force-cache' }); if (!r.ok) continue; const j = await r.json();
+        ps = (j.Parameters || []).filter(x => x && x.Id && !FX_BLOCK.test(x.Id)).map(x => ({ id: x.Id, v: Number(x.Value) || 0, b: x.Blend || 'Add' })); } catch (e) { continue; }
+      // 只看真改了东西的参数（水水「哭哭」里顺带列了值为 0 的心心眼、星星眼，按名字会被错归成开心）
+      const nz = ps.filter(p => Math.abs(fxDelta(p)) > 1e-3);
+      if (!nz.length) continue;
+      const nzNames = nz.map(p => names[p.id] || '').join(' ');
+      if (FX_SKIP.test(f.name + ' ' + f.file + ' ' + nzNames)) continue;
+      // 1) 表情名带分类前缀（happy_xxx / sad_xxx……，VTS 和 N.E.K.O 的常见写法）：作者已经分好了，直接用
+      const pre = /^(happy|sad|angry|surprised)[_\-\s]/i.exec(f.name);
+      if (pre) { push(pre[1].toLowerCase(), f, nz); continue; }
+      // 2) 整张脸好几条参数一起改（mao_pro 这类）：参数名分不出喜怒，按值打分——
+      //    笑眼 / 嘴角上扬 / 脸红 → 开心；嘴角下垂 / 眉毛往下 → 难过；嘟嘴 / 眉角下压 → 生气；瞳孔缩小 / 睁大眼 → 惊讶。
+      let cat = null;
+      if (nz.length >= 4) {
+        const val = re => { let t = 0; for (const p of nz) if (re.test((names[p.id] || '') + ' ' + p.id)) t += fxDelta(p); return t; };
+        const sc = {
+          happy: val(/smile|笑/i) + val(/corner upward|mouthup|嘴角.*上/i) + val(/blush|cheek|脸红|照れ/i) * .5,
+          sad: val(/corner downward|mouthdown|嘴角.*下/i) + val(/tear|泪|涙/i) - Math.min(0, val(/eyebrow.*_?y\b|brow[lr]?y|眉.*上下/i)) * .5,
+          angry: val(/pout|angry|嘟/i) - Math.min(0, val(/eyebrow.*angle|brow[lr]?angle|眉.*角/i)) * .5,
+          surprised: -Math.min(0, val(/shrink|eyeballform|瞳孔/i)) + Math.max(0, val(/open|睁/i)) * .5,
+        };
+        const best = Object.keys(sc).sort((x, y) => sc[y] - sc[x])[0];
+        if (sc[best] > .4) cat = best;
+      }
+      // 3) 少数几条参数的「按键」表情：按表情名 + 被改参数的显示名找关键词
+      if (!cat) {
+        const text = f.name + ' ' + f.file + ' ' + nzNames;
+        cat = FX_CATS.find(c => FX_KW[c].test(text)) || null;
+      }
+      if (cat) push(cat, f, nz);
+    }
+    return out;
+  }
+  // 第六十九轮：模型连一个能用的表情文件都没有（小侦探 0 个、沐莹只有道具、neko 只有 default）时，
+  // 用标准脸部参数拼一个「通用大表情」。写进去的是标准单位，后面还会经过适配器按画面拉齐，
+  // 所以任何带标准参数的新模型都有开心 / 难过 / 生气 / 惊讶，幅度和水水一致。
+  const FX_SYNTH = {
+    happy: [{ id: 'ParamEyeLSmile', v: .8 }, { id: 'ParamEyeRSmile', v: .8 }, { id: 'ParamMouthForm', v: .8 }, { id: 'ParamCheek', v: .8 }, { id: 'ParamBrowLY', v: .3 }, { id: 'ParamBrowRY', v: .3 }],
+    sad: [{ id: 'ParamMouthForm', v: -.7 }, { id: 'ParamBrowLForm', v: -.7 }, { id: 'ParamBrowRForm', v: -.7 }, { id: 'ParamBrowLAngle', v: .5 }, { id: 'ParamBrowRAngle', v: .5 }, { id: 'ParamEyeLOpen', v: .8, b: 'Multiply' }, { id: 'ParamEyeROpen', v: .8, b: 'Multiply' }],
+    angry: [{ id: 'ParamBrowLAngle', v: -.8 }, { id: 'ParamBrowRAngle', v: -.8 }, { id: 'ParamBrowLY', v: -.4 }, { id: 'ParamBrowRY', v: -.4 }, { id: 'ParamMouthForm', v: -.5 }],
+    surprised: [{ id: 'ParamBrowLY', v: .8 }, { id: 'ParamBrowRY', v: .8 }, { id: 'ParamEyeLOpen', v: 1.2, b: 'Multiply' }, { id: 'ParamEyeROpen', v: 1.2, b: 'Multiply' }],
+  };
+  function synthFx(model, cat) {
+    const core = model.internalModel && model.internalModel.coreModel;
+    if (!core || !FX_SYNTH[cat]) return null;
+    const ps = FX_SYNTH[cat].filter(p => { try { return core.getParameterIndex(p.id) >= 0; } catch (e) { return false; } })
+      .map(p => ({ id: p.id, v: p.v, b: p.b || 'Add' }));
+    return ps.length >= 2 ? { file: 'synth:' + cat, ps, auto: true, synth: true } : null;
   }
   // 写入时叠加表情层：w 为 0..1；Add 加 Value·w，Multiply 按 1→Value 插值，Overwrite 当前值→Value 插值
   function applyFx(c, fx, w, seed) {
@@ -1326,7 +1420,8 @@
     };
     try { if (im.eyeBlink) im.eyeBlink.updateParameters = function () { }; } catch (e) { }
     try { im.updateNaturalMovements = function () { }; } catch (e) { }
-    try { if (im.physics) im.physics.evaluate = function () { }; } catch (e) { }
+    // 第六十五轮：原物理函数挂在 physics 上，多模型适配量模型时要用它跑物理（白毛宝宝的头靠物理带动）
+    try { if (im.physics) { im.physics.__nekoOrigEvaluate = saved.physicsEval; im.physics.evaluate = function () { }; } } catch (e) { }
     try {
       if (im.motionManager) {
         im.motionManager.stopAllMotions();
@@ -1395,7 +1490,12 @@
         if (!S.model) traceLog('cb-skip-noModel', {});
         if (!o) traceLog('cb-skip-noPose', {});
         if (!o || !S.model) return;
-        const c = S.model.internalModel.coreModel;
+        // 第六十三轮（多模型适配）：按标准单位（水水上调出来的数值）写，NekoModelFit 换算到当前模型：
+        // 先按模型自带 vtube.json 的映射转换，再用「尺子」在本模型上量过的校正曲线拉到和水水一样的画面幅度
+        // （第一次上台量一遍并存档，之后直接用）。没加载 / 没量好时就是原 coreModel，行为与接入前一样。
+        const c = (global.NekoModelFit && global.NekoModelFit.fitted(S.model)) || S.model.internalModel.coreModel;
+        DIAG.fitted = !!c.__fitted;
+        DIAG.fitSource = c.__prof ? c.__prof.source : '';
         DIAG.writeFrames += 1;
         // 第二十六轮：桌面律动（music_groove 在 afterMotionUpdate 已写入本帧）做底，舞台舞步让位
         const now = performance.now();
@@ -1447,6 +1547,10 @@
         for (const k in fin) {
           try { c.setParameterValueById(k, clampParam(c, k, stdToModel(c, k, fin[k]))); } catch (e) { recordErr('setParam', e); }
         }
+        // 第六十三轮：记下本帧「按标准单位」要的张嘴值。主程序自己的口型（live2dManager.setMouth）会在
+        // 这之后、渲染之前再按原始值写一遍张嘴参数，把适配换算盖掉；所以在最后一道（poseOverride）里
+        // 再按适配后的值写一次，见 ensureFitMouthHook。
+        S._fitMouth = (c.__fitted && typeof fin.ParamMouthOpenY === 'number') ? { c, v: fin.ParamMouthOpenY } : null;
         // 第二十八轮：表情层（当前模型自己的 exp3，按主程序情绪映射）
         try {
           if (FX_LIB.model !== S.model) loadFxLib(S.model);
@@ -1480,6 +1584,7 @@
       } catch (e) { recordErr('callback', e); }
     };
     try { im.on('beforeModelUpdate', saved.onBeforeModelUpdate); traceLog('sub-before-ok', { inst: traceId(im) }); } catch (e) { traceLog('sub-before-err', { inst: traceId(im), err: String(e && e.message) }); }
+    ensureFitMouthHook(true);
     // 定位（只读）：模型 update 完成之后（afterModelUpdate）再读一次，看帧末值
     saved.onAfterModelUpdate = function () { DIAG.locAfterFrame = locRead(core); };
     try { im.on('afterModelUpdate', saved.onAfterModelUpdate); traceLog('sub-after-ok', { inst: traceId(im) }); } catch (e) { traceLog('sub-after-err', { inst: traceId(im), err: String(e && e.message) }); }
@@ -1527,8 +1632,34 @@
     FX_LIB.written.clear();
   }
 
+  // 第六十三轮：渲染前最后一道，把适配后的张嘴值写回去（主程序口型在我们之后按原始值写，会盖掉换算）。
+  // 只在舞台挂着、且这一帧走了适配时写；舞台退出时撤掉，主程序口型恢复原样。
+  const FIT_MOUTH_SRC = 'nekoStageFitMouth';
+  function fitMouthApply(core) {
+    const fm = S._fitMouth;
+    if (!fm || !S.model || core !== S.model.internalModel.coreModel) return;
+    // 嘴的「来源」不变：主程序口型（live2dManager.setMouth，按干声算的）在唱时说了算，和接入前一样；
+    // 这里只把它的值按本模型的校正换算一下再写回。主程序没在驱动口型时，用舞台自己的值。
+    // （真宿主实测：直接写舞台值会让水水自己的嘴也大 1.5 倍——那是换了来源，不是换算。）
+    const mgr = global.live2dManager;
+    let v = fm.v;
+    try {
+      if (mgr && typeof mgr.hasActiveLipSync === 'function' && mgr.hasActiveLipSync() && typeof mgr.mouthValue === 'number') v = mgr.mouthValue;
+    } catch (e) { }
+    try { fm.c.setParameterValueById('ParamMouthOpenY', v); DIAG.fitMouthWrites = (DIAG.fitMouthWrites || 0) + 1; DIAG.fitMouthSrc = v === fm.v ? 'stage' : 'host'; } catch (e) { }
+  }
+  function ensureFitMouthHook(on) {
+    const mgr = global.live2dManager;
+    if (!mgr || typeof mgr.setTemporaryPoseOverride !== 'function') return;
+    try {
+      if (on) mgr.setTemporaryPoseOverride(FIT_MOUTH_SRC, fitMouthApply, { priority: 50 });
+      else if (typeof mgr.clearTemporaryPoseOverride === 'function') mgr.clearTemporaryPoseOverride(FIT_MOUTH_SRC);
+    } catch (e) { }
+  }
   function unbindModel() {
     try { dropModelFx(); } catch (e) { }
+    S._fitMouth = null;
+    ensureFitMouthHook(false);
     const m = S.model, sv = S.modelSaved;
     traceLog('unbind-enter', { inst: traceId(m && m.internalModel), hadSaved: !!sv, stack: traceStack() });
     if (!m || !sv) { S.model = null; S.modelSaved = null; return; }
@@ -2078,6 +2209,17 @@
     if (ts - S.lastPaint < 1000 / (S.fpsCap ? S.fpsCap : Math.max(S.fps, 60)) - 2) return;
     S.lastPaint = ts;
     if (!S.playing && !S.dirty) return;
+    // 第六十六轮：唱歌时人物「一瞬间卡过去」的根因——主程序的省电帧率守护只认「动作 / 拖拽 / 口型状态位」
+    // 为活动，舞台演出不算，于是唱歌时人物被压在 30fps 的定时器节拍上（实测 idleTick=true、30.5fps），
+    // 头部一帧走 3~4 度，快的转头/点头就是一格一格跳。舞台播放期间每 0.5 秒给主程序续一次满帧，
+    // 停播后不再续，0.9 秒后主程序自己回落到省电帧率（和接入前一样）。
+    if (S.playing) {
+      const now0 = performance.now();
+      if (!S._boostAt || now0 - S._boostAt > 500) {
+        S._boostAt = now0;
+        try { const mgr = global.live2dManager; if (mgr && typeof mgr.boostInteractiveFPS === 'function') { mgr.boostInteractiveFPS(1500); DIAG.fpsBoosts = (DIAG.fpsBoosts || 0) + 1; } } catch (e) { }
+      }
+    }
     S.dirty = false;
     const t0 = performance.now();
     renderAt(currentT());

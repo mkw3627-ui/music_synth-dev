@@ -18,7 +18,7 @@
   'use strict';
   if (global.__NEKO_SOLO_STAGE_LOADER__) { return; }
 
-  var STAGE_BUILD = '20261117r55';
+  var STAGE_BUILD = '20261119r69';
   var state = {
     version: 't3b-1',
     active: false,
@@ -167,6 +167,11 @@
       ['stage-look.js', 'NekoStageLook'],
       ['stage-planner.js', 'NekoStagePlanner'],
       ['stage-lyrics.js', 'NekoStageLyrics'],
+      // 第六十三轮：多模型适配——转换器（vtube.json）+ 尺子 + 自适应校正
+      ['vts_map.js', 'NekoVtsMap'],
+      ['ruler.js', 'NekoRuler'],
+      ['calib.js', 'NekoCalib'],
+      ['model_fit.js', 'NekoModelFit'],
       ['stage-runtime.js', 'NekoStage']
     ];
     // 第四十五轮：开源 pixi-filters（人物 GPU 滤镜）。按宿主 PIXI 大版本挑：7 → v5，6 → v4；加载失败不影响演出

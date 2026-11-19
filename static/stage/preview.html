@@ -23,6 +23,10 @@
 <script src="./skins/skins.js"></script>
 <script src="./stage-scenes.js"></script>
 <script src="./stage-lyrics.js"></script>
+<script src="./vts_map.js"></script>
+<script src="./ruler.js"></script>
+<script src="./calib.js"></script>
+<script src="./model_fit.js"></script>
 <script src="./stage-runtime.js"></script>
 <script>
 'use strict';
@@ -49,6 +53,8 @@ const FIXTURES = [
 ];
 const CUR = Q.get('fixture') || 'demo_star';
 const M = Q.get('m') || '/model/Blue%20cat.model3.json';
+// ?nofit=1：不用多模型适配（对照组，只给离线预览用）
+if (Q.get('nofit') === '1') window.NekoModelFit = undefined;
 const UI = Q.get('ui') !== '0';
 const T0 = Q.has('t') ? +Q.get('t') : 0;
 const AUTOPLAY = Q.get('autoplay') === '1';
