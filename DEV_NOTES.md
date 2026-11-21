@@ -2121,3 +2121,10 @@ numpy 2.2.6、transformers 4.41.2；引导页各项全部就绪；变声、人�
 - 删除 `test_wizard_s8_backup_exists` 这条无意义断言（检查本机备份文件的存在性不属于回归测试范畴）。`tests/test_packaging_s13.py` 里断言 `.bak` **不被打包**的那条保留（它正确且与文件存在无关）。
 - 验证：pytest **367 passed / 17 skipped**（比 0.3.8 少 1 条，即被删除的那条）；ruff（CI 参数，两种布局）All checks passed；4 个 node 套件 exit=0。
 - 本版只改 `plugin.toml` 版本号与该测试文件，产品代码零改动。
+
+### 市场版本选用说明（0.3.10）
+
+- v0.3.7、v0.3.8 的 GitHub Release **没有插件包附件**（分别挂在 Ruff check 与 Release check），市场页面请选用 **v0.3.10（或最新成功版本）**，不要选用 v0.3.7 / v0.3.8。
+- **根因**：市场包由 CI 的 `neko_plugin_cli` 按插件目录下 `pyproject.toml` 的 `[tool.neko.build]` 打包，本地 `tools/build_package.py` CI 根本不调用——规则写错地方时就会出现「本地核对干净、线上包不干净」。v0.3.9 的市场包因此带了 `tests/` 29 个文件、`PLAN_download_tiering.md`（只有本机路径，无密钥）、`tools/`、`host/`。
+- **修复**：`pyproject.toml` 增加 `exclude_dirs`（tests/_reports/_test/_trash/backup/dist/tools/host）、`exclude_files`（PLAN_*.md、.gitignore）与 `*.bak*`/`*_bak*`；新增 `tests/test_market_pack_rules.py` 防回归（本地等价判定 + CI 环境用上游真实规则再验一遍）。
+- **验证**：用上游 `core.build_plugin` 实测，payload 从 628 降到 **592**，`tests`/`tools`/`host`/`_reports`/`_test`/`PLAN`/`.bak` 全为 0，运行模块齐全，`payload_hash_verified=True`。

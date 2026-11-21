@@ -1,6 +1,14 @@
-# 只为声明打包规则（N.E.K.O Plugin CLI 的 [tool.neko.build]）。
+# 市场包的打包规则（N.E.K.O Plugin CLI 的 [tool.neko.build]）。
+# **注意**：市场包由 CI 的 neko_plugin_cli 按这张表打包（core/build_rules.py），
+# 本地 tools/build_package.py 只用于本机核对、CI 不调用它——规则必须写在这里才生效。
 # 插件市场不允许包内出现二进制文件：.exe / .pyd / .dll 一律排除。
 # proc-tap 与 winrt 由 setup.py 在安装时 pip 装进合成环境；
 # ACE 的 genres_vocab 改为随包发纯文本 genres_vocab.txt，不再带 .gz。
 [tool.neko.build]
-exclude = ["*.pyd", "*.exe", "*.dll", "*.so", "*.dylib", "*.gz"]
+# 二进制与备份文件（原有 6 个二进制后缀一个都不能删）
+exclude = ["*.pyd", "*.exe", "*.dll", "*.so", "*.dylib", "*.gz", "*.bak*", "*_bak*"]
+# 运行时用不到的目录：测试与夹具、验收材料、本机临时脚本、回收站、备份、开发工具、
+# 舞台加载器的安装脚本（host/ 由用户单独运行，历来不进本地包）
+exclude_dirs = ["tests", "_reports", "_test", "_trash", "backup", "dist", "tools", "host"]
+# 计划文档带本机路径；.gitignore 是仓库配置，都不该随包发布
+exclude_files = ["PLAN_*.md", ".gitignore"]
