@@ -40,8 +40,3 @@ def test_wizard_s8_pure_functions_and_syntax():
     output = (proc.stdout or "") + (proc.stderr or "")
     assert proc.returncode == 0, f"node 自测失败（exit={proc.returncode}）:\n{output}"
     assert "ALL PASS" in output, f"未看到 ALL PASS：\n{output}"
-
-
-def test_wizard_s8_backup_exists():
-    assert (_ROOT / "static" / "index.html.bak_dltier_20261121").is_file(), \
-        "缺少 static/index.html.bak_dltier_20261121 备份"

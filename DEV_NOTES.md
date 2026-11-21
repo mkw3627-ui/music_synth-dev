@@ -2108,3 +2108,16 @@ numpy 2.2.6、transformers 4.41.2；引导页各项全部就绪；变声、人�
 - 修复：4 个测试文件（`test_config_wiring_s12.py`、`test_download_engine.py`、`test_entries_dl.py`、`test_tiering.py`）里的本地模块导入改用布局无关的 `E = import_module("download_engine")` 写法（与 `conftest.py` / `test_ace_daemon.py` / `test_download_daemon.py` 既有惯例一致）。用法不变，行为零变化。
 - 验证：用 CI 同款 `ruff 0.12.4`，**CI 布局**（工作区根扫 `plugin-repo/`）与**仓库根布局**都是 `All checks passed!`；pytest 368 passed / 17 skipped；4 个 node 套件 exit=0；守护进程单独运行无 ImportError。
 - 本版只改 `plugin.toml` 版本号与上述测试文件，产品代码零改动。
+
+### 0.3.8 CI 失败（标签保留，未发布成功）
+
+- Ruff check 已通过（0.3.8 的导入修复生效），但卡在 **Release check**（在 Linux runner 上跑插件全部测试）：`1 failed, 362 passed, 22 skipped`。
+- 失败用例：`tests/test_wizard_s8.py::test_wizard_s8_backup_exists` —— 它断言本机临时备份 `static/index.html.bak_dltier_20261121` 存在。该文件是 `.bak`，被 `.gitignore` 忽略、也被打包排除，CI 上必然不存在。**这是测试自身的缺陷，不是产品问题。**
+- 22 个 skip 比 Windows 的 17 个多 5 个，来自 0.3.7 加的 Windows 专属 `skipif`，符合预期。
+- 标签 `v0.3.8` 保留不删。
+
+### 0.3.9 修复后发版
+
+- 删除 `test_wizard_s8_backup_exists` 这条无意义断言（检查本机备份文件的存在性不属于回归测试范畴）。`tests/test_packaging_s13.py` 里断言 `.bak` **不被打包**的那条保留（它正确且与文件存在无关）。
+- 验证：pytest **367 passed / 17 skipped**（比 0.3.8 少 1 条，即被删除的那条）；ruff（CI 参数，两种布局）All checks passed；4 个 node 套件 exit=0。
+- 本版只改 `plugin.toml` 版本号与该测试文件，产品代码零改动。
