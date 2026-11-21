@@ -3,6 +3,10 @@
 Runs under the DDSP Python (it only needs modelscope/huggingface_hub from
 acestep/pylibs).  Progress is written to ``<root>/install_status.json`` every
 few seconds so the plugin can show a live bar in 设置与环境.
+
+S7：权重改由后台守护进程下载。传 ``--skip-models`` 时本 worker 只做
+「代码仓库 + venv + 依赖」，跳过 ``snapshot_download`` 的两段权重下载
+（模型由 ``soulx_weights`` / ``soulx_rmvpe`` 两个 repo 型 artifact 负责）。
 """
 from __future__ import annotations
 
@@ -47,9 +51,23 @@ def _downloaded(root: Path) -> int:
     return total
 
 
+SKIP_MODELS_FLAG = "--skip-models"
+
+
+def _skip_models() -> bool:
+    """``--skip-models`` 可能出现在位置参数两侧（runtime.run_worker 允许前置 flag）。"""
+    return SKIP_MODELS_FLAG in sys.argv[1:]
+
+
+def _positional_args() -> list[str]:
+    return [a for a in sys.argv[1:] if not a.startswith("--")]
+
+
 def main() -> int:
-    job = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-    out_path = Path(sys.argv[2])
+    args = _positional_args()
+    job = json.loads(Path(args[0]).read_text(encoding="utf-8"))
+    out_path = Path(args[1])
+    skip_models = _skip_models() or bool(job.get("skip_models"))
     result = {"ok": False, "step": "soulx_install"}
     root = Path(str(job["root"]))
     status_path = root / "install_status.json"
@@ -114,18 +132,21 @@ def main() -> int:
             src.rename(repo)
             zip_path.unlink(missing_ok=True)
 
-        # 2) SVC weights + RMVPE
-        watcher = threading.Thread(target=watch_models, daemon=True)
-        watcher.start()
-        status(0, "models", "正在下载模型（可断点续传）…")
-        snapshot_download("Soul-AILab/SoulX-Singer",
-                          local_dir=str(root / "models"))
-        status(61, "rmvpe", "正在下载 RMVPE 音高模型…")
-        snapshot_download("Soul-AILab/SoulX-Singer-Preprocess",
-                          local_dir=str(root / "preprocess"),
-                          allow_patterns=["rmvpe/*"])
-        stop.set()
-        status(65, "models_done", "模型下载完成")
+        # 2) SVC weights + RMVPE（S7：后台守护进程负责时跳过）
+        if skip_models:
+            status(60, "models_skipped", "权重由后台下载进程负责，这里跳过")
+        else:
+            watcher = threading.Thread(target=watch_models, daemon=True)
+            watcher.start()
+            status(0, "models", "正在下载模型（可断点续传）…")
+            snapshot_download("Soul-AILab/SoulX-Singer",
+                              local_dir=str(root / "models"))
+            status(61, "rmvpe", "正在下载 RMVPE 音高模型…")
+            snapshot_download("Soul-AILab/SoulX-Singer-Preprocess",
+                              local_dir=str(root / "preprocess"),
+                              allow_patterns=["rmvpe/*"])
+            stop.set()
+            status(65, "models_done", "模型下载完成")
 
         # 3) 运行环境：第五十八轮起和人声分离共用 envs\sep（同为 torch 2.10 + numpy 2.x），
         #    不再单独建一个 4GB 多的 torch 环境。分离环境还没装时才自己建。
@@ -156,7 +177,7 @@ def main() -> int:
         status(100, "done", "SoulX-Singer 安装完成", done=True)
         result.update({"ok": True, "venv": str(venv_py),
                        "repo": str(repo), "models": str(root / "models"),
-                       "status": str(status_path)})
+                       "status": str(status_path), "models_skipped": skip_models})
     except Exception as exc:  # noqa: BLE001
         stop.set()
         msg = f"{type(exc).__name__}: {exc}"

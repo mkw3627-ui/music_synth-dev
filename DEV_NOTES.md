@@ -2051,3 +2051,48 @@ numpy 2.2.6、transformers 4.41.2；引导页各项全部就绪；变声、人�
 - 实测（测试根 `D:\NekoMSTest61` 从零下载翻唱全部模型 8 项）：464 秒全部装好、零错误；改之前同样 8 项跑了一个多小时还没下完。
   ContentVec 380MB 不到 1 分钟（约 11MB/s），以前约 90KB/s。RMVPE 中途 github 掉到 113KB/s 时自动换到 ghfast.top 续传完成。
 - 下载结果核对：ContentVec 与线上文件 sha256 一致；其余与上一轮慢速下载的结果 sha256 一致；分离权重真跑一次 15 秒人声分离成功。
+
+## 下载分级 + 后台下载（S1–S13，2026-11-21，未发版）
+
+计划书：`PLAN_download_tiering.md`；执行/验收报告：`_reports/dl_tiering_e2e/REPORT.md`、`_reports/dl_tiering_e2e/ACCEPTANCE_S13.md`。
+
+**下载源实测结论（S1，2026-11-21；`tools/dl_sources_report.json`）**
+- 剔除（不进 `download_catalog` 的源表，原因记在 `download_catalog.REJECTED_SOURCES`）：
+  - `hf-mirror.com`：308 永久跳转回 huggingface.co，已不是镜像。
+  - `ghfast.top`（TLS 握手超时）、`hk.gh-proxy.com`（500 Domain Not Found）、`gh.llkk.cc`（522）、
+    `ghp.ci` / `hub.gitmirror.com`（域名解析失败）、`gh-proxy.net` / `gitproxy.click`（返回 text/html 失效页）、
+    `ghproxy.cc`（证书校验失败）、`gh.api.99988866.xyz`（SSLv3 握手失败）。
+- 保留但有限制：`ghproxy.net` 对 Release 资产可用，对 `codeload.github.com` 返回 403（DDSP 仓库 zip 下不了，测速会把它排到最后）。
+- 新增：`cors.isteed.cc` 作为第 3 个 GitHub 镜像（gh-proxy.com、ghproxy.net、cors.isteed.cc）。
+- ModelScope 没有 `lengyue233/content-vec-best` 与 `SVCFusion/DDSP6.3-Pretrain` 的同名仓库，这两项只有 hf-mirror.net + 官方 HF。
+- PyPI 改为阿里云优先（实测 24–28MB/s），其次 USTC、腾讯云、清华；torch cu128 官方 index 失败时回落阿里云 pytorch-wheels（find-links）。
+  torch 绝不能用 `--extra-index-url`：pip 会从 PyPI 挑 CPU 版。cu128 官方最高只到 2.11.0，GPU 机上已装 CPU 版时要 `--force-reinstall` 才降得回去。
+- `setup.py` 的 `GH_MIRRORS` / `HF_MIRROR_HOSTS` 已改为从 `download_catalog` 派生（S13 返工），旧下载链路与 `compat.speed_targets` 不再碰死源。
+
+**真机发现并已修的坑（S12）**
+- 宿主里插件是子包，`download_*` 模块之间必须「先相对导入、失败再绝对导入」。
+- 宿主里 `sys.executable` 是 `projectneko_server.exe`，拿它拉守护进程会再开一个 N.E.K.O；守护进程改为找真正的 python.exe。
+- `resolve_paths()` 的 Path 不能直接 json.dumps；rmvpe 的目标是文件路径、解压要用它的父目录；新建 venv 可能没有 pip（先 ensurepip）。
+- 48915 的插件目录缓存不随 reload 刷新，新入口要走 48916 `/runs`（参数放 `args`，不是 `inputs`）。
+
+**S13 返工补的坑**
+- 守护进程把 paths 存进 state 时，dict 值（`raw` 配置）必须存成 JSON；之前 `str()` 成 Python repr，`json.loads` 失败后静默用默认值，`download_*` 配置全部不生效。单测要走 `DownloadDaemon.enqueue` 这条真实路径，别直接塞 dict。
+- 多文件下载物（`files`）每个文件都要有自己的源：`download_catalog.file_entries()` 支持第 4 项专属源；多文件时不再回落到全部 `sources`。`sep_karaoke` 的 yaml 之前会去下 1.7GB 的 ckpt，sha 必败，全新安装的翻唱永远装不齐。
+- 设置页「下载源偏好」存的是 `download_source`（auto/mirror/huggingface），没显式设 `download_source_strategy` 时按它映射。
+
+---
+
+## 0.3.7 发版（下载分级 + 后台静默下载）
+
+**功能**
+- 首次引导先选功能（翻唱/训练/原创/SoulX/采集），只前台装所选功能的基础环境与程序，装完即可进主页。
+- 模型交给独立守护进程后台下载：切页、关面板不中断，杀进程后断点续传；常驻下载条显示进度/速度/当前源。
+- 未安装功能页高斯模糊 + 居中「下载」，点后在模糊层上原地显示分段进度。
+- 每个下载物多个实测源（ModelScope / hf-mirror.net / GitHub 镜像 / 阿里云 PyPI 等），测速选最快，慢了自动换源续传，尾部校验 + sha256。
+- 剔除失效源（hf-mirror.com、ghfast.top、hk.gh-proxy.com 等），PyPI 改阿里云优先，torch 不再误装 CPU 版。
+- 新建 venv 自动补 pip，ffmpeg winget 失败时下载便携版兜底。
+- `plugin.toml` 新增 10 个 `download_*` 配置；新增 368 条测试。
+
+**发版前修的市场 CI 阻断**
+- CI 的 ruff 规则是 `E4,E7,E9,F,I` 且带 `--ignore-noqa`（本地 `# noqa` 无效）。把各文件 `sys.path.insert` 后的导入改成 `importlib.import_module`，测试统一由 `conftest.py` 注入路径。
+- Linux CI 上跑测试：给依赖 Windows 进程语义（taskkill / CREATE_NEW_PROCESS_GROUP / msvcrt 锁）与 Windows 解释器命名规则的用例加了 `skipif(os.name != "nt")`；产品代码本身已有 `fcntl` 回退，未为兼容性改动。

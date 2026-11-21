@@ -35,6 +35,12 @@ PID = 'music_synth'
 EXCLUDE_DIR_NAMES = {
     '__pycache__', '.pytest_cache', '.venv', 'node_modules', '.git',
     '_trash', 'claude-backups', 'NEKO_PLUGIN_BACKUPS', 'dist', 'tools',
+    # tests/：S1–S11 的 pytest / node 测试与假镜像夹具，不进插件包
+    'tests',
+    # _test/：返工时的临时脚本（真机验证用），不进插件包
+    '_test',
+    # _reports/：验收报告、真机证据、用户配置备份（含本机绝对路径），不进插件包
+    '_reports',
     # host/：宿主页面的舞台加载器 + 安装脚本，用户单独运行，不进插件包
     # .github/.vscode：仓库配置
     'host', '.github', '.vscode',
@@ -68,6 +74,9 @@ def keep(rel):
     if base.endswith(('.pyd', '.exe', '.dll', '.so', '.dylib', '.gz')):
         return False
     if '.bak' in base or '_bak' in base or base.startswith('_dbg'):
+        return False
+    # 计划文档等根目录 Markdown（PLAN_*.md）不进插件包
+    if base.startswith('PLAN_') and base.endswith('.md'):
         return False
     return True
 

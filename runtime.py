@@ -1059,10 +1059,13 @@ def _find_winget_package_ffmpeg() -> str:
     return ""
 
 
-def _find_ffmpeg() -> str:
+def _find_ffmpeg(compute_root: str | Path | None = None) -> str:
     """先看 PATH，再看 winget / chocolatey / 常见安装目录。
 
     宿主的插件进程 PATH 往往不含 WinGet Links，只靠 shutil.which 会误报「缺 ffmpeg」。
+
+    ``compute_root`` 给定时还会看插件自己兜底解压的位置
+    ``<compute_root>\\tools\\ffmpeg\\bin\\ffmpeg.exe``（S5：winget 不可用时的 zip 兜底）。
     """
     exe = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
     if exe:
@@ -1071,13 +1074,18 @@ def _find_ffmpeg() -> str:
         candidate = Path(os.path.expandvars(raw))
         if candidate.is_file():
             return str(candidate)
+    if compute_root:
+        for name in ("ffmpeg.exe", "ffmpeg"):
+            candidate = Path(str(compute_root)) / "tools" / "ffmpeg" / "bin" / name
+            if candidate.is_file():
+                return str(candidate)
     return _find_winget_package_ffmpeg()
 
 
-def ffmpeg_status(configured: str = "") -> dict:
+def ffmpeg_status(configured: str = "", compute_root: str | Path | None = None) -> dict:
     exe = str(configured or "").strip()
     if not exe or not Path(exe).is_file():
-        exe = _find_ffmpeg()
+        exe = _find_ffmpeg(compute_root)
     if not exe:
         return {"available": False, "ok": False, "exists": False, "path": "", "version": ""}
     text = _run_quiet([exe, "-version"], timeout=6.0)

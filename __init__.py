@@ -44,8 +44,18 @@ from . import (
     vram_release,
 )
 from . import compat as compat_mod
+
+# 分级下载/安装（S6）：入口逻辑 + 分级安装后端（S5）
+from . import download_entries as dl_entries
+from . import install_tiering as tiering
 from . import setup as setup_mod
 from . import voice_import as voice_import_mod
+
+# S7：ACE / SoulX / 底模并入后台守护进程
+try:
+    from . import download_manager as dl_manager
+except ImportError:  # 独立运行（非包内）时的回退
+    import download_manager as dl_manager  # type: ignore[no-redef]
 
 # 离线编排（show.json）：schema/director/presets 都只用标准库，进程内直接 import
 # 不影响启动耗时；真正的重活（librosa 分析）在 choreo_worker 子进程里跑。
@@ -411,8 +421,17 @@ class MusicSynthPlugin(NekoPluginBase):
         # 原创「生成并让她唱」被打断的话，重启后自己接着唱完，不用再点一次
         if resume_ids:
             self._thread("ms-auto-resume", self._auto_resume_tracks, list(resume_ids))
+        # 后台下载：有未完成任务且 download_auto_resume 开启时，拉起守护进程续下（S6）。
+        resume_dl: dict = {"started": False, "pid": 0, "reason": "skipped"}
+        try:
+            resume_dl = dl_entries.resume_on_startup(self._pipeline.paths)
+            if resume_dl.get("started"):
+                self.logger.info("[dl] 启动时续下后台任务，守护进程 pid=%s", resume_dl.get("pid"))
+        except Exception as exc:  # noqa: BLE001 - 起不来只影响后台下载，不拖垮启动
+            self.logger.warning("[dl] 启动时拉起下载守护进程失败：%s", exc)
         return Ok({"status": "ready", "resumed_training": resumed,
-                   "resuming_tracks": len(resume_ids)})
+                   "resuming_tracks": len(resume_ids),
+                   "downloads_resumed": resume_dl})
 
     # 第七十轮：以前这里少了 @lifecycle，宿主停插件时根本不会调到它——口型服务、录音子进程都留在后台
     @lifecycle(id="shutdown")
@@ -433,6 +452,14 @@ class MusicSynthPlugin(NekoPluginBase):
                 await asyncio.to_thread(listener.cleanup_stale_worker)
         except Exception as exc:  # noqa: BLE001 - 收不干净下次启动时 cleanup_stale_worker 还会再收一次
             self.logger.warning("[listener] 退出时结束录音进程失败：%s", exc)
+        # 后台下载：download_keep_after_exit=false 时让守护进程收尾退出（S6）。
+        # 默认 true=关 N.E.K.O 后继续下载，这里不做任何事。
+        try:
+            dl_stop = dl_entries.stop_on_shutdown(self._pipeline.paths)
+            if dl_stop.get("stopped"):
+                self.logger.info("[dl] 关闭时停止下载守护进程 pid=%s", dl_stop.get("pid"))
+        except Exception as exc:  # noqa: BLE001 - 停不掉不影响退出
+            self.logger.warning("[dl] 关闭时停止下载守护进程失败：%s", exc)
         return Ok({"status": "stopped"})
 
     # ------------------------------------------------------------------
@@ -515,6 +542,19 @@ class MusicSynthPlugin(NekoPluginBase):
                 for _k, _v in _art.items()
                 if _k in ("vocals", "instrumental", "vocal_clean", "vocal_wav"))
         setup_state = self._setup_state()
+        # 后台下载摘要（只给 totals/daemon，面板要看每项再调 ms_dl_status）——减少轮询请求（S6）。
+        try:
+            dl_state = dl_entries.dl_status(paths)
+            downloads = {"totals": dl_state.get("totals") or {},
+                         "daemon": dl_state.get("daemon") or {},
+                         "active": len([i for i in (dl_state.get("items") or {}).values()
+                                        if i.get("state") in ("queued", "probing", "downloading",
+                                                              "verifying", "post", "pending_post",
+                                                              "paused", "paused_disk_full")]),
+                         "failed": len([i for i in (dl_state.get("items") or {}).values()
+                                        if i.get("state") == "failed"])}
+        except Exception:  # noqa: BLE001 - 读不到状态不拖垮快照
+            downloads = {"totals": {}, "daemon": {}, "active": 0, "failed": 0}
         return {
             "ok": True,
             "tier": plan,
@@ -573,6 +613,7 @@ class MusicSynthPlugin(NekoPluginBase):
             "link": link or {},
             "capture": {"runtime": runtime.locate_app_capture_runtime(self._data_dir, str(self._pipeline.paths.get("synth_python") or ""))},
             "setup": dict(setup_state, progress=self._setup_progress()),
+            "downloads": downloads,
             "first_run": not bool(setup_state.get("completed")),
             "last_run": {
                 "probe": pipeline.last_probe,
@@ -1032,12 +1073,17 @@ class MusicSynthPlugin(NekoPluginBase):
                       "path": {"type": "string", "description": "安装根目录（留空沿用当前/建议目录）"},
                       "items": {"type": "array", "items": {"type": "string"},
                                 "description": "只补装这些 key；留空=全部缺失项"},
+                      "features": {"type": "array", "items": {"type": "string"},
+                                   "description": "要安装的功能：cover/train/create/soulx/capture（分级：T0/T1 前台装，T2 后台下）"},
+                      "tiers": {"type": "array", "items": {"type": "string", "enum": ["T0", "T1", "T2"]},
+                                "description": "只装这些层级；缺省 T0/T1（T2 默认交给后台守护进程）"},
                       "base_python": {"type": "string"},
-                      "download_source": {"type": "string", "enum": ["huggingface", "mirror"]},
+                      "download_source": {"type": "string", "enum": ["auto", "huggingface", "mirror"]},
                       "precision": {"type": "string", "enum": ["auto", "fp32", "fp16", "bf16"]}}})
     @error_log.logged_entry
     async def ms_setup_install(self, path: str = "", items=None, base_python: str = "",
-                               download_source: str = "", precision: str = "", **_):
+                               download_source: str = "", precision: str = "",
+                               features=None, tiers=None, **_):
         updates: dict = {}
         current_root = str(self._pipeline.paths.get("compute_root") or "")
         if path:
@@ -1075,7 +1121,20 @@ class MusicSynthPlugin(NekoPluginBase):
         selected = [str(x) for x in items] if isinstance(items, (list, tuple)) else None
         if selected is not None:
             selected = [x for x in selected if x]
-        if not selected and not report["installable_missing"]:
+        tiered = bool(features or tiers)
+        feat_list = [str(x) for x in features] if isinstance(features, (list, tuple)) else None
+        tier_list = [str(x) for x in tiers] if isinstance(tiers, (list, tuple)) else None
+        if tiered:
+            # 分级安装：T0/T1 已就绪就只入队 T2，不再起安装线程（计划 B.1）。
+            annotated = tiering.annotate_report_with_paths(report, paths, feat_list)
+            tiers_now = annotated.get("tiers") or {}
+            if tiers_now.get("T0", {}).get("ready") and tiers_now.get("T1", {}).get("ready"):
+                deferred = tiering.deferred_items(feat_list)
+                enqueued = dl_entries.maybe_enqueue_deferred(paths, deferred)
+                return Ok({"ok": True, "already_ready": True, "base_completed": True,
+                           "tiers": tiers_now, "features": annotated.get("features"),
+                           "enqueued": enqueued})
+        elif not selected and not report["installable_missing"]:
             if report["ready"]:
                 self._save_setup_state({"completed": True, "report": report,
                                         "checked_at": time.strftime("%Y-%m-%d %H:%M:%S")})
@@ -1108,27 +1167,38 @@ class MusicSynthPlugin(NekoPluginBase):
                                  stage=str(detail).split("：")[0][:40])
 
             try:
-                result = setup_mod.install(paths, selected, progress, probe)
+                result = dl_entries.run_install(setup_mod, paths, features=feat_list,
+                                                tiers=tier_list, items=selected,
+                                                progress=progress, probe=probe)
                 after = result.get("report") or {}
+                deferred = result.get("deferred") or []
+                enqueued = dl_entries.maybe_enqueue_deferred(paths, deferred)
+                # 前台（T0/T1）是否装好：分级看 base_completed，旧行为看 ok（=全部就绪）
+                fg_ok = bool(result.get("base_completed")) if tiered else bool(result.get("ok"))
                 self._save_setup_state({
                     "completed": bool(after.get("ready")),
+                    "base_completed": bool(result.get("base_completed", after.get("ready"))),
                     "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "report": after,
                     "last_install": {k: v for k, v in result.items() if k != "report"},
                 })
                 errs = [f"{e.get('item')}: {e.get('error')}" for e in result.get("errors", [])
                         if not e.get("optional")]
-                if not result.get("ok"):
+                if not fg_ok:
                     if result.get("error"):
                         errs.insert(0, str(result["error"]))
                     if not errs:
                         miss = result.get("missing_after") or []
                         errs.append(("仍缺少：" + "、".join(miss)) if miss else "未知原因（没有可下载的项，但仍有必需项未就绪）")
-                detail = "安装完成" if result.get("ok") else "安装未全部完成：" + "；".join(errs)
-                self._job_update(job_id, state="done" if result.get("ok") else "failed",
+                if deferred:
+                    enq_text = f"；后台下载已入队 {len(deferred)} 项" if enqueued else ""
+                else:
+                    enq_text = ""
+                detail = ("安装完成" if fg_ok else "安装未全部完成：" + "；".join(errs)) + enq_text
+                self._job_update(job_id, state="done" if fg_ok else "failed",
                                  progress=100, detail=detail[-500:], result=result)
                 # 新机器装好环境后补起空闲学习（启动时因为没装好被跳过了）
-                if result.get("ok"):
+                if fg_ok:
                     try:
                         self._reload_paths()
                         self._start_idle_learner()
@@ -1186,6 +1256,79 @@ class MusicSynthPlugin(NekoPluginBase):
         return Ok({"ok": True, "job": job, "setup": self._setup_state(),
                    "progress": self._setup_progress(),
                    "first_run": not bool(self._setup_state().get("completed"))})
+
+    # ------------------------------------------------------------------
+    # 后台下载入口（S6）：只读状态 / 入队 / 控制 / 测速 / 功能就绪
+    # ------------------------------------------------------------------
+    @plugin_entry(id="ms_dl_status", name="为她而唱 · 后台下载状态",
+                  description=("只读：后台下载守护进程的状态（每项进度/速度/当前源/换源次数/错误）。"
+                               "面板只轮询这个，不写任何停止指令"),
+                  input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
+    async def ms_dl_status(self, **_):
+        return Ok(dl_entries.dl_status(self._pipeline.paths))
+
+    @plugin_entry(id="ms_dl_enqueue", name="为她而唱 · 入队后台下载",
+                  description=("把所选功能（缺省全部功能）的 T2 模型入队到后台守护进程静默下载；"
+                               "也可用 artifacts 直接点名"),
+                  input_schema={"type": "object", "properties": {
+                      "features": {"type": "array", "items": {"type": "string"},
+                                   "description": "功能 id 列表：cover/train/create/soulx/capture"},
+                      "artifacts": {"type": "array", "items": {"type": "string"},
+                                    "description": "直接指定下载物 key（不受层级过滤）"},
+                      "tiers": {"type": "array", "items": {"type": "string",
+                                                           "enum": ["T0", "T1", "T2"]}}}})
+    @error_log.logged_entry
+    async def ms_dl_enqueue(self, features=None, artifacts=None, tiers=None, **_):
+        paths = self._reload_paths()
+        if not paths.get("configured"):
+            return Ok({"ok": False, "needs_path": True,
+                       "error": "还没有选择安装位置，请先到安装向导里选一个目录"})
+        return Ok(dl_entries.dl_enqueue(paths, features=features, artifacts=artifacts,
+                                        tiers=tiers))
+
+    @plugin_entry(id="ms_dl_control", name="为她而唱 · 控制后台下载",
+                  description="暂停/继续/取消/重试后台下载（只在用户点按钮时调用）",
+                  input_schema={"type": "object", "properties": {
+                      "action": {"type": "string", "enum": ["pause", "resume", "cancel",
+                                                            "retry", "prioritize"]},
+                      "target": {"type": "string",
+                                 "description": "下载物 key 或 \"all\"（缺省 all）"}}})
+    @error_log.logged_entry
+    async def ms_dl_control(self, action: str = "", target: str = "all", **_):
+        paths = self._reload_paths()
+        if not paths.get("configured"):
+            return Ok({"ok": False, "needs_path": True,
+                       "error": "还没有选择安装位置"})
+        return Ok(dl_entries.dl_control(paths, action, target))
+
+    @plugin_entry(id="ms_dl_speedtest", name="为她而唱 · 下载源测速",
+                  description="按下载物逐个测每个源的下载速度，返回将选用的源",
+                  input_schema={"type": "object", "properties": {
+                      "artifact": {"type": "string",
+                                   "description": "只测这一个下载物；留空测所有有源的"}}})
+    @error_log.logged_entry
+    async def ms_dl_speedtest(self, artifact: str = "", **_):
+        paths = self._reload_paths()
+        if not paths.get("configured"):
+            return Ok({"ok": False, "needs_path": True,
+                       "error": "还没有选择安装位置"})
+        return Ok(await asyncio.to_thread(dl_entries.dl_speedtest, paths,
+                                          str(artifact or "") or None))
+
+    @plugin_entry(id="ms_feature_status", name="为她而唱 · 功能就绪状态",
+                  description=("每个功能（翻唱/训练/原创/SoulX/采集/舞台）的就绪状态、缺失项、"
+                               "后台下载中的项与失败项（合并磁盘就绪与下载进度）"),
+                  input_schema={"type": "object", "properties": {}})
+    @error_log.logged_entry
+    async def ms_feature_status(self, **_):
+        paths = self._reload_paths()
+
+        def _run():
+            ts = tiering.tier_status(setup_mod, paths)
+            return dl_entries.feature_status(paths, tier_status=ts)
+
+        return Ok(await asyncio.to_thread(_run))
 
     # -- 首次向导：分项进度（只读，不改安装逻辑） ---------------------------
     # 安装线程的进度回调把「<label>：<细节>」写进 job["stage"]（取「：」前那段）和 job["detail"]，
@@ -1306,7 +1449,7 @@ class MusicSynthPlugin(NekoPluginBase):
                       "device": {"type": "string", "enum": ["auto", "cuda", "cpu"]},
                       "precision": {"type": "string", "enum": ["auto", "fp32", "fp16", "bf16"]},
                       "max_parallel": {"type": "integer", "minimum": 0, "maximum": 4},
-                      "download_source": {"type": "string", "enum": ["huggingface", "mirror"]}}})
+                      "download_source": {"type": "string", "enum": ["auto", "huggingface", "mirror"]}}})
     @error_log.logged_entry
     async def ms_set_config(self, tier: str = "", sep_backend: str = "",
                             compute_root=None, envs_dir=None, models_dir=None,
@@ -2139,6 +2282,20 @@ class MusicSynthPlugin(NekoPluginBase):
                 setup_mod.resolve_tier_base, self._pipeline.paths, tier, target)
             if found:
                 return Ok({"ok": True, "already": True, "tier": tier, "path": str(found)})
+        # S7：底模（.sf_dlc → model_0.pt）改走后台守护进程，有真实字节进度，
+        # 且不随面板/插件重启中断。legacy 模式保留原来的 install() 路径。
+        if self._dl_engine_mode() != "legacy":
+            key = f"ddsp_base_{tier}"
+            try:
+                dl_manager.ensure_daemon(self._pipeline.paths)
+                dl_manager.enqueue(self._pipeline.paths, [key])
+            except Exception as exc:  # noqa: BLE001
+                return Ok({"ok": False,
+                           "error": f"后台下载入队失败：{type(exc).__name__}: {exc}"})
+            return Ok({"ok": True, "job_id": key, "tier": tier,
+                       "engine": "daemon", "queued": True,
+                       "detail": f"{tier}质量底模已交给后台下载进程"})
+
         expected = float(spec.get("size_gb") or 0.0) * 1024 ** 3
         job_id = self._job_begin("ddsp-base-download")
 
@@ -7362,6 +7519,52 @@ class MusicSynthPlugin(NekoPluginBase):
             "output": Path(self._pipeline.work_dir) / "ace",
         }
 
+    # ------------------------------------------------------------------
+    # S7：repo 型下载物（ACE / SoulX 权重）统一走后台守护进程
+    # ------------------------------------------------------------------
+    REPO_ARTIFACTS = ("ace_model", "soulx_weights", "soulx_rmvpe")
+
+    def _dl_engine_mode(self) -> str:
+        """``download_engine``：daemon（默认）或 legacy（旧的 snapshot_download 路径）。"""
+        try:
+            return dl_entries.engine_mode(self._pipeline.paths)
+        except Exception:  # noqa: BLE001 - 配置读不到就当默认
+            return "daemon"
+
+    def _enqueue_repo_artifact(self, key: str, *, paths: dict | None = None,
+                               priority: int = 0) -> dict:
+        """把一个 repo 型下载物入队到守护进程。
+
+        返回 ``{"ok", "job_id", "key", "state"}``；``job_id`` 与守护进程 item id
+        相同，旧面板拿它轮询 ``ms_dl_status`` 也能显示进度。
+        """
+        target_paths = dict(paths or self._pipeline.paths)
+        # catalog 的 repo 型 target 用 ``soulx_root`` / ``acestep`` 这些键解析；
+        # 插件侧的 paths 里没有，补上（与 _soulx_paths / _ace_paths 的实际目录一致）。
+        root = Path(str(target_paths.get("compute_root") or self._data_dir))
+        target_paths.setdefault("soulx_root", str(root / "soulx"))
+        target_paths.setdefault("acestep", str(root / "acestep"))
+        try:
+            dl_manager.ensure_daemon(target_paths)
+            dl_manager.enqueue(target_paths, [key], priority=priority)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        state = {}
+        try:
+            state = dl_manager.read_item(target_paths, key) or {}
+        except Exception:  # noqa: BLE001
+            state = {}
+        return {"ok": True, "job_id": key, "key": key,
+                "state": state.get("state") or "queued",
+                "bytes_total": int(state.get("bytes_total") or 0)}
+
+    def _repo_artifact_state(self, key: str) -> dict:
+        """守护进程里这个下载物的当前状态（读不到返回空 dict）。"""
+        try:
+            return dl_manager.read_item(self._pipeline.paths, key) or {}
+        except Exception:  # noqa: BLE001
+            return {}
+
     ACE_MODEL_DEFAULT = "acestep-v15-turbo"
     # XL 是 4B DiT；turbo 8 步、sft/base 50 步。面板按显存给推荐项。
     ACE_MODEL_CHOICES = (
@@ -7561,12 +7764,25 @@ class MusicSynthPlugin(NekoPluginBase):
         base_python = (py_launcher + " -3.10") if py_launcher else "py -3.10"
         job_id = self._job_begin("soulx-install")
         status_path = Path(p["root"]) / "install_status.json"
+        # S7：权重（model-svc.pt / model.pt / rmvpe.pt）交给后台守护进程，
+        # worker 只做「代码仓库 + venv + pip 依赖」，用 --skip-models 跳过 snapshot_download。
+        use_daemon = self._dl_engine_mode() != "legacy"
         job = {
             "root": str(p["root"]),
             "pylibs": str(self._ace_paths()["pylibs"]),
             "venv": str(Path(p["python"]).parents[1]),
             "base_python": base_python,
+            "skip_models": use_daemon,
         }
+        queued = {}
+        if use_daemon:
+            for repo_key in ("soulx_weights", "soulx_rmvpe"):
+                enq = self._enqueue_repo_artifact(repo_key)
+                if enq.get("ok"):
+                    queued[repo_key] = enq["job_id"]
+                else:
+                    return Ok({"ok": False,
+                               "error": f"{repo_key} 入队失败：{enq.get('error')}"})
         need_deps = bool(self._ace_deps_missing())
 
         def run():
@@ -7598,9 +7814,13 @@ class MusicSynthPlugin(NekoPluginBase):
             watcher = threading.Thread(target=watch, daemon=True)
             watcher.start()
             try:
+                worker_script = self._train_worker("soulx_install_worker.py")
+                if use_daemon:
+                    # runtime.run_worker 支持 [path, "--flag", ...] 这种带前置 flag 的写法
+                    worker_script = [str(worker_script), "--skip-models"]
                 result = runtime.run_worker(
                     Path(str(self._pipeline.paths["synth_python"])),
-                    self._train_worker("soulx_install_worker.py"),
+                    worker_script,
                     job, cwd=Path(p["root"]), timeout=21600,
                     log_path=Path(p["root"]) / "install_worker.log")
             except Exception as exc:  # noqa: BLE001
@@ -7617,7 +7837,9 @@ class MusicSynthPlugin(NekoPluginBase):
                                  detail=str(result.get("error") or "SoulX 安装失败"))
 
         self._thread(f"ms-soulx-install-{job_id}", run)
-        return Ok({"ok": True, "job_id": job_id})
+        return Ok({"ok": True, "job_id": job_id,
+                   "engine": "daemon" if use_daemon else "legacy",
+                   "queued": queued})
 
     def _bundled_voice(self, name: str) -> dict | None:
         """插件自带的体验音色：data/bundled_voices.json 里登记的名字 → 试听样曲。
@@ -7972,6 +8194,17 @@ class MusicSynthPlugin(NekoPluginBase):
                        "vram_min_gb": (meta or {}).get("vram_min_gb"),
                        "disk_free_gb": round(disk_free_gb, 1),
                        "warning": "；".join(warnings)})
+        # S7：默认把 ACE 下载交给后台守护进程（有真实字节进度、关面板/关 N.E.K.O 不中断）。
+        # 只有 download_engine="legacy" 才走原来的 snapshot_download 路径。
+        if self._dl_engine_mode() != "legacy":
+            enq = self._enqueue_repo_artifact("ace_model")
+            if not enq.get("ok"):
+                return Ok({"ok": False,
+                           "error": "后台下载进程没能入队：" + str(enq.get("error") or "")})
+            return Ok({"ok": True, "job_id": enq["job_id"], "model": name,
+                       "engine": "daemon", "queued": True,
+                       "detail": "已交给后台下载进程，可在下载条或「原创歌曲」页看进度"})
+
         job_id = self._job_begin("ace-download")
         _src = str((self._pipeline.paths.get("raw") or {})
                    .get("download_source") or "").strip().lower()
@@ -8909,10 +9142,23 @@ class MusicSynthPlugin(NekoPluginBase):
         return out
 
     def _ace_install_model_sync(self, progress=None) -> dict:
-        """下载 ACE 主模型（turbo + vae + Qwen3 文本编码器）。走插件自带的 ACE 下载器（ModelScope 优先）。"""
+        """下载 ACE 主模型（turbo + vae + Qwen3 文本编码器）。
+
+        S7：默认入队到后台守护进程（repo 型 artifact，按 components 逐文件下，有真实
+        字节进度）；``download_engine="legacy"`` 时走原来的 snapshot_download 路径。
+        """
         p = self._ace_paths()
         if not p["python"].is_file():
             return {"ok": False, "error": "合成环境还没装好"}
+        if self._dl_engine_mode() != "legacy":
+            enq = self._enqueue_repo_artifact("ace_model")
+            if not enq.get("ok"):
+                return {"ok": False, "error": str(enq.get("error") or "入队失败")}
+            if progress:
+                progress("原创歌曲：ACE 基础模型已交给后台下载（约 6GB，可断点续传）")
+            # 入队成功就算「已开始」；最终就绪由 feature_ready / ms_ace_status 判定
+            return {"ok": True, "detail": "ACE 基础模型已交给后台下载进程",
+                    "job_id": enq["job_id"], "queued": True}
         if [x for x in self._ace_problems() if x.startswith("ACE 依赖")]:
             return {"ok": False, "error": "先装 ACE 依赖"}
         p["checkpoints"].mkdir(parents=True, exist_ok=True)

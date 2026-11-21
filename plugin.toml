@@ -4,7 +4,7 @@ name = "为她而唱"
 description = "全自动变声翻唱模块：采集 AI 正在听的歌 → 按静音/标题切歌 → 分离人声与伴奏 → 用 DDSP-SVC 6.3（RectifiedFlow）把原唱声线转换到目标音色 → 混回伴奏 → 面板出曲、AI 可调用演唱。"
 short_description = "听歌识歌、人声分离、DDSP-SVC 音色转换翻唱，一键出成品并让 AI 唱出来"
 keywords = ["唱歌", "翻唱", "变声", "音色转换", "DDSP-SVC", "人声分离", "SVC", "sing", "cover", "vocal", "voice conversion"]
-version = "0.3.6"
+version = "0.3.7"
 type = "plugin"
 entry = "plugin.plugins.music_synth:MusicSynthPlugin"
 
@@ -61,3 +61,25 @@ max_parallel = 0
 # huggingface | mirror（国内可切镜像 hf-mirror.com）
 download_source = "huggingface"
 auto_setup = true
+
+# ---- 下载分级 / 换源（S11）----
+# 下载峰值限速（MB/s）：0 = 不限速。设成 0 时由测速自动选最快源。
+download_max_mbps = 0
+# 源偏好：auto（纯测速选最快）| mirror（国内源优先）| huggingface（官方源优先）
+download_mirror_preference = "auto"
+# 校验下载源 TLS 证书；只在需要信任自签镜像时改 false，正常保持 true
+download_check_ssl = true
+# 单文件换源/重试上限（到达后固定用历史最快源）
+download_max_retries = 8
+# 下载完成后校验 sha256（内容完整性 + 跨源一致性）
+download_verify_hash = true
+# 后台守护进程同时下载的文件数
+download_max_parallel = 2
+# 断点续传（.part / .part.json 由引擎维护，换源前比对末尾 64KB）
+download_resume = true
+# 守护进程队列空闲 N 秒后自动退出（下次入队会自动拉起）
+download_idle_sleep_s = 60
+# 测速结果缓存天数（超过后重新测速）
+download_cache_days = 7
+# 源策略：fastest（测速选最快）| mirror_first（国内优先）| official_first（官方优先）
+download_source_strategy = "fastest"

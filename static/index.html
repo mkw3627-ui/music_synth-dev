@@ -4752,6 +4752,119 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     if (env.ffmpeg) push("ffmpeg", !!(env.ffmpeg.ok !== void 0 ? env.ffmpeg.ok : env.ffmpeg.exists), env.ffmpeg.path || env.ffmpeg.detail || "", "在安装向导里装");
     return rows;
   }
+  /* S11_PURE_BEGIN */
+  // S11 纯函数（下载速度与来源设置）：无 DOM 依赖，便于 node 自测（tests/test_sources_s11.js 提取本块 eval）。
+  // 速度档位来自 S1 实测（_reports/S1_sources_report.md）；被 S1 剔除的镜像进 S11_REJECTED，不进默认顺序。
+  var S11 = (function () {
+    // 主机 → 速度档（越小越快）；S1 实测速递排序。查不到的按 99（最慢兜底）。
+    var HOST_RANK = {
+      "modelscope.cn": 0,
+      "mirrors.aliyun.com": 1,
+      "mirror.nju.edu.cn": 1,
+      "mirrors.ustc.edu.cn": 2,
+      "mirrors.cloud.tencent.com": 2,
+      "pypi.tuna.tsinghua.edu.cn": 2,
+      "gh-proxy.com": 3,
+      "cors.isteed.cc": 3,
+      "ghproxy.net": 4,
+      "hf-mirror.net": 4,
+      "huggingface.co": 5,
+      "download.pytorch.org": 5,
+      "github.com": 5,
+      "codeload.github.com": 5
+    };
+    // S1 实测剔除的死源（308 跳回 / 404 / TLS / text/html 等），标灰不入默认顺序
+    var REJECTED = [
+      "hf-mirror.com", "ghfast.top", "hk.gh-proxy.com", "gh.llkk.cc", "ghp.ci",
+      "hub.gitmirror.com", "gh-proxy.net", "gitproxy.click", "ghproxy.cc",
+      "gh.api.99988866.xyz"
+    ];
+    function hostOfUrl(url) {
+      if (!url) return "";
+      var m = String(url).match(/^[a-z]+:\/\/([^\/?#]+)/i);
+      if (m) return m[1].replace(/^www\./, "").toLowerCase();
+      return String(url).split(/[\/?#]/)[0].toLowerCase();
+    }
+    function normalizeHost(host) {
+      return String(host || "").replace(/^www\./, "").toLowerCase();
+    }
+    function rankHost(host) {
+      var h = normalizeHost(host);
+      return (HOST_RANK[h] !== void 0) ? HOST_RANK[h] : 99;
+    }
+    function isRejected(host) {
+      return REJECTED.indexOf(normalizeHost(host)) >= 0;
+    }
+    function isRecommended(host) {
+      return rankHost(host) <= 1;
+    }
+    function sortHosts(hosts) {
+      return (hosts || []).slice().sort(function (a, b) {
+        var ra = rankHost(a), rb = rankHost(b);
+        if (ra !== rb) return ra - rb;
+        return String(a).localeCompare(String(b));
+      });
+    }
+    function defaultOrder() {
+      return sortHosts(Object.keys(HOST_RANK));
+    }
+    // ms_dl_speedtest 的 items（{artifact: [rows]}）→ 按 host 聚合出每源速度/可用性
+    function aggregateByHost(items) {
+      var agg = {};
+      Object.keys(items || {}).forEach(function (k) {
+        (items[k] || []).forEach(function (r) {
+          var h = normalizeHost((r && r.host) || hostOfUrl(r && r.url) || (r && r.url) || "?");
+          if (!agg[h]) agg[h] = { host: h, okCount: 0, failCount: 0, bpsSum: 0, artifacts: 0 };
+          if (r && r.ok) { agg[h].okCount += 1; agg[h].bpsSum += Number(r.bps || 0); }
+          else agg[h].failCount += 1;
+          agg[h].artifacts += 1;
+        });
+      });
+      return Object.keys(agg).map(function (h) {
+        var a = agg[h];
+        return { host: h, ok: a.okCount > 0, okCount: a.okCount, failCount: a.failCount,
+                 avgBps: a.okCount ? a.bpsSum / a.okCount : 0, artifacts: a.artifacts };
+      });
+    }
+    // 测速后「当前生效来源顺序」：可用源按速度档排、再按实测速度降序；不可用/被禁排最后
+    function effectiveOrder(rows) {
+      return (rows || []).slice().sort(function (a, b) {
+        var aOk = !!a.ok && !isRejected(a.host), bOk = !!b.ok && !isRejected(b.host);
+        if (aOk !== bOk) return aOk ? -1 : 1;
+        var ra = rankHost(a.host), rb = rankHost(b.host);
+        if (ra !== rb) return ra - rb;
+        return (Number(b.avgBps) || 0) - (Number(a.avgBps) || 0);
+      });
+    }
+    function prefOptions() {
+      return [
+        { value: "auto", label: "自动（测速选最快）" },
+        { value: "mirror", label: "国内源优先" },
+        { value: "huggingface", label: "官方源优先" }
+      ];
+    }
+    function prefLabel(pref) {
+      var hit = prefOptions().filter(function (o) { return o.value === pref; })[0];
+      return hit ? hit.label : "自动（测速选最快）";
+    }
+    function explainText() {
+      return "300MB 以上的下载物都备了多个镜像，自动测速选最快并校验 sha256 哈希；换源前会比对已下末尾 64KB，对不上就重下，不污染续传。";
+    }
+    function speedText(bps) {
+      var v = Number(bps) || 0;
+      if (v < 1024) return v.toFixed(0) + " B/s";
+      if (v < 1024 * 1024) return (v / 1024).toFixed(0) + " KB/s";
+      return (v / (1024 * 1024)).toFixed(1) + " MB/s";
+    }
+    return {
+      HOST_RANK: HOST_RANK, REJECTED: REJECTED, hostOfUrl: hostOfUrl, normalizeHost: normalizeHost,
+      rankHost: rankHost, isRejected: isRejected, isRecommended: isRecommended, sortHosts: sortHosts,
+      defaultOrder: defaultOrder, aggregateByHost: aggregateByHost, effectiveOrder: effectiveOrder,
+      prefOptions: prefOptions, prefLabel: prefLabel, explainText: explainText, speedText: speedText
+    };
+  })();
+  /* S11_PURE_END */
+
   function PageSettings(props) {
     var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l;
     const { api, snap, onRefresh } = props;
@@ -4809,6 +4922,36 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const [cacheInfo, setCacheInfo] = useState(null);
     const [ckpt, setCkpt] = useState("");
     const [ckptPath, setCkptPath] = useState("");
+    // S11：下载速度与来源设置
+    const [dlPref, setDlPref] = useState(() => (paths && paths.download_source) || "auto");
+    const [dlSpeed, setDlSpeed] = useState(null);
+    const [dlSpeedBusy, setDlSpeedBusy] = useState(false);
+    const [dlSpeedErr, setDlSpeedErr] = useState("");
+    const runSpeedtest = async () => {
+      if (dlSpeedBusy) return;
+      setDlSpeedBusy(true);
+      setDlSpeedErr("");
+      try {
+        const r = await callEntry(api, "ms_dl_speedtest", {}, 9e4);
+        setDlSpeed(r && r.items ? r : null);
+      } catch (e) {
+        setDlSpeedErr(String(e && e.message || e));
+      }
+      setDlSpeedBusy(false);
+    };
+    const saveDlPref = async () => {
+      if (busy) return;
+      setBusy("dlpref");
+      setNotice(null);
+      try {
+        const r = await callEntry(api, "ms_set_config", { download_source: dlPref }, 6e4);
+        if (!r || r.ok === false) throw Error(String(r && r.error || "保存失败"));
+        setNotice({ tone: "info", text: "下载源偏好已保存：" + S11.prefLabel(dlPref) });
+      } catch (e) {
+        setNotice({ tone: "error", text: "保存下载源偏好失败：" + String(e && e.message || e) });
+      }
+      setBusy("");
+    };
     const init = useRef(false);
     useEffect(() => {
       var _a2, _b2, _c2, _d2, _e2, _f2, _g2, _h2, _i2, _j2, _k2, _l2, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v;
@@ -5450,14 +5593,160 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           ] })
         }
       ),
+      /* @__PURE__ */ jsxs(Panel, { title: "下载速度与来源", extra: /* @__PURE__ */ jsx(Pill, { tone: "neutral", children: S11.prefLabel(dlPref) }), children: [
+        /* @__PURE__ */ jsxs(Col, { style: { gap: 12 }, children: [
+          /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK_2, lineHeight: 1.8 }, children: S11.explainText() }),
+          /* @__PURE__ */ jsx(Field, { label: "下载源偏好", children: /* @__PURE__ */ jsxs(Select, { value: dlPref, onChange: (e) => setDlPref(e.target.value), children: S11.prefOptions().map((o) => /* @__PURE__ */ jsx("option", { value: o.value, children: o.label }, o.value)) }) }),
+          /* @__PURE__ */ jsx(Row, { children: [
+            /* @__PURE__ */ jsx(Btn, { style: PRIMARY_BTN, disabled: !!busy, onClick: saveDlPref, children: busy === "dlpref" ? "保存中…" : "保存源偏好" }),
+            /* @__PURE__ */ jsx(Btn, { disabled: dlSpeedBusy, onClick: runSpeedtest, children: dlSpeedBusy ? "测速中（约 1 分钟）…" : "测速" })
+          ] }),
+          dlSpeedErr ? /* @__PURE__ */ jsx(Alert, { tone: "warning", children: dlSpeedErr }) : null,
+          dlSpeed ? /* @__PURE__ */ jsxs(Col, { style: { gap: 6 }, children: [
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, fontWeight: 700, color: INK }, children: "当前生效来源顺序（按测速）" }),
+            S11.effectiveOrder(S11.aggregateByHost(dlSpeed.items)).map((r, i) => /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 10, alignItems: "center", padding: "7px 10px", borderRadius: 10, background: r.ok ? "rgba(232,247,239,0.5)" : "rgba(253,236,236,0.5)" }, children: [
+              /* @__PURE__ */ jsx("span", { style: { width: 18, color: INK_3, fontSize: 11.5, textAlign: "right" }, children: i + 1 }),
+              /* @__PURE__ */ jsx("span", { style: { flex: "1 1 auto", minWidth: 120, fontSize: 12.5, color: INK, wordBreak: "break-all" }, children: r.host }),
+              S11.isRecommended(r.host) ? /* @__PURE__ */ jsx(Pill, { tone: "success", children: "推荐" }) : null,
+              /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11.5 }, children: r.ok ? S11.speedText(r.avgBps) : "不可用" })
+            ] }, r.host))
+          ] }) : null,
+          /* @__PURE__ */ jsxs(Col, { style: { gap: 6 }, children: [
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, fontWeight: 700, color: INK }, children: "默认来源顺序（S1 实测速度档）" }),
+            /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexWrap: "wrap", gap: 6 }, children: S11.defaultOrder().map((h) => /* @__PURE__ */ jsxs("span", { style: { padding: "3px 9px", borderRadius: 999, fontSize: 11.5, background: S11.isRecommended(h) ? "rgba(232,247,239,0.7)" : "rgba(248,250,252,0.9)", border: "1px solid " + LINE, color: INK_2 }, children: [
+              h,
+              S11.isRecommended(h) ? " ★" : ""
+            ] }, h)) })
+          ] }),
+          S11.REJECTED.length ? /* @__PURE__ */ jsxs("div", { style: { fontSize: 11.5, color: INK_3, lineHeight: 1.7 }, children: [
+            "已禁用的源（S1 实测剔除，不再参与下载）：",
+            S11.REJECTED.join("、")
+          ] }) : null
+        ] })
+      ] }),
       /* @__PURE__ */ jsx(Muted, { children: "所有处理都在本机完成，不会把音频上传到网上。" })
     ] });
   }
 
   // ../../.neko-plugin-installations/plugins/music_synth/ui/onboarding.tsx
-  var STEPS = ["体验", "功能", "用法", "环境", "开始"];
-  var STEP_TITLES = ["先听听效果", "她能做什么", "怎么用", "准备运行环境", "准备完成"];
+  var STEPS = ["体验", "功能", "用法", "选功能", "环境", "开始"];
+  var STEP_TITLES = ["先听听效果", "她能做什么", "怎么用", "选想用的功能", "准备运行环境", "准备完成"];
   var REDOWNLOAD_KEYS = ["ddsp_contentvec", "sep_karaoke"];
+  /* S8_PURE_BEGIN */
+  // S8 纯函数（下载分级向导）：无 DOM 依赖，便于 node 自测（tests/test_wizard_s8.js 提取本块 eval）。
+  var S8_FEATURE_ORDER = ["cover", "train", "create", "soulx", "capture"];
+  var S8_FEATURE_DEPENDS = { cover: [], train: ["cover"], create: ["cover"], soulx: ["create"], capture: ["cover"] };
+  var S8_FEATURE_DEFAULT = { cover: true, train: false, create: false, soulx: false, capture: true };
+  var S8_FEATURE_GPU = { cover: false, train: false, create: true, soulx: true, capture: false };
+  var S8_FEATURE_LABEL = { cover: "翻唱", train: "音色训练", create: "原创歌曲", soulx: "SoulX 唱法", capture: "听歌采集" };
+  // 每个功能的必需下载物（只做展示过滤；真正的安装/入队由后端按 features/tiers 决定）。
+  var S8_FEATURE_ITEMS = {
+    cover: { T0: ["base_python", "ffmpeg", "synth_env", "torch", "ddsp_deps", "audio_separator"], T1: ["ddsp_repo"], T2: ["ddsp_contentvec", "ddsp_vocoder", "ddsp_rmvpe", "sep_karaoke"] },
+    train: { T0: [], T1: [], T2: ["ddsp_reflow_base"] },
+    create: { T0: ["ace_deps"], T1: [], T2: ["ace_model"] },
+    soulx: { T0: [], T1: ["soulx_code"], T2: ["soulx_weights", "soulx_rmvpe"] },
+    capture: { T0: ["capture_native"], T1: [], T2: [] },
+    stage: { T0: [], T1: [], T2: [] }
+  };
+  var S8 = (function () {
+    function mapWizardStep(n) {
+      var v = Number(n);
+      if (!Number.isFinite(v) || v < 1) return 1;
+      // 旧 5 步 → 新 6 步：旧「环境」4 → 新 5，旧「开始」5 → 新 6，1/2/3 不变。
+      if (v === 4) return 5;
+      if (v === 5) return 6;
+      if (v > 6) return 6;
+      return v;
+    }
+    // ?wizard= 参数 → 新编号步数（只在这里映射一次）；无参数或不认识返回 0。
+    function wizardStepFromQuery(v) {
+      v = String(v || "");
+      if (/^[1-6]$/.test(v)) return mapWizardStep(Number(v));
+      if (v === "fail" || v === "install") return 5;
+      return 0;
+    }
+    // Onboarding 收到的 startAt 已是新编号：只夹到 1..6，不再映射。
+    function clampWizardStep(n) {
+      var v = Number(n);
+      return Number.isFinite(v) && v >= 1 && v <= 6 ? Math.floor(v) : 1;
+    }
+    function expandFeatures(selection) {
+      var out = [];
+      var seen = {};
+      function walk(k) {
+        if (!S8_FEATURE_DEPENDS[k] || seen[k]) return;
+        seen[k] = true;
+        (S8_FEATURE_DEPENDS[k] || []).forEach(walk);
+        out.push(k);
+      }
+      (selection || []).forEach(walk);
+      return S8_FEATURE_ORDER.filter(function (k) { return seen[k]; });
+    }
+    function featureOptions(fs, hasGpu) {
+      return S8_FEATURE_ORDER.map(function (k) {
+        var f = (fs && fs[k]) || {};
+        var gpuRequired = !!S8_FEATURE_GPU[k];
+        var disabled = gpuRequired && !hasGpu;
+        return {
+          key: k,
+          label: (f && f.label) || S8_FEATURE_LABEL[k] || k,
+          fg_gb: Number(f.fg_gb || 0),
+          bg_gb: Number(f.bg_gb || 0),
+          total_gb: Number(f.total_gb || 0),
+          gpu_required: gpuRequired,
+          gpu_ok: !gpuRequired || !!hasGpu,
+          disabled: disabled,
+          disabled_reason: disabled ? "需要 NVIDIA 显卡（显存 ≥ 6GB）" : "",
+          depends: (S8_FEATURE_DEPENDS[k] || []).slice(),
+          depends_labels: (S8_FEATURE_DEPENDS[k] || []).map(function (d) {
+            return (fs && fs[d] && fs[d].label) || S8_FEATURE_LABEL[d] || d;
+          }),
+          default: !!S8_FEATURE_DEFAULT[k],
+          pages: (f.pages || []).slice()
+        };
+      });
+    }
+    function fgKeysFor(selection) {
+      var out = [];
+      expandFeatures(selection).forEach(function (f) {
+        var m = S8_FEATURE_ITEMS[f] || { T0: [], T1: [] };
+        out = out.concat(m.T0 || []).concat(m.T1 || []);
+      });
+      return out;
+    }
+    function bgGbFor(selection, fs) {
+      return expandFeatures(selection).reduce(function (s, f) {
+        var meta = (fs && fs[f]) || {};
+        return s + Number(meta.bg_gb || 0);
+      }, 0);
+    }
+    function fgGbFor(selection, fs) {
+      return expandFeatures(selection).reduce(function (s, f) {
+        var meta = (fs && fs[f]) || {};
+        return s + Number(meta.fg_gb || 0);
+      }, 0);
+    }
+    function baseCompletedFor(selection, fs) {
+      var keys = expandFeatures(selection);
+      if (!keys.length) return false;
+      return keys.every(function (f) {
+        var meta = (fs && fs[f]) || {};
+        return !!(meta.t0_ready && meta.t1_ready);
+      });
+    }
+    return {
+      mapWizardStep: mapWizardStep,
+      wizardStepFromQuery: wizardStepFromQuery,
+      clampWizardStep: clampWizardStep,
+      expandFeatures: expandFeatures,
+      featureOptions: featureOptions,
+      fgKeysFor: fgKeysFor,
+      bgGbFor: bgGbFor,
+      fgGbFor: fgGbFor,
+      baseCompletedFor: baseCompletedFor
+    };
+  })();
+  /* S8_PURE_END */
   function previewMode() {
     try {
       const q = String(window.location && window.location.search || "");
@@ -5660,8 +5949,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
   }
   function Onboarding(props) {
     const [step, setStep] = useState(() => {
-      const n = Number(props.startAt || 1);
-      return n >= 1 && n <= 5 ? n : 1;
+      return S8.clampWizardStep(props.startAt || 1);
     });
     const [src, setSrc] = useState("");
     const [playing, setPlaying] = useState(false);
@@ -5726,6 +6014,26 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const featNext = () => setFeat((i) => Math.min(FEATURES.length - 1, i + 1));
     const [report, setReport] = useState(null);
     const [mockMode, setMockMode] = useState(false);
+    // S8：选功能 + 功能就绪状态（ms_feature_status）
+    const [featStatus, setFeatStatus] = useState(null);
+    const [selFeats, setSelFeats] = useState(() => {
+      try {
+        const raw = window.localStorage.getItem("ms_download_features");
+        const parsed = raw ? JSON.parse(raw) : null;
+        if (parsed && Array.isArray(parsed)) return parsed.filter((k) => S8_FEATURE_ORDER.indexOf(k) >= 0);
+        return S8_FEATURE_ORDER.filter((k) => S8_FEATURE_DEFAULT[k]);
+      } catch (e) {
+        return S8_FEATURE_ORDER.filter((k) => S8_FEATURE_DEFAULT[k]);
+      }
+    });
+    const enqueuedRef = useRef(null); // 进入主页时标记是否已入队过
+    const loadFeatures = async () => {
+      try {
+        const r = await callEntryLoose(props.api, "ms_feature_status", {}, 6e4);
+        if (r && r.features) setFeatStatus(r);
+      } catch (e) {
+      }
+    };
     const [path, setPath] = useState("");
     const [freeGb, setFreeGb] = useState(null);
     const [busy, setBusy] = useState("");
@@ -5773,6 +6081,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     };
     useEffect(() => {
       check();
+      loadFeatures();
     }, []);
     const restartAndCheck = async () => {
       setBusy("start");
@@ -5831,7 +6140,6 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
             if (p.job_state === "done") {
               setInstalling(false);
               setMockDone(true);
-              setStep(5);
               return;
             }
             continue;
@@ -5854,18 +6162,12 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
             }
             if (s === "done" || s === "failed") {
               setInstalling(false);
-              const fresh = await check();
               setProg(null);
-              if (s === "done" && fresh && fresh.ready) {
-                setStep(5);
-                return;
-              }
+              await check();
+              await loadFeatures();
               if (s === "failed") {
                 setErr(String(st.progress && st.progress.detail || st.job && st.job.detail || "安装没有全部完成，看下面哪一项失败了。"));
-                return;
               }
-              const miss = (fresh && fresh.items || []).filter((i) => i.required && !i.ok);
-              setErr("安装跑完了，但这些必需项还没就绪：" + (miss.map((i) => i.label).join("、") || "（检测结果里没有可显示的项）") + "。可以再点一次安装补装。");
               return;
             }
           } catch (e) {
@@ -5889,18 +6191,21 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       if (bad) {
         setPathErr(bad);
         setMustInstall(false);
-        setStep(4);
+        setStep(5);
         return;
       }
       setBusy(only || "all");
       setErr("");
       setMustInstall(false);
       try {
-        const r = await callEntry(props.api, "ms_setup_install", only ? { path: target, items: [only] } : { path: target }, 6e4);
+        const payload = only
+          ? { path: target, items: [only] }
+          : { path: target, features: selected, tiers: ["T0", "T1"] };
+        const r = await callEntry(props.api, "ms_setup_install", payload, 6e4);
         if (r && r.already_ready) {
-          setProg({ job_state: "done", items: {}, detail: "环境已就绪" });
-          setMockDone(true);
-          setStep(5);
+          setProg({ job_state: "done", items: {}, detail: "基础环境已就绪" });
+          setInstalling(false);
+          await loadFeatures();
           return;
         }
         if (r && r.job_id) {
@@ -6133,17 +6438,41 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     const lack = freeGb !== null && needGb > 0 && freeGb < Math.max(0.5, needGb * 1.15);
     const pathIssue = pathProblem(path);
     const allReady = !!report && report.ready === true;
+    // S8：选功能 → 展开依赖 → 计算前台/后台体积、就绪、要显示的 T0/T1 清单
+    const hasGpu = !report || !!report.hardware.gpu;
+    const selected = S8.expandFeatures(selFeats);
+    const featOpts = S8.featureOptions(featStatus && featStatus.features, hasGpu);
+    const fgKeys = S8.fgKeysFor(selFeats);
+    const fgItemKeys = new Set(fgKeys);
+    const bgGb = S8.bgGbFor(selFeats, featStatus && featStatus.features);
+    const fgGb = S8.fgGbFor(selFeats, featStatus && featStatus.features);
+    const baseCompleted = mockDone || S8.baseCompletedFor(selFeats, featStatus && featStatus.features);
     const canNext = allReady || mockDone;
     const knownMissing = !!report && !allReady && !mockDone && items.some((i) => i.required && !i.ok && i.installable);
+    const toggleFeat = (k) => {
+      setSelFeats((prev) => {
+        const on = prev.indexOf(k) >= 0;
+        let next = on ? prev.filter((x) => x !== k) : prev.concat([k]);
+        // 勾选某个功能时自动带上它的前置（展开顺序统一）
+        next = S8.expandFeatures(next);
+        return next;
+      });
+    };
+    const persistSel = () => {
+      try {
+        window.localStorage.setItem("ms_download_features", JSON.stringify(selected));
+      } catch (e) {
+      }
+    };
     const requestSkip = () => {
       if (!report && !err) {
         setMustInstall(true);
-        setStep(4);
+        setStep(5);
         return;
       }
       if (knownMissing) {
         setMustInstall(true);
-        setStep(4);
+        setStep(5);
         return;
       }
       if (props.onSkip) props.onSkip();
@@ -6359,16 +6688,55 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       /* @__PURE__ */ jsx(Muted, { style: { textAlign: "center", fontSize: 11.5 }, children: "想换回原来的声音？随时在「我的声音」里切换。" }),
       /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between" }, children: [
         /* @__PURE__ */ jsx(Btn, { style: ghostBtn, onClick: () => setStep(2), children: "上一步" }),
-        /* @__PURE__ */ jsx(Btn, { style: primaryBtn, onClick: () => setStep(4), children: "下一步：准备运行环境 →" })
+        /* @__PURE__ */ jsx(Btn, { style: primaryBtn, onClick: () => setStep(4), children: "下一步：选想用的功能 →" })
+      ] })
+    ] });
+    // S8：第 4 步 · 选功能（FeaturePicker）
+    const page4 = /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 14 }, children: [
+      /* @__PURE__ */ jsxs("div", { style: { textAlign: "center" }, children: [
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 19, fontWeight: 800, color: INK }, children: "先选想用哪些功能" }),
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK_2, marginTop: 6, lineHeight: 1.8 }, children: "基础环境装好后就能进主页；模型会在后台自动下载。" })
+      ] }),
+      /* @__PURE__ */ jsx("div", { style: { display: "flex", flexDirection: "column", gap: 8 }, children: featOpts.map((f) => {
+        const on = selFeats.indexOf(f.key) >= 0;
+        const cardStyle = {
+          display: "grid",
+          gridTemplateColumns: "34px minmax(0,1fr) auto",
+          gap: "4px 12px",
+          alignItems: "center",
+          padding: "13px 15px",
+          borderRadius: 16,
+          cursor: f.disabled ? "default" : "pointer",
+          border: "1px solid " + (on ? BRAND : LINE),
+          background: on ? "rgba(255,229,239,0.6)" : f.disabled ? "rgba(40,37,50,0.03)" : "rgba(255,255,255,0.8)",
+          opacity: f.disabled ? 0.55 : 1
+        };
+        return /* @__PURE__ */ jsxs("div", { role: "button", tabIndex: f.disabled ? -1 : 0, "aria-pressed": on, "aria-label": f.label + (f.disabled ? "（" + f.disabled_reason + "）" : ""), onClick: () => { if (!f.disabled) toggleFeat(f.key); }, style: cardStyle, children: [
+          /* @__PURE__ */ jsx("span", { style: { width: 26, height: 26, borderRadius: 9, display: "grid", placeItems: "center", border: "1.5px solid " + (on ? BRAND : "rgba(40,37,50,0.18)"), background: on ? BRAND : "transparent", color: "#fff", fontSize: 14, fontWeight: 800 }, children: on ? "✓" : "" }),
+          /* @__PURE__ */ jsxs("div", { style: { minWidth: 0 }, children: [
+            /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }, children: [
+              /* @__PURE__ */ jsx("span", { style: { fontSize: 14.5, fontWeight: 700, color: INK }, children: f.label }),
+              f.depends && f.depends.length ? /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11 }, children: "需要先装：" + (f.depends_labels || f.depends).join("、") }) : null
+            ] }),
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: INK_3, marginTop: 2, lineHeight: 1.6 }, children: f.disabled ? f.disabled_reason : "前台 " + (f.fg_gb ? f.fg_gb + " GB" : "—") + " · 后台 " + (f.bg_gb ? f.bg_gb + " GB" : "—") })
+          ] }),
+          /* @__PURE__ */ jsx(Pill, { tone: f.disabled ? "neutral" : on ? "success" : "neutral", children: f.disabled ? "不可用" : on ? "已选" : "可选" })
+        ] }, f.key);
+      }) }),
+      !featStatus ? /* @__PURE__ */ jsx(Muted, { children: "正在读取各功能的体积与硬件要求…" }) : null,
+      /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between", marginTop: 4 }, children: [
+        /* @__PURE__ */ jsx(Btn, { style: ghostBtn, onClick: () => setStep(3), children: "上一步" }),
+        /* @__PURE__ */ jsx(Btn, { style: primaryBtn, disabled: !selected.length, onClick: () => { persistSel(); setStep(5); }, children: "下一步：准备运行环境 →" })
       ] })
     ] });
     const rank = (i) => i.required ? i.status === "ready" ? 2 : 0 : i.status === "ready" ? 3 : 1;
-    const showing = [...items].sort((a, b) => rank(a) - rank(b));
+    const fgList = items.filter((i) => fgItemKeys.has(i.key));
+    const showing = [...fgList].sort((a, b) => rank(a) - rank(b));
     const firstOptIdx = showing.findIndex((i) => i.required === false);
     const driveOptions = (report && report.hardware && report.hardware.drives || []).map((d) => ({ drive: String(d.drive || ""), free: Number(d.free_gib) })).filter((d) => /^[A-Za-z]:$/.test(d.drive)).sort((a, b) => (isFinite(b.free) ? b.free : -1) - (isFinite(a.free) ? a.free : -1)).slice(0, 4);
     const overall = (() => {
       if (!prog) return 0;
-      const list = items.filter((i) => i.status !== "ready");
+      const list = fgList.filter((i) => i.status !== "ready");
       if (!list.length) return 100;
       let sum = 0;
       for (const i of list) {
@@ -6378,23 +6746,23 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       return Math.round(sum / list.length);
     })();
     const failed = !!(prog && prog.job_state === "failed");
-    const sizeText = !report ? "约 2 GB（以检测结果为准）" : needsPath ? "选好安装目录后再统计" : needGb > 0 ? "必需 " + needGb + " GB" + (optGb > 0 ? " · 可选 " + optGb + " GB" : "") : optGb > 0 ? "必需 0 GB（已齐） · 可选 " + optGb + " GB" : "不用下载（已齐）";
-    const timeText = !report ? "看网速，一般 10～40 分钟" : needsPath ? "先选安装目录" : needGb > 0 ? fmtEta(needGb * 900) : optGb > 0 ? "必需项不用下；可选约 " + fmtEta(optGb * 900) : "不用下载";
-    const failLabels = items.filter((i) => {
+    const sizeText = !report ? "约 2 GB（以检测结果为准）" : needsPath ? "选好安装目录后再统计" : fgGb > 0 ? "前台约 " + fgGb + " GB · 后台约 " + bgGb + " GB" : "不用下载（已齐）";
+    const timeText = !report ? "看网速，一般 10～40 分钟" : needsPath ? "先选安装目录" : fgGb > 0 ? "前台约 " + fmtEta(fgGb * 900) + "（模型后台继续下）" : "前台不用下；模型后台自动下";
+    const failLabels = fgList.filter((i) => {
       const st = prog && prog.items && prog.items[i.key];
       return st && st.state === "failed";
     });
-    const page4 = /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 14 }, children: [
+    const page5 = /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 14 }, children: [
       /* @__PURE__ */ jsxs("div", { style: { textAlign: "center" }, children: [
         /* @__PURE__ */ jsx("div", { style: { fontSize: 19, fontWeight: 800, color: INK }, children: "准备运行环境" }),
-        /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK_2, marginTop: 6, lineHeight: 1.8 }, children: "第一次打开要先装好程序、模型和音频工具，只需一次。" })
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 12.5, color: INK_2, marginTop: 6, lineHeight: 1.8 }, children: "先把基础环境装好就能进主页；大模型会在后台自动下载。" })
       ] }),
       mustInstall ? /* @__PURE__ */ jsx(Alert, { tone: "warning", children: "必需的程序还没装好，先在下面把它装好才能开始使用。" }) : null,
       mockMode ? /* @__PURE__ */ jsx(Alert, { tone: "info", children: "当前是模拟演示：没有连上安装接口，进度为示例数据，只用于查看界面流程。" }) : null,
       err ? /* @__PURE__ */ jsx(Alert, { tone: "warning", children: err }) : null,
       notRunning ? /* @__PURE__ */ jsx("div", { style: { display: "flex", gap: 10, justifyContent: "center" }, children: /* @__PURE__ */ jsx(Btn, { style: primaryBtn, disabled: busy === "start", onClick: restartAndCheck, children: busy === "start" ? "正在启动插件…" : "启动插件并重新检测" }) }) : null,
       /* @__PURE__ */ jsx("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 12 }, children: [
-        ["要下载什么", "运行程序 + 声音模型 + 去伴奏模型"],
+        ["要下载什么", "基础环境（程序 + 音频工具）"],
         ["大约多大", sizeText],
         ["大概多久", timeText]
       ].map((row, i) => /* @__PURE__ */ jsxs("div", { style: { padding: 14, borderRadius: 16, background: "rgba(255,229,239,0.5)", border: "1px solid rgba(224,45,118,0.10)" }, children: [
@@ -6603,6 +6971,10 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         ] }, i.key);
       }) }),
       failed && !failLabels.length ? /* @__PURE__ */ jsx(Row, { style: { justifyContent: "flex-end" }, children: /* @__PURE__ */ jsx(Btn, { style: ghostBtn, disabled: !!busy, onClick: () => startInstall(), children: "重新安装缺失项" }) }) : null,
+      /* @__PURE__ */ jsx("details", { style: { padding: "11px 14px", borderRadius: 14, background: "rgba(232,247,239,0.6)", border: "1px solid rgba(28,138,88,0.16)" }, children: [
+        /* @__PURE__ */ jsx("summary", { style: { cursor: "pointer", fontSize: 12.5, color: "#1c8a58", fontWeight: 700 }, children: "模型不用现在下：进入主页后自动后台下载" + (bgGb > 0 ? " · 约 " + bgGb + " GB" : "") }),
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 11.5, color: "#3c7a5a", lineHeight: 1.7, marginTop: 6 }, children: "声音模型、去伴奏模型等会在你进入主页后由后台静默下载；切页、关面板、关 N.E.K.O 都不中断，随时可以在页面底部看到进度。" })
+      ] }),
       /* @__PURE__ */ jsxs(Muted, { style: { fontSize: 11.5, lineHeight: 1.7 }, children: [
         "安装过程中可以继续用电脑；关掉这个窗口不会中断下载，下次打开会接着装。",
         /* @__PURE__ */ jsx("br", {}),
@@ -6610,7 +6982,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       ] }),
       mockMode ? null : /* @__PURE__ */ jsx(DeployOverview, { api: props.api })
     ] });
-    const page5 = /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 18, alignItems: "center", textAlign: "center", padding: "14px 0 6px" }, children: [
+    const page6 = /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 18, alignItems: "center", textAlign: "center", padding: "14px 0 6px" }, children: [
       /* @__PURE__ */ jsx("span", { style: { width: 58, height: 58, borderRadius: 999, background: "#e8f7ef", color: "#1c8a58", display: "grid", placeItems: "center", boxShadow: "0 8px 20px rgba(28,138,88,0.12)" }, children: /* @__PURE__ */ jsx("svg", { width: "30", height: "30", viewBox: "0 0 24 24", children: /* @__PURE__ */ jsx("path", { d: "M5 12.5 9.6 17 19 7.2", fill: "none", stroke: "currentColor", strokeWidth: "2.4", strokeLinecap: "round", strokeLinejoin: "round" }) }) }),
       /* @__PURE__ */ jsx("div", { style: { fontSize: 22, fontWeight: 800, color: INK }, children: "都准备好了" }),
       /* @__PURE__ */ jsx("div", { style: { fontSize: 13.5, color: INK_2, lineHeight: 1.9, maxWidth: 480 }, children: "必需项已就绪。以后打开插件不用再装东西了。先把几首歌放进「准备素材」，就能开始训练她的声音。" }),
@@ -6619,7 +6991,30 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       /* @__PURE__ */ jsx(Row, { style: { justifyContent: "center", marginTop: 4 }, children: /* @__PURE__ */ jsx(Btn, { style: primaryBtn, onClick: props.onDone, children: "开始使用" }) }),
       /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11 }, children: "安装文件只来自官方发布地址，放在你选定的目录里；不会改动系统设置。" })
     ] });
-    const body = step === 1 ? page1 : step === 2 ? page2 : step === 3 ? page3 : step === 4 ? page4 : page5;
+    const body = step === 1 ? page1 : step === 2 ? page2 : step === 3 ? page3 : step === 4 ? page4 : step === 5 ? page5 : page6;
+    const fgMissing = fgList.some((i) => i.installable && i.status !== "ready");
+    const enterHome = async () => {
+      persistSel();
+      if (!enqueuedRef.current) {
+        enqueuedRef.current = true;
+        try {
+          // 只补队还没完成的 T2（已 done 的不重下）；避免与 S6 装完后的自动入队重复触发
+          let doneKeys = {};
+          try {
+            const st = await callEntryLoose(props.api, "ms_dl_status", {}, 3e4);
+            const it = (st && st.items) || {};
+            Object.keys(it).forEach((k) => { if (it[k] && it[k].state === "done") doneKeys[k] = true; });
+          } catch (e) {
+          }
+          const t2 = S8.expandFeatures(selected).reduce((a, f) => a.concat((S8_FEATURE_ITEMS[f] || {}).T2 || []), []);
+          const pending = t2.filter((k) => !doneKeys[k]);
+          if (pending.length) await callEntryLoose(props.api, "ms_dl_enqueue", { artifacts: pending }, 3e4);
+        } catch (e) {
+          enqueuedRef.current = false;
+        }
+      }
+      props.onDone();
+    };
     return /* @__PURE__ */ jsxs("div", { style: { position: "fixed", inset: 0, zIndex: 1100, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "rgba(248,250,252,0.97)", overflow: "auto" }, children: [
       /* @__PURE__ */ jsx("style", { children: `
         @keyframes ms-ob-wave { 0%,100% { transform: scaleY(.35); } 50% { transform: scaleY(1); } }
@@ -6635,12 +7030,12 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
               /* @__PURE__ */ jsxs("div", { style: { fontSize: 11.5, color: INK_2, marginTop: 1 }, children: [
                 "第 ",
                 step,
-                " 步 / 共 5 步 · ",
+                " 步 / 共 6 步 · ",
                 STEP_TITLES[step - 1]
               ] })
             ] })
           ] }),
-          step === 5 ? null : /* @__PURE__ */ jsx(
+          step === 6 ? null : /* @__PURE__ */ jsx(
             "button",
             {
               type: "button",
@@ -6656,24 +7051,24 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           const on = step === no;
           return /* @__PURE__ */ jsx("div", { title: t, style: { flex: 1, height: 4, borderRadius: 999, background: on ? BRAND : done2 ? "rgba(224,45,118,0.40)" : "rgba(40,37,50,0.08)", transition: "background-color .2s ease" } }, t);
         }) }),
-        /* @__PURE__ */ jsx("div", { className: "ms-ob-scroll", style: { maxHeight: step === 4 ? "calc(100vh - 300px)" : "calc(100vh - 240px)", overflowY: "auto", overflowX: "hidden", paddingRight: 2 }, children: body }),
-        step === 4 ? /* @__PURE__ */ jsxs("div", { style: { borderTop: "1px solid " + LINE, paddingTop: 12, display: "flex", flexDirection: "column", gap: 6 }, children: [
+        /* @__PURE__ */ jsx("div", { className: "ms-ob-scroll", style: { maxHeight: step === 5 ? "calc(100vh - 300px)" : "calc(100vh - 240px)", overflowY: "auto", overflowX: "hidden", paddingRight: 2 }, children: body }),
+        step === 5 ? /* @__PURE__ */ jsxs("div", { style: { borderTop: "1px solid " + LINE, paddingTop: 12, display: "flex", flexDirection: "column", gap: 6 }, children: [
           /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between", alignItems: "center" }, children: [
-            /* @__PURE__ */ jsx(Btn, { style: ghostBtn, onClick: () => setStep(3), disabled: installing, children: "上一步" }),
+            /* @__PURE__ */ jsx(Btn, { style: ghostBtn, onClick: () => setStep(4), disabled: installing, children: "上一步" }),
             /* @__PURE__ */ jsxs(Row, { style: { gap: 10 }, children: [
-              !items.some((i) => i.installable && i.status !== "ready") ? null : /* @__PURE__ */ jsx(
+              !fgMissing ? null : /* @__PURE__ */ jsx(
                 Btn,
                 {
                   style: primaryBtn,
-                  disabled: !!busy || installing || !path.trim() || !!pathIssue || lack || !items.some((i) => i.installable && i.status !== "ready"),
+                  disabled: !!busy || installing || !path.trim() || !!pathIssue || lack,
                   onClick: () => startInstall(),
-                  children: installing ? "正在安装…" : busy === "all" ? "正在启动…" : needGb > 0 ? "一键安装全部" : "安装可选项"
+                  children: installing ? "正在安装…" : busy === "all" ? "正在启动…" : fgGb > 0 ? "一键安装基础环境" : "安装基础环境"
                 }
               ),
-              /* @__PURE__ */ jsx(Btn, { style: canNext ? primaryBtn : ghostBtn, disabled: !canNext || installing, onClick: () => setStep(5), children: canNext ? "下一步：开始使用 →" : "装好后继续" })
+              /* @__PURE__ */ jsx(Btn, { style: baseCompleted ? primaryBtn : ghostBtn, disabled: !baseCompleted || installing, onClick: enterHome, children: baseCompleted ? "进入主页 →" : "装好后进入主页" })
             ] })
           ] }),
-          !canNext && !installing ? /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11.5, textAlign: "right" }, children: "必需项装好之前，其它页面先不能使用。" }) : null
+          !baseCompleted && !installing ? /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11.5, textAlign: "right" }, children: "基础环境装好之前，先不能进主页。" }) : null
         ] }) : null
       ] }) })
     ] });
@@ -6685,10 +7080,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       const q = String(window.location && window.location.search || "");
       const m = q.match(/[?&]wizard=([a-z0-9]+)/);
       if (!m) return 0;
-      const v = m[1];
-      if (v === "1" || v === "2" || v === "3" || v === "4" || v === "5") return Number(v);
-      if (v === "fail" || v === "install") return 4;
-      return 0;
+      return S8.wizardStepFromQuery(m[1]);
     } catch (e) {
       return 0;
     }
@@ -6986,6 +7378,621 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
       /* @__PURE__ */ jsx("path", { d: "M3.2 10a6.8 6.8 0 0 1 1.3-4M16.8 10a6.8 6.8 0 0 1-1.3 4M5.4 15.4a6.8 6.8 0 0 1-1.1-1.4M14.6 4.6a6.8 6.8 0 0 0-1.1-1.4" })
     ] });
   }
+  /* S9_PURE_BEGIN */
+  // S9 纯函数（常驻下载条 DownloadDock）：无 DOM 依赖，便于 node 自测（tests/test_dock_s9.js 提取本块 eval）。
+  var S9_BUSY = { queued: 1, probing: 1, downloading: 1, verifying: 1, post: 1, pending_post: 1, paused: 1, paused_disk_full: 1 };
+  var S9 = (function () {
+    function isBusy(st) { return !!S9_BUSY[st]; }
+    function isDone(st) { return st === "done"; }
+    function isFailed(st) { return st === "failed"; }
+    function isCanceled(st) { return st === "canceled"; }
+    // active = 所有未结束项（决定轮询频率）；running/queued/paused 只用于文案，排队与暂停不算「下载中」。
+    function itemStates(items) {
+      var active = 0, done = 0, failed = 0, total = 0, queued = 0, paused = 0;
+      Object.keys(items || {}).forEach(function (k) {
+        var it = items[k] || {};
+        total += 1;
+        if (isBusy(it.state)) active += 1;
+        if (it.state === "queued") queued += 1;
+        if (it.state === "paused" || it.state === "paused_disk_full") paused += 1;
+        if (isDone(it.state)) done += 1;
+        if (isFailed(it.state)) failed += 1;
+      });
+      return { active: active, running: active - queued - paused, queued: queued, paused: paused, done: done, failed: failed, total: total };
+    }
+    function fmtBytes(n) {
+      var v = Number(n) || 0;
+      if (v < 1024) return v + " B";
+      if (v < 1024 * 1024) return (v / 1024).toFixed(0) + " KB";
+      if (v < 1024 * 1024 * 1024) return (v / (1024 * 1024)).toFixed(1) + " MB";
+      return (v / (1024 * 1024 * 1024)).toFixed(1) + " GB";
+    }
+    function fmtSpeed(bps) {
+      var v = Number(bps) || 0;
+      if (v < 1024) return v.toFixed(0) + " B/s";
+      if (v < 1024 * 1024) return (v / 1024).toFixed(0) + " KB/s";
+      return (v / (1024 * 1024)).toFixed(1) + " MB/s";
+    }
+    function fmtEta(seconds) {
+      var n = Number(seconds);
+      if (!isFinite(n) || n < 0) return "—";
+      if (n < 60) return Math.max(1, Math.round(n)) + " 秒";
+      if (n < 3600) return Math.round(n / 60) + " 分钟";
+      return (n / 3600).toFixed(1) + " 小时";
+    }
+    function hostOf(source) {
+      if (!source) return "";
+      var m = String(source).match(/^[a-z]+:\/\/([^\/?#]+)/i);
+      if (m) return m[1];
+      return String(source).split(/[\/?#]/)[0];
+    }
+    function sourceLabel(source, sourceId) {
+      if (sourceId) return sourceId;
+      return hostOf(source).replace(/^www\./, "");
+    }
+    function leadItem(items) {
+      var best = null;
+      Object.keys(items || {}).forEach(function (k) {
+        var it = items[k] || {};
+        if (!isBusy(it.state)) return;
+        if (!best) { best = it; return; }
+        if ((Number(it.bytes_done) || 0) > (Number(best.bytes_done) || 0)) best = it;
+      });
+      return best;
+    }
+    function summary(state) {
+      var items = (state && state.items) || {};
+      var totals = (state && state.totals) || {};
+      var st = itemStates(items);
+      var lead = leadItem(items);
+      var bytesDone = Number(totals.bytes_done || 0);
+      var bytesTotal = Number(totals.bytes_total || 0);
+      var speed = Number(totals.speed_bps || 0);
+      var eta = Number(totals.eta_s || 0);
+      if (lead) {
+        if (!bytesTotal) bytesTotal = Number(lead.bytes_total) || 0;
+        if (!speed) speed = Number(lead.speed_bps) || 0;
+      }
+      return {
+        active: st.active, running: st.running, queued: st.queued, paused: st.paused,
+        done: st.done, failed: st.failed, total: st.total,
+        bytesDone: bytesDone, bytesTotal: bytesTotal, speedBps: speed, etaS: eta,
+        sourceLabel: sourceLabel(lead && lead.source, lead && lead.source_id),
+        hasError: st.failed > 0
+      };
+    }
+    function lineText(sum) {
+      if (!sum || !sum.total) return "";
+      if (sum.active === 0 && sum.failed === 0 && sum.done >= sum.total) return "全部下载完成";
+      var parts = [];
+      if (sum.active > 0) {
+        // 旧调用方的 sum 可能没有 running 字段：视为全部在下载
+        var running = sum.running == null ? sum.active : sum.running;
+        var head = [];
+        if (running > 0) head.push("后台下载中 " + running);
+        if (sum.queued > 0) head.push("排队 " + sum.queued);
+        if (sum.paused > 0) head.push("暂停 " + sum.paused);
+        if (!head.length) head.push("后台下载中 " + sum.active);
+        parts.push(head.join(" · ") + " / 共 " + sum.total);
+      } else if (sum.failed > 0) {
+        parts.push("有 " + sum.failed + " 项下载失败");
+      } else {
+        parts.push("后台下载 " + sum.done + "/" + sum.total);
+      }
+      if (sum.bytesTotal > 0) parts.push(fmtBytes(sum.bytesDone) + "/" + fmtBytes(sum.bytesTotal));
+      if (sum.speedBps > 0) parts.push(fmtSpeed(sum.speedBps));
+      if (sum.sourceLabel) parts.push(sum.sourceLabel);
+      if (sum.etaS > 0 && sum.active > 0) parts.push("约 " + fmtEta(sum.etaS));
+      return parts.join(" · ");
+    }
+    function stateMeta(st) {
+      switch (st) {
+        case "done": return { text: "完成", tone: "success" };
+        case "failed": return { text: "失败", tone: "error" };
+        case "canceled": return { text: "已取消", tone: "neutral" };
+        case "paused": return { text: "已暂停", tone: "neutral" };
+        case "paused_disk_full": return { text: "磁盘满·暂停", tone: "warning" };
+        case "downloading": return { text: "下载中", tone: "warning" };
+        case "probing": return { text: "测速中", tone: "neutral" };
+        case "verifying": return { text: "校验中", tone: "neutral" };
+        case "post": return { text: "处理中", tone: "neutral" };
+        case "pending_post": return { text: "等环境", tone: "warning" };
+        case "queued": return { text: "排队", tone: "neutral" };
+        default: return { text: st || "未知", tone: "neutral" };
+      }
+    }
+    function itemActions(it) {
+      var st = (it && it.state) || "";
+      return {
+        retry: st === "failed" || st === "canceled",
+        pause: st === "downloading" || st === "probing" || st === "queued",
+        resume: st === "paused" || st === "paused_disk_full",
+        cancel: isBusy(st) || st === "failed" || st === "canceled"
+      };
+    }
+    function pollInterval(sum) {
+      return (sum.active > 0) ? 1500 : 10000;
+    }
+    function stateRank(st) {
+      if (st === "failed") return 0;
+      if (st === "downloading" || st === "probing" || st === "verifying" || st === "post" || st === "pending_post") return 1;
+      if (st === "queued") return 2;
+      if (st === "paused" || st === "paused_disk_full") return 3;
+      if (st === "done") return 4;
+      return 5; // canceled 等
+    }
+    function sortedItems(items) {
+      return Object.keys(items || {}).map(function (k) { return [k, items[k]]; })
+        .sort(function (a, b) {
+          var ra = stateRank(a[1].state), rb = stateRank(b[1].state);
+          if (ra !== rb) return ra - rb;
+          return (Number(b[1].bytes_done) || 0) - (Number(a[1].bytes_done) || 0);
+        });
+    }
+    function pct(sum) {
+      if (!sum) return 0;
+      if (sum.bytesTotal > 0) return Math.max(0, Math.min(100, sum.bytesDone / sum.bytesTotal * 100));
+      if (sum.total > 0) return Math.max(0, Math.min(100, sum.done / sum.total * 100));
+      return 0;
+    }
+    return {
+      isBusy: isBusy, isDone: isDone, isFailed: isFailed, isCanceled: isCanceled,
+      itemStates: itemStates, fmtBytes: fmtBytes, fmtSpeed: fmtSpeed, fmtEta: fmtEta,
+      hostOf: hostOf, sourceLabel: sourceLabel, leadItem: leadItem, summary: summary,
+      lineText: lineText, stateMeta: stateMeta, itemActions: itemActions,
+      pollInterval: pollInterval, stateRank: stateRank, sortedItems: sortedItems, pct: pct
+    };
+  })();
+  /* S9_PURE_END */
+
+  // 常驻下载条（S9）：挂在 .ms-shell 底部，所有页面可见；只读 state.json，只在用户点按钮时调 ms_dl_control。
+  function DownloadDock(props) {
+    const api = props.api;
+    const [state, setState] = useState(null);
+    const [expanded, setExpanded] = useState(false);
+    const [doneHidden, setDoneHidden] = useState(false);
+    const [dismissed, setDismissed] = useState(false);
+    const [busy, setBusy] = useState(false);
+    const stateRef = useRef(null);
+    stateRef.current = state;
+    const poll = async () => {
+      try {
+        const r = await callEntryLoose(api, "ms_dl_status", {}, 2e4);
+        if (r && r.items) setState(r);
+      } catch (e) {
+        /* 读不到就不显示，静默 */
+      }
+    };
+    const pollRef = useRef(poll);
+    pollRef.current = poll;
+    // 轮询：活跃 1.5s / 空闲 10s；document.hidden 时暂停，恢复可见立即刷新一次
+    useEffect(() => {
+      let stop = false;
+      let timer = null;
+      const schedule = () => {
+        if (stop) return;
+        timer = setTimeout(tick, S9.pollInterval(S9.summary(stateRef.current)));
+      };
+      const tick = async () => {
+        if (stop) return;
+        if (typeof document !== "undefined" && document.hidden) {
+          const onVis = () => {
+            document.removeEventListener("visibilitychange", onVis);
+            if (stop) return;
+            pollRef.current();
+            schedule();
+          };
+          document.addEventListener("visibilitychange", onVis);
+          return;
+        }
+        await pollRef.current();
+        schedule();
+      };
+      pollRef.current();
+      schedule();
+      return () => {
+        stop = true;
+        if (timer) clearTimeout(timer);
+      };
+    }, []);
+    const sum = S9.summary(state);
+    const allDone = sum.total > 0 && sum.active === 0 && sum.failed === 0 && sum.done >= sum.total;
+    const hasFailed = sum.failed > 0;
+    // 完成态 8 秒后收起；有新任务/失败时恢复
+    useEffect(() => {
+      if (!allDone) {
+        setDoneHidden(false);
+        return;
+      }
+      const t = setTimeout(() => setDoneHidden(true), 8000);
+      return () => clearTimeout(t);
+    }, [allDone]);
+    // 有新活动时清除「用户关闭失败条」状态
+    useEffect(() => {
+      if (sum.active > 0) setDismissed(false);
+    }, [sum.active]);
+    if (!state || sum.total === 0) return null;
+    if (allDone && doneHidden) return null;
+    if (hasFailed && dismissed) return null;
+    const onControl = async (action, target) => {
+      if (busy) return;
+      setBusy(true);
+      try {
+        await callEntryLoose(api, "ms_dl_control", { action, target }, 2e4);
+        if (action === "retry") setDismissed(false);
+      } catch (e) {
+      } finally {
+        setBusy(false);
+        poll();
+      }
+    };
+    const canPauseAll = Object.keys(state.items || {}).some((k) => S9.itemActions(state.items[k]).pause);
+    const canResumeAll = Object.keys(state.items || {}).some((k) => S9.itemActions(state.items[k]).resume);
+    const rows = S9.sortedItems(state.items);
+    const barTone = hasFailed ? "#e06666" : allDone ? "#1c8a58" : void 0;
+    return /* @__PURE__ */ jsx("div", { className: "ms-dock", style: { position: "sticky", bottom: 0, zIndex: 1000, marginTop: 10, padding: "8px 14px", borderRadius: 14, background: hasFailed ? "rgba(253,236,236,0.97)" : allDone ? "rgba(232,247,239,0.97)" : "rgba(255,255,255,0.96)", border: "1px solid " + (hasFailed ? "rgba(201,60,60,0.30)" : allDone ? "rgba(28,138,88,0.28)" : "rgba(224,45,118,0.14)"), boxShadow: "0 -6px 24px rgba(142,159,187,0.14)" }, children: [
+      expanded ? /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 8 }, children: [
+        /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between", flexWrap: "nowrap" }, children: [
+          /* @__PURE__ */ jsxs(Row, { style: { gap: 8 }, children: [
+            /* @__PURE__ */ jsx(StatusBadge, { tone: hasFailed ? "error" : allDone ? "success" : "warning", children: allDone ? "下载完成" : hasFailed ? "有下载失败" : "后台下载中" }),
+            /* @__PURE__ */ jsx(Muted, { style: { fontSize: 12 }, children: S9.lineText(sum) })
+          ] }),
+          /* @__PURE__ */ jsxs(Row, { style: { gap: 8, flexWrap: "nowrap" }, children: [
+            hasFailed ? /* @__PURE__ */ jsx(Btn, { style: { ...ghostBtn, padding: "5px 10px", fontSize: 11.5 }, onClick: () => setDismissed(true), children: "关闭" }) : null,
+            /* @__PURE__ */ jsx(Btn, { style: { ...ghostBtn, padding: "5px 10px", fontSize: 11.5 }, onClick: () => setExpanded(false), children: "收起" })
+          ] })
+        ] }),
+        /* @__PURE__ */ jsx("div", { style: { display: "flex", gap: 8, alignItems: "center" }, children: /* @__PURE__ */ jsx(Bar, { pct: S9.pct(sum), tone: barTone }) }),
+        /* @__PURE__ */ jsx("div", { style: { display: "flex", flexDirection: "column", gap: 6, maxHeight: 300, overflowY: "auto" }, children: rows.map(([k, it]) => {
+          const meta = S9.stateMeta(it.state);
+          const acts = S9.itemActions(it);
+          const pct = (it.bytes_total > 0 ? it.bytes_done / it.bytes_total : 0) * 100;
+          return /* @__PURE__ */ jsxs("div", { style: { display: "grid", gridTemplateColumns: "minmax(0,1fr) auto", gap: "2px 12px", alignItems: "center", padding: "7px 10px", borderRadius: 10, background: "rgba(255,255,255,0.7)" }, children: [
+            /* @__PURE__ */ jsxs("div", { style: { minWidth: 0 }, children: [
+              /* @__PURE__ */ jsxs(Row, { style: { gap: 6 }, children: [
+                /* @__PURE__ */ jsx(Pill, { tone: meta.tone, children: meta.text }),
+                /* @__PURE__ */ jsx("span", { style: { fontSize: 12.5, fontWeight: 600, color: INK, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: it.label || k })
+              ] }),
+              /* @__PURE__ */ jsx("div", { style: { fontSize: 11, color: INK_3, marginTop: 2, lineHeight: 1.6 }, children: [
+                (it.bytes_total > 0 ? S9.fmtBytes(it.bytes_done) + "/" + S9.fmtBytes(it.bytes_total) : "—"),
+                it.speed_bps > 0 ? " · " + S9.fmtSpeed(it.speed_bps) : "",
+                it.source ? " · " + S9.sourceLabel(it.source, it.source_id) : "",
+                it.switches > 0 ? " · 换源 " + it.switches + " 次" : ""
+              ] }),
+              it.error ? /* @__PURE__ */ jsx("div", { style: { fontSize: 11, color: "#c93c3c", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: it.error }) : null,
+              /* @__PURE__ */ jsx("div", { style: { marginTop: 4, display: "flex" }, children: /* @__PURE__ */ jsx(Bar, { pct, tone: it.state === "failed" ? "#e06666" : void 0 }) })
+            ] }),
+            /* @__PURE__ */ jsxs(Row, { style: { gap: 6, flexWrap: "nowrap" }, children: [
+              acts.retry ? /* @__PURE__ */ jsx(Btn, { style: { ...ghostBtn, padding: "4px 9px", fontSize: 11, borderRadius: 8 }, disabled: busy, onClick: () => onControl("retry", k), children: "重试" }) : null,
+              acts.pause ? /* @__PURE__ */ jsx(Btn, { style: { ...ghostBtn, padding: "4px 9px", fontSize: 11, borderRadius: 8 }, disabled: busy, onClick: () => onControl("pause", k), children: "暂停" }) : null,
+              acts.resume ? /* @__PURE__ */ jsx(Btn, { style: { ...ghostBtn, padding: "4px 9px", fontSize: 11, borderRadius: 8 }, disabled: busy, onClick: () => onControl("resume", k), children: "继续" }) : null,
+              acts.cancel && it.state !== "failed" && it.state !== "canceled" ? /* @__PURE__ */ jsx(Btn, { style: { ...ghostBtn, padding: "4px 9px", fontSize: 11, borderRadius: 8 }, disabled: busy, onClick: () => onControl("cancel", k), children: "取消" }) : null
+            ] })
+          ] }, k);
+        }) })
+      ] }) : /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: 10, minHeight: 28 }, children: [
+        /* @__PURE__ */ jsx("span", { style: { fontSize: 12.5, fontWeight: 700, color: hasFailed ? "#c93c3c" : allDone ? "#1c8a58" : INK, whiteSpace: "nowrap" }, children: S9.lineText(sum) }),
+        /* @__PURE__ */ jsx("div", { style: { flex: 1, display: "flex" }, children: /* @__PURE__ */ jsx(Bar, { pct: S9.pct(sum), tone: barTone }) }),
+        /* @__PURE__ */ jsx(Btn, { style: { ...ghostBtn, padding: "4px 10px", fontSize: 11.5, whiteSpace: "nowrap" }, onClick: () => setExpanded(true), children: "展开" }),
+        canPauseAll ? /* @__PURE__ */ jsx(Btn, { style: { ...ghostBtn, padding: "4px 10px", fontSize: 11.5, whiteSpace: "nowrap" }, disabled: busy, onClick: () => onControl("pause", "all"), children: "全部暂停" }) : null,
+        canResumeAll && !canPauseAll ? /* @__PURE__ */ jsx(Btn, { style: { ...ghostBtn, padding: "4px 10px", fontSize: 11.5, whiteSpace: "nowrap" }, disabled: busy, onClick: () => onControl("resume", "all"), children: "全部继续" }) : null,
+        hasFailed ? /* @__PURE__ */ jsx(Btn, { style: { ...ghostBtn, padding: "4px 10px", fontSize: 11.5, whiteSpace: "nowrap" }, onClick: () => setDismissed(true), children: "关闭" }) : null
+      ] })
+    ] });
+  }
+  /* S10_PURE_BEGIN */
+  // S10 纯函数（未安装门控 FeatureGate）：无 DOM 依赖，便于 node 自测（tests/test_gate_s10.js 提取本块 eval）。
+  var S10 = (function () {
+    // 页面 → 功能门控映射（计划 B.1：不门控 start/models/settings/stage）
+    var PAGE_FEATURE = { sing: "cover", materials: "train", train: "train", create: "create" };
+    function featureForPage(page) { return PAGE_FEATURE[page] || ""; }
+    function isGatedPage(page) { return !!PAGE_FEATURE[page]; }
+    function gbStr(n) {
+      var v = Number(n) || 0;
+      var s = String(Math.round(v * 10) / 10);
+      return s.replace(/\.0$/, "");
+    }
+    function gateState(feature, f) {
+      var m = f || {};
+      var running = (m.running || []).length > 0;
+      var failed = (m.failed || []).length > 0;
+      var ready = m.ready === true && !running && !failed;
+      var t0 = m.t0_ready === true, t1 = m.t1_ready === true, t2 = m.t2_ready === true;
+      return {
+        feature: feature,
+        label: m.label || feature,
+        ready: ready,
+        t0_ready: t0, t1_ready: t1, t2_ready: t2,
+        baseReady: t0 && t1,
+        notInstalled: !ready && !running && !failed,
+        downloading: running,
+        failed: failed,
+        running: (m.running || []).slice(),
+        failedKeys: (m.failed || []).slice(),
+        downloads: m.downloads || {},
+        fg_gb: Number(m.fg_gb || 0),
+        bg_gb: Number(m.bg_gb || 0),
+        total_gb: Number(m.total_gb || 0),
+        gpu_required: !!m.gpu_required
+      };
+    }
+    function cardShape(g) {
+      if (!g || g.ready) return "off";
+      if (g.failed) return "failed";
+      if (g.downloading) return "downloading";
+      return "not-installed";
+    }
+    function needText(g) {
+      if (!g) return "";
+      if (g.total_gb <= 0) return "「" + g.label + "」还没安装";
+      var seg = [];
+      if (g.fg_gb > 0) seg.push("环境 " + gbStr(g.fg_gb) + " GB");
+      if (g.bg_gb > 0) seg.push("模型 " + gbStr(g.bg_gb) + " GB");
+      var tail = seg.length ? "（" + seg.join(" + ") + "）" : "";
+      return "「" + g.label + "」还没安装 · 需要下载约 " + gbStr(g.total_gb) + " GB" + tail;
+    }
+    function t2Progress(dl) {
+      var bytes_done = 0, bytes_total = 0, done = 0, failed = 0, running = 0;
+      Object.keys(dl || {}).forEach(function (k) {
+        var it = dl[k] || {};
+        bytes_done += Number(it.bytes_done || 0);
+        bytes_total += Number(it.bytes_total || 0);
+        if (it.state === "done") done += 1;
+        else if (it.state === "failed") failed += 1;
+        else running += 1;
+      });
+      return { bytes_done: bytes_done, bytes_total: bytes_total, done: done,
+               failed: failed, running: running, total: Object.keys(dl || {}).length };
+    }
+    function segState(ready, active) {
+      if (ready) return "done";
+      if (active) return "active";
+      return "pending";
+    }
+    function tierSegments(g, fg) {
+      var fgi = !!(fg && fg.installing);
+      return {
+        t0: segState(g.t0_ready, fgi),
+        t1: segState(g.t1_ready, fgi),
+        t2: segState(g.t2_ready, g.downloading),
+        fgInstalling: fgi,
+        fgPct: Number((fg && fg.pct) || 0)
+      };
+    }
+    function segText(seg, g, tp) {
+      var map = { done: "已装", active: "进行中", pending: "待装" };
+      var out = map[seg] || seg;
+      if (seg === "active" && tp && tp.bytes_total > 0) {
+        out = "下载中 " + Math.round(tp.bytes_done / tp.bytes_total * 100) + "%";
+      }
+      return out;
+    }
+    function segTone(seg) {
+      return seg === "done" ? "success" : seg === "active" ? "warning" : "neutral";
+    }
+    function t2Keys(feature) {
+      var m = (typeof S8_FEATURE_ITEMS !== "undefined" && S8_FEATURE_ITEMS[feature]) || {};
+      return (m.T2 || []).slice();
+    }
+    return {
+      PAGE_FEATURE: PAGE_FEATURE, featureForPage: featureForPage, isGatedPage: isGatedPage,
+      gbStr: gbStr, gateState: gateState, cardShape: cardShape, needText: needText,
+      t2Progress: t2Progress, segState: segState, tierSegments: tierSegments,
+      segText: segText, segTone: segTone, t2Keys: t2Keys
+    };
+  })();
+  /* S10_PURE_END */
+
+  // 未安装门控（S10）：feature_ready==false 时模糊内容 + 居中卡片；inline 变体供页内局部门控。
+  function FeatureGate(props) {
+    const api = props.api;
+    const feature = props.feature;
+    const inline = !!props.inline;
+    const [fs, setFs] = useState(null);
+    const [busy, setBusy] = useState(false);
+    const [cardOpen, setCardOpen] = useState(false);
+    const [installJob, setInstallJob] = useState("");
+    const [installProg, setInstallProg] = useState(null);
+    const [fading, setFading] = useState(false);
+    const fsRef = useRef(null);
+    fsRef.current = fs;
+
+    const load = async () => {
+      try {
+        const r = await callEntryLoose(api, "ms_feature_status", {}, 9e4);
+        if (r && r.features) setFs(r);
+      } catch (e) {
+        /* 读不到就不门控，避免误伤 */
+      }
+    };
+    // 轮询：门控中（未装/下载中/失败）3s，就绪 10s；document.hidden 暂停、恢复可见立即刷新
+    useEffect(() => {
+      let stop = false;
+      let timer = null;
+      const gNow = () => S10.gateState(feature, fsRef.current && fsRef.current.features && fsRef.current.features[feature]);
+      const tick = async () => {
+        if (stop) return;
+        if (typeof document !== "undefined" && document.hidden) {
+          const onVis = () => {
+            document.removeEventListener("visibilitychange", onVis);
+            if (stop) return;
+            load().then(schedule);
+          };
+          document.addEventListener("visibilitychange", onVis);
+          return;
+        }
+        await load();
+        schedule();
+      };
+      const schedule = () => {
+        if (stop) return;
+        const g = gNow();
+        const interval = (!g.ready && g.feature) ? 3000 : 10000;
+        timer = setTimeout(tick, interval);
+      };
+      load().then(schedule);
+      return () => {
+        stop = true;
+        if (timer) clearTimeout(timer);
+      };
+    }, [feature]);
+
+    const f = fs && fs.features && fs.features[feature];
+    const g = S10.gateState(feature, f);
+    const shape = S10.cardShape(g);
+    const gated = !g.ready;
+
+    // 就绪后淡出 300ms 再移除门控层（保留门控层到淡出结束，避免一闪而过的硬切换）
+    useEffect(() => {
+      if (gated) {
+        setFading(false);
+        return;
+      }
+      setFading(true);
+      const t = setTimeout(() => setFading(false), 300);
+      return () => clearTimeout(t);
+    }, [gated]);
+
+    const pollInstall = async (jobId) => {
+      if (!jobId) return;
+      try {
+        const st = await callEntryLoose(api, "ms_setup_status", {}, 3e4);
+        setInstallProg(st.progress || null);
+        const state = String((st.job || {}).state || "");
+        if (state === "done" || state === "failed") {
+          setInstallJob("");
+          await load();
+        }
+      } catch (e) {
+      }
+    };
+    useEffect(() => {
+      if (!installJob) return;
+      const id = setInterval(() => pollInstall(installJob), 2000);
+      return () => clearInterval(id);
+    }, [installJob]);
+
+    const enqueueT2 = async () => {
+      const t2 = S10.t2Keys(feature);
+      if (!t2.length) return;
+      let doneKeys = {};
+      try {
+        const st = await callEntryLoose(api, "ms_dl_status", {}, 3e4);
+        const it = (st && st.items) || {};
+        Object.keys(it).forEach((k) => { if (it[k] && it[k].state === "done") doneKeys[k] = true; });
+      } catch (e) {
+      }
+      const pending = t2.filter((k) => !doneKeys[k]);
+      if (pending.length) await callEntryLoose(api, "ms_dl_enqueue", { artifacts: pending }, 3e4);
+    };
+    const start = async () => {
+      if (busy) return;
+      setBusy(true);
+      setCardOpen(true);
+      try {
+        if (!g.baseReady) {
+          // T0/T1 前台装（S6 装完自动入队 T2）
+          const r = await callEntryLoose(api, "ms_setup_install",
+            { features: [feature], tiers: ["T0", "T1"] }, 6e4);
+          if (r && r.job_id) {
+            setInstallJob(String(r.job_id));
+            setInstallProg(null);
+            pollInstall(String(r.job_id));
+          } else if (r && r.already_ready) {
+            await load();
+          }
+        } else {
+          await enqueueT2();
+          await load();
+        }
+      } catch (e) {
+      } finally {
+        setBusy(false);
+      }
+    };
+    const controlFeature = async (action) => {
+      if (busy) return;
+      setBusy(true);
+      try {
+        const keys = S10.t2Keys(feature);
+        const dl = g.downloads || {};
+        for (const k of keys) {
+          const it = dl[k];
+          if (!it) continue;
+          const acts = (typeof S9 !== "undefined" && S9.itemActions) ? S9.itemActions(it) : {};
+          if (action === "pause" && acts.pause) await callEntryLoose(api, "ms_dl_control", { action: "pause", target: k }, 2e4);
+          if (action === "resume" && acts.resume) await callEntryLoose(api, "ms_dl_control", { action: "resume", target: k }, 2e4);
+          if (action === "retry" && acts.retry) await callEntryLoose(api, "ms_dl_control", { action: "retry", target: k }, 2e4);
+        }
+        await load();
+      } catch (e) {
+      } finally {
+        setBusy(false);
+      }
+    };
+    if (!gated && !fading) return props.children;
+    const tp = S10.t2Progress(g.downloads);
+    const segs = S10.tierSegments(g, installJob ? { installing: true, pct: installProg && installProg.pct || 0 } : { installing: false, pct: 0 });
+    const showDownloadCard = cardOpen || shape === "downloading" || shape === "failed";
+    const contentStyle = {
+      filter: gated ? "blur(8px)" : "none",
+      pointerEvents: gated ? "none" : "auto",
+      userSelect: gated ? "none" : "auto",
+      transition: "filter .3s ease"
+    };
+    const overlayStyle = {
+      position: "absolute",
+      inset: 0,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      padding: 20,
+      background: "rgba(248,250,252,0.42)",
+      opacity: gated ? 1 : 0,
+      pointerEvents: gated ? "auto" : "none",
+      transition: "opacity .3s ease"
+    };
+    const cardStyle = inline
+      ? { maxWidth: 420 }
+      : { maxWidth: 480, padding: "22px 24px" };
+    return /* @__PURE__ */ jsxs("div", { style: { position: "relative" }, children: [
+      /* @__PURE__ */ jsx("div", { style: contentStyle, children: props.children }),
+      /* @__PURE__ */ jsx("div", { style: overlayStyle, children: /* @__PURE__ */ jsx("div", { style: { width: "100%", ...cardStyle, background: "#fff", borderRadius: 20, border: "1px solid rgba(224,45,118,0.10)", boxShadow: "0 20px 60px rgba(40,37,50,0.18)", padding: inline ? "16px 18px" : "22px 24px" }, children: showDownloadCard ? /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 12 }, children: [
+        /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "space-between", alignItems: "center" }, children: [
+          /* @__PURE__ */ jsxs("div", { children: [
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 15.5, fontWeight: 700, color: INK }, children: "「" + g.label + "」正在准备" }),
+            /* @__PURE__ */ jsx("div", { style: { fontSize: 12, color: INK_2, marginTop: 3 }, children: shape === "failed" ? "有下载失败，可重试。" : "装好后这个页面会自动可用。" })
+          ] }),
+          /* @__PURE__ */ jsx(StatusBadge, { tone: shape === "failed" ? "error" : installJob ? "warning" : "warning", children: shape === "failed" ? "失败" : installJob ? "装环境" : "后台下载中" })
+        ] }),
+        /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 6 }, children: [
+          /* @__PURE__ */ jsxs(Row, { style: { gap: 8 }, children: [
+            /* @__PURE__ */ jsx(Pill, { tone: S10.segTone(segs.t0), children: "基础环境" }),
+            /* @__PURE__ */ jsx(Pill, { tone: S10.segTone(segs.t1), children: "程序" }),
+            /* @__PURE__ */ jsx(Pill, { tone: S10.segTone(segs.t2), children: "模型" })
+          ] }),
+          /* @__PURE__ */ jsx(Muted, { style: { fontSize: 12 }, children: [
+            segs.fgInstalling ? "基础环境安装中 " + Math.round(segs.fgPct) + "%" : "基础环境：" + S10.segText(segs.t0, g, null),
+            " · 程序：" + S10.segText(segs.t1, g, null),
+            " · 模型：" + S10.segText(segs.t2, g, tp)
+          ] }),
+          tp.bytes_total > 0 ? /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 8, alignItems: "center" }, children: [
+            /* @__PURE__ */ jsx("div", { style: { flex: 1, display: "flex" }, children: /* @__PURE__ */ jsx(Bar, { pct: tp.bytes_total > 0 ? tp.bytes_done / tp.bytes_total * 100 : 0 }) }),
+            /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11.5, whiteSpace: "nowrap" }, children: (typeof S9 !== "undefined" ? S9.fmtBytes(tp.bytes_done) : tp.bytes_done) + "/" + (typeof S9 !== "undefined" ? S9.fmtBytes(tp.bytes_total) : tp.bytes_total) })
+          ] }) : null
+        ] }),
+        /* @__PURE__ */ jsxs(Row, { style: { justifyContent: "flex-end", gap: 8 }, children: [
+          shape === "failed" ? /* @__PURE__ */ jsx(Btn, { style: { ...ghostBtn, padding: "7px 14px", fontSize: 12.5 }, disabled: busy, onClick: () => controlFeature("retry"), children: "重试" }) : null,
+          !installJob && g.downloading ? /* @__PURE__ */ jsx(Btn, { style: { ...ghostBtn, padding: "7px 14px", fontSize: 12.5 }, disabled: busy, onClick: () => controlFeature("pause"), children: "暂停" }) : null,
+          /* @__PURE__ */ jsx(Btn, { style: { ...ghostBtn, padding: "7px 14px", fontSize: 12.5 }, onClick: () => setCardOpen(false), children: "后台下载（关卡片，任务继续）" })
+        ] })
+      ] }) : /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 12, alignItems: "center", textAlign: "center" }, children: [
+        /* @__PURE__ */ jsx("div", { style: { fontSize: 15.5, fontWeight: 700, color: INK }, children: S10.needText(g) }),
+        /* @__PURE__ */ jsx(Row, { style: { justifyContent: "center" }, children: /* @__PURE__ */ jsx(Btn, { style: primaryBtn, disabled: busy, onClick: start, children: busy ? "准备中…" : "下载" }) }),
+        /* @__PURE__ */ jsx(Muted, { style: { fontSize: 11.5 }, children: "下载不会中断：切页、关面板、关 N.E.K.O 都会继续。" })
+      ] }) }) })
+    ] });
+  }
   function Panel2(props) {
     const api = props.api;
     const [page, setPage] = useState(() => {
@@ -7017,14 +8024,17 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
     }, []);
     const hostState = props.state;
     const view = snap || (hostState && typeof hostState === "object" ? hostState : null);
+    // S8：向导的强制条件是「基础环境（T0+T1）未装好」，而不是「全部就绪」。
+    // base_completed 由 S5/S6 写入 setup_state；老安装只有 completed（=全就绪），同样视为基础就绪。
     const setupReady = !view || !view.setup || view.setup.completed === true;
+    const baseCompleted = !view || !view.setup || view.setup.base_completed === true || view.setup.completed === true;
     useEffect(() => {
-      if (wizardStartAt() || !setupReady || !onboarded()) setWizard(true);
-    }, [setupReady]);
+      if (wizardStartAt() || !baseCompleted || !onboarded()) setWizard(true);
+    }, [baseCompleted]);
     const wizardStart = (() => {
       const forced = wizardStartAt();
       if (forced) return forced;
-      if (!setupReady && onboarded()) return 4;
+      if (!baseCompleted && onboarded()) return 5;
       return void 0;
     })();
     const closeWizard = () => {
@@ -7098,15 +8108,16 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           ] }) }),
           /* @__PURE__ */ jsxs("div", { className: "ms-main", children: [
             page === "start" ? /* @__PURE__ */ jsx(PageStart, { api, snap: view, onGo: go }) : null,
-            page === "materials" ? /* @__PURE__ */ jsx(PageMaterials, { api, onGo: go }) : null,
-            page === "train" ? /* @__PURE__ */ jsx(PageTrain, { api, snap: view, onRefresh: refresh, onGo: go }) : null,
+            page === "materials" ? /* @__PURE__ */ jsx(FeatureGate, { api, feature: "train", children: /* @__PURE__ */ jsx(PageMaterials, { api, onGo: go }) }) : null,
+            page === "train" ? /* @__PURE__ */ jsx(FeatureGate, { api, feature: "train", children: /* @__PURE__ */ jsx(PageTrain, { api, snap: view, onRefresh: refresh, onGo: go }) }) : null,
             page === "models" ? /* @__PURE__ */ jsx(PageModels, { api, snap: view, onRefresh: refresh, onGo: go }) : null,
-            page === "sing" ? /* @__PURE__ */ jsx(PageSing, { api, snap: view, onRefresh: refresh, onGo: go }) : null,
-            page === "create" ? /* @__PURE__ */ jsx(PageCreate, { api, snap: view, onRefresh: refresh, onGo: go }) : null,
+            page === "sing" ? /* @__PURE__ */ jsx(FeatureGate, { api, feature: "cover", children: /* @__PURE__ */ jsx(PageSing, { api, snap: view, onRefresh: refresh, onGo: go }) }) : null,
+            page === "create" ? /* @__PURE__ */ jsx(FeatureGate, { api, feature: "create", children: /* @__PURE__ */ jsx(PageCreate, { api, snap: view, onRefresh: refresh, onGo: go }) }) : null,
             page === "stage" ? /* @__PURE__ */ jsx(PageStage, { api, snap: view, onGo: go }) : null,
             page === "settings" ? /* @__PURE__ */ jsx(PageSettings, { api, snap: view, onRefresh: refresh, onOpenWizard: () => setWizard(true) }) : null
           ] })
-        ] })
+        ] }),
+        /* @__PURE__ */ jsx(DownloadDock, { api })
       ] }),
       wizard ? /* @__PURE__ */ jsx(Onboarding, { api, startAt: wizardStart, onDone: closeWizard, onSkip: closeWizard }) : null
     ] });

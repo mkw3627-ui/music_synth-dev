@@ -35,3 +35,7 @@ store.db
 .env
 .DS_Store
 build/
+
+# 验收材料与本机验证脚本（含用户配置备份与本机绝对路径，不入库）
+_reports/
+_test/

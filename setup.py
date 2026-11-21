@@ -34,26 +34,47 @@ from . import runtime
 
 TORCH_CU128_INDEX = "https://download.pytorch.org/whl/cu128"
 TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
+# 2026-11 S1 实测：阿里云 pytorch-wheels 镜像 35MB/s，官方 0.75MB/s。
+# 官方 index 失败时按 find-links 方式回落（pip 缓存让重跑不重下已完成的 wheel）。
+TORCH_CU128_FIND_LINKS = "https://mirrors.aliyun.com/pytorch-wheels/cu128/"
 
 # 国内加速：GitHub 直连在不少宽带上只有几十 KB/s，先走镜像，镜像全挂再回落官方。
-# hk.gh-proxy / ghproxy.net 是 2026-11 实测可用的备用镜像；前一个挂了自动换下一个。
-GH_MIRRORS = ("https://gh-proxy.com/", "https://ghfast.top/",
-              "https://hk.gh-proxy.com/", "https://ghproxy.net/")
+# 2026-11-21 实测（见 tools/dl_sources_report.json）：gh-proxy.com 最稳，
+# cors.isteed.cc 常比它快，ghproxy.net 可作第三档（但 codeload 路径会 403）。
+# 已剔除：ghfast.top（TLS 超时）、hk.gh-proxy.com（500 Domain Not Found）、
+# gh.llkk.cc / ghp.ci / hub.gitmirror.com / gh-proxy.net / gitproxy.click /
+# ghproxy.cc / gh.api.99988866.xyz（全部不可用）。源表唯一事实来源是 download_catalog。
+def _catalog_mirrors():
+    """从 ``download_catalog`` 取权威源表（包内相对导入，独立运行回退绝对导入）。"""
+    try:
+        from . import download_catalog  # noqa: PLC0415 - 包内
+    except ImportError:  # 独立运行 / 测试
+        import download_catalog  # noqa: PLC0415
+    return download_catalog
+
+
+GH_MIRRORS = _catalog_mirrors().GH_MIRRORS
 GH_HOSTS = {"github.com", "codeload.github.com", "objects.githubusercontent.com",
             "raw.githubusercontent.com"}
-# PyPI 先清华、再阿里云、最后官方：任何一个镜像挂了都还有下一档。
-PYPI_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"
-PYPI_MIRRORS = (PYPI_INDEX, "https://mirrors.aliyun.com/pypi/simple/")
+# PyPI 镜像，按 2026-11 S1 实测速度排序（阿里云 24–28MB/s 最快，清华 4–5MB/s），
+# 最后一档是官方源：任何一个镜像挂了都还有下一档。
+PYPI_INDEX = "https://mirrors.aliyun.com/pypi/simple/"
+PYPI_MIRRORS = (
+    PYPI_INDEX,                                        # 阿里云（实测最快）
+    "https://mirrors.ustc.edu.cn/pypi/simple/",        # USTC（5–6MB/s）
+    "https://mirrors.cloud.tencent.com/pypi/simple/",  # 腾讯云（4MB/s）
+    "https://pypi.tuna.tsinghua.edu.cn/simple",        # 清华（4–5MB/s）
+)
 
 # DDSP-SVC 6.3 repo + pretrain assets (all release assets / codeload zips, so
 # no git binary is required on the target machine).
 DDSP_ZIP = ("https://codeload.github.com/yxlllc/DDSP-SVC/zip/"
             "b9d4e6a58182448aa7259a636570d53c49c92b1d")
 # ContentVec encoder (contentvec768l12tta2x)。国内优先镜像，失败再试官方 HF。
-# 注意：hf-mirror.com 现在会把 resolve 请求 302 到 cas-bridge.xethub.hf.co，
-# 那条 CDN 国内连不通（用户实测 SSL EOF）；hf-mirror.net 仍直接出字节，
-# 实测同一文件前 64KB 的 sha256 与 hf-mirror.com 一致。
-HF_MIRROR_HOSTS = ("hf-mirror.com", "hf-mirror.net")
+# 2026-11-21 实测：hf-mirror.com 已退化为 308 永久跳转回 huggingface.co（不再是镜像），
+# **禁止出现在任何源表**；hf-mirror.net 仍直接出字节（0.4–0.7MB/s）。
+# 源表唯一事实来源是 download_catalog.HF_MIRRORS。
+HF_MIRROR_HOSTS = _catalog_mirrors().HF_MIRRORS
 
 
 def _hf_urls(path: str) -> list[str]:
@@ -81,9 +102,12 @@ LOW_BASE_URLS = _hf_urls("SVCFusion/DDSP6.3-Pretrain/resolve/main/"
 HIGH_BASE_URLS = _hf_urls("SVCFusion/DDSP6.3-Pretrain/resolve/main/"
                           "ddsp6.3_6x512_10x2048.sf_dlc")
 # Fallback only if the GitHub API is unreachable.
+# 2026-11 S1 实测：20250612 这个 release 的 x86_64 Windows 产物**没有** shared- 变体，
+# 原来的 "...-shared-install_only.tar.gz" 是 404；去掉 "shared-" 后正常（38,943,022 字节，
+# sha256 d26dba4e…，与 NJU 镜像字节一致）。这里同步修正。
 PYTHON_STANDALONE_PINNED = (
     "https://github.com/astral-sh/python-build-standalone/releases/download/"
-    "20250612/cpython-3.10.18+20250612-x86_64-pc-windows-msvc-shared-install_only.tar.gz"
+    "20250612/cpython-3.10.18+20250612-x86_64-pc-windows-msvc-install_only.tar.gz"
 )
 # 国内可直连的 python-build-standalone 镜像（GitHub Release 镜像，免梯子）。
 # 2026-11 实测：NJU 可直接下；USTC 回 HTML、SJTU 回源 GitHub、TUNA 没有，故只列 NJU。
@@ -940,8 +964,30 @@ def _make_venv(base_python: str, venv_dir: Path, progress, label: str) -> Path:
     code, tail = _run_stream([base_python, "-m", "venv", str(venv_dir)], progress, f"创建 {label}")
     if code != 0 or not python.is_file():
         raise RuntimeError(f"创建 {label} 虚拟环境失败：{tail[-1200:]}")
+    # 有些 Python 发行版（便携版 / 被裁剪的嵌入式版）建出来的 venv 不带 pip，
+    # 后面所有 _pip 都会报 "No module named pip"。先用 ensurepip 补上。
+    if not _venv_has_pip(python):
+        _say(f"{label}: venv 里没有 pip，用 ensurepip 补装")
+        code_b, tail_b = _run_stream([str(python), "-m", "ensurepip", "--upgrade"],
+                                     progress, f"{label} 补装 pip")
+        # ensurepip 报 0 也可能没装上（被裁剪的发行版）：以「能不能 -m pip」为准
+        if not _venv_has_pip(python):
+            raise RuntimeError(
+                f"{label} 的 pip 无法安装（ensurepip 退出码 {code_b}）：{tail_b[-600:]}")
     _pip(python, ["--upgrade", "pip", "setuptools", "wheel"], progress, f"{label} 基础工具")
     return python
+
+
+def _venv_has_pip(python: Path) -> bool:
+    """这个 venv 里的 python 能不能 ``-m pip``。"""
+    try:
+        proc = subprocess.run([str(python), "-m", "pip", "--version"],
+                              capture_output=True, text=True, errors="replace",
+                              timeout=60,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 _DDSP_PROBE_MODULES = ("librosa", "pyworld", "parselmouth", "torchcrepe", "transformers")
@@ -1033,6 +1079,35 @@ def _torch_index(gpu: dict | None) -> str:
     if not gpu:
         return TORCH_CPU_INDEX
     return TORCH_CU128_INDEX if int(gpu.get("cc_major") or 0) >= 7 else TORCH_CPU_INDEX
+
+
+def _torch_install_args(index: str, force: bool = False) -> list[tuple[list[str], str]]:
+    """装 torch 的尝试序列：官方 index → 阿里云 find-links。
+
+    注意：cu128 的 wheel 只存在于这两个地方，**PyPI / 阿里云 PyPI 上没有**。
+    所以这里绝不能用 ``--extra-index-url`` 混装（pip 会挑 PyPI 的 CPU 版）。
+
+    ``force``：GPU 机上已装成 CPU 版（或没装）时传 True，用 ``--force-reinstall``
+    让 pip 忽略已装的旧版本、从 index 重下正确版本。否则 pip 会保留已装的
+    高版本 CPU wheel（实测 2.14.1+cpu 盖在 2.11.0+cu128 之上，永远 downgrade 不动）。
+    """
+    prefix = ["--force-reinstall"] if force else []
+    attempts: list[tuple[list[str], str]] = [
+        (["--index-url", index] + prefix + ["torch", "torchaudio"], "官方 index"),
+    ]
+    if index == TORCH_CU128_INDEX:
+        attempts.append((["-f", TORCH_CU128_FIND_LINKS] + prefix + ["torch", "torchaudio"], "阿里云镜像"))
+    return attempts
+
+
+def _torch_fallback_args(index: str) -> list[str]:
+    """官方 torch index 失败时的回落参数（阿里云 find-links）；没有对应镜像返回 []。
+
+    只给 cu128 配了镜像（S1 实测过的那一个）；CPU 版体积小、官方源够用。
+    """
+    if index == TORCH_CU128_INDEX:
+        return ["-f", TORCH_CU128_FIND_LINKS, "torch", "torchaudio"]
+    return []
 
 
 def _ensure_repo(paths: dict, progress) -> None:
@@ -1491,7 +1566,8 @@ def check_dependencies(paths: dict, probe: dict | None = None) -> dict:
                        host_version, required=True,
                        fix="" if host_ok else "需要 Python 3.9+ 运行插件"))
 
-    ff = runtime.ffmpeg_status(str((paths.get("raw") or {}).get("ffmpeg_path") or ""))
+    ff = runtime.ffmpeg_status(str((paths.get("raw") or {}).get("ffmpeg_path") or ""),
+                               paths.get("compute_root"))
     # 分离（audio-separator）必须用系统 PATH 里的 ffmpeg；pip 装的 imageio-ffmpeg 它用不到，
     # 所以不给「pip 安装」按钮，而是提供「用 winget 安装」——只在用户点按钮时执行。
     items.append(_item(
@@ -2060,11 +2136,126 @@ def install_ffmpeg_winget(progress=None, timeout: float = WINGET_TIMEOUT_S) -> d
             "manual": "https://www.gyan.dev/ffmpeg/builds/", "output_summary": summary}
 
 
+def _install_ffmpeg_zip(paths: dict, progress=None) -> dict:
+    """winget 不可用时的 FFmpeg 兜底：下便携 zip 解压到 ``tools\\ffmpeg\\bin``。
+
+    源表取自 ``download_catalog`` 的 ``ffmpeg_zip``（gyan.dev essentials + BtbN 构建走
+    GitHub 镜像），下载交给 S3 的 ``download_engine``（多源测速 + sha256 校验）。
+    解压后的目录结构：``tools\\ffmpeg\\bin\\ffmpeg.exe``；``runtime.ffmpeg_status``
+    会识别它。
+    """
+    prog = progress or (lambda *_: None)
+    try:
+        from . import download_catalog as catalog  # noqa: PLC0415
+        from . import download_engine  # noqa: PLC0415 - 只在兜底时导入
+    except ImportError:  # 独立运行（非包内）时的回退
+        import download_catalog as catalog  # type: ignore[no-redef]  # noqa: PLC0415
+        import download_engine  # type: ignore[no-redef]  # noqa: PLC0415
+
+    spec = catalog.ARTIFACTS.get("ffmpeg_zip") or {}
+    sources = list(spec.get("sources") or [])
+    if not sources:
+        return {"ok": False, "error": "没有可用的 ffmpeg 下载源"}
+
+    root = Path(str(paths.get("compute_root") or "."))
+    dest_dir = root / "tools" / "ffmpeg" / "bin"
+    staging = root / "tools" / "_ffmpeg_dl"
+    try:
+        staging.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {"ok": False, "error": f"无法创建目录：{exc}"}
+
+    archive = staging / "ffmpeg.zip"
+    prog("winget 不可用，改为下载便携版 FFmpeg…")
+    try:
+        download_engine.download(
+            archive, sources, size=int(spec.get("size") or 0),
+            sha256=str(spec.get("sha256") or ""),
+            on_progress=lambda p: prog(f"FFmpeg：{p.bytes_done / 2**20:.0f}/"
+                                       f"{max(1, p.bytes_total) / 2**20:.0f} MB"))
+    except Exception as exc:  # noqa: BLE001 - 兜底失败要把原因带回去
+        return {"ok": False, "error": f"下载失败：{type(exc).__name__}: {str(exc)[:400]}"}
+
+    try:
+        _place_ffmpeg_zip(archive, dest_dir)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"解压失败：{type(exc).__name__}: {str(exc)[:400]}"}
+    finally:
+        try:
+            archive.unlink(missing_ok=True)
+            staging.rmdir()
+        except OSError:
+            pass
+
+    exe = dest_dir / "ffmpeg.exe"
+    if not exe.is_file():
+        return {"ok": False, "error": f"解压后没有 ffmpeg.exe：{dest_dir}"}
+    return {"ok": True, "path": str(exe), "error": ""}
+
+
+def _place_ffmpeg_zip(archive: Path, dest_dir: Path) -> None:
+    """把 gyan / BtbN 的 ffmpeg zip 里的 bin 内容铺到 ``dest_dir``。"""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=str(dest_dir.parent)) as tmp:
+        tmp_path = Path(tmp)
+        _safe_extract(Path(archive), tmp_path)
+        # gyan: ffmpeg-<ver>-essentials_build/bin/ffmpeg.exe
+        # BtbN: ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe
+        bin_dir = next((p for p in sorted(tmp_path.rglob("bin")) if p.is_dir()), None)
+        if bin_dir is None:
+            raise RuntimeError("压缩包里找不到 bin 目录")
+        for entry in bin_dir.iterdir():
+            if not entry.is_file():
+                continue
+            target = dest_dir / entry.name
+            try:
+                if target.exists():
+                    target.unlink()
+                shutil.copy2(entry, target)
+            except OSError as exc:
+                raise RuntimeError(f"复制 {entry.name} 失败：{exc}") from exc
+
+
 # ---------------------------------------------------------------------------
 # Installer
 # ---------------------------------------------------------------------------
 def _item_map(report: dict) -> dict:
     return {i["key"]: i for i in report.get("items", [])}
+
+
+# ---------------------------------------------------------------------------
+# 分级安装（S5）：T0/T1 前台装、T2 交后台守护进程
+# ---------------------------------------------------------------------------
+def _tiering_module():
+    """导入 install_tiering；包内走相对导入，独立运行（测试/CLI）走顶层导入。"""
+    try:
+        from . import install_tiering  # noqa: PLC0415 - 包内
+        return install_tiering
+    except ImportError:
+        import install_tiering  # type: ignore[no-redef]  # noqa: PLC0415 - 顶层
+        return install_tiering
+
+
+def install_tiered(paths: dict, progress, *, features: list | None = None,
+                   tiers: list | None = None, probe: dict | None = None,
+                   allow_optional: bool = False, include_t2: bool = False) -> dict:
+    """按功能与层级安装（见 ``install_tiering.install_tiered``）。
+
+    与 ``install()`` 的区别：T2 项默认**不下载**，放在返回值的 ``deferred`` 里，
+    由 S6 交给后台守护进程。不传 ``features``/``tiers`` 时等价于只装 T0+T1。
+    """
+    install_tiering = _tiering_module()
+    return install_tiering.install_tiered(
+        sys.modules[__name__], paths, features=features, tiers=tiers,
+        progress=progress, probe=probe, allow_optional=allow_optional,
+        include_t2=include_t2)
+
+
+def check_dependencies_tiered(paths: dict, probe: dict | None = None,
+                              features: list | None = None) -> dict:
+    """``check_dependencies`` + ``feature``/``tier`` 标注与 ``features`` 汇总段。"""
+    install_tiering = _tiering_module()
+    return install_tiering.check_tiered(sys.modules[__name__], paths, probe, features)
 
 
 def install(paths: dict, items: list[str] | None, progress, probe: dict | None = None) -> dict:
@@ -2153,17 +2344,39 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
     index = _torch_index(gpu)
     torch_label = "CUDA 12.8" if index == TORCH_CU128_INDEX else "CPU"
     if "torch" in requested and synth_py.is_file():
-        try:
-            _pip(synth_py, ["--index-url", index, "torch", "torchaudio"], progress,
-                 f"安装 torch/torchaudio（{torch_label}）", head="PyTorch / torchaudio")
-            installed.append("torch")
-        except Exception as exc:  # noqa: BLE001
-            errors.append({"item": "torch", "error": str(exc)})
+        # D2 修复：GPU 机上已装 CPU torch（或还没装）时，强制重装成 cu128。
+        # 否则 pip 看到已装的 2.14.1+cpu 就不 downgrade 到 2.11.0+cu128，
+        # check_dependencies 永远判 mismatch → base_completed 永远 false。
+        force_torch = (index == TORCH_CU128_INDEX
+                       and not runtime.has_cuda_build(synth_py))
+        torch_errors: list[str] = []
+        for targs, tag in _torch_install_args(index, force=force_torch):
+            try:
+                _pip(synth_py, targs, progress,
+                     f"安装 torch/torchaudio（{torch_label}·{tag}）",
+                     head="PyTorch / torchaudio")
+                installed.append("torch")
+                torch_errors = []
+                break
+            except Exception as exc:  # noqa: BLE001 - 换下一档
+                torch_errors.append(f"{tag}: {str(exc)[:400]}")
+        if torch_errors:
+            errors.append({"item": "torch", "error": "；".join(torch_errors)[-900:]})
     if ("synth_env" in requested or "ddsp_deps" in requested) and synth_py.is_file():
         try:
             tv = _torch_pin(synth_py)
-            extra = ([f"torch=={tv}", f"torchaudio=={tv}", "--extra-index-url", index] if tv else [])
-            _pip(synth_py, DDSP_PACKAGES + extra, progress, "安装 DDSP-SVC 依赖", head="安装 DDSP-SVC 依赖")
+            # 注意：带本地版本号（+cu128 / +cpu）的 torch 只有 PyTorch 官方 index 有。
+            # 若把它和普通依赖一起丢给「阿里云 PyPI + --extra-index-url」，pip 会从
+            # PyPI 解析到同名但无后缀的版本（实测装成 torch 2.14.1+cpu，把 GPU 版换掉）。
+            # 所以：先单独 pin 住 torch（只走它的 index），再装其余依赖。
+            if tv:
+                _pip(synth_py, [f"torch=={tv}", f"torchaudio=={tv}", "--index-url", index],
+                     progress, "冻结 torch 版本", head="安装 DDSP-SVC 依赖")
+                _pip(synth_py, DDSP_PACKAGES, progress,
+                     "安装 DDSP-SVC 依赖", head="安装 DDSP-SVC 依赖")
+            else:
+                _pip(synth_py, DDSP_PACKAGES, progress,
+                     "安装 DDSP-SVC 依赖", head="安装 DDSP-SVC 依赖")
             installed.append("synth_deps")
             invalidate_deps_cache(synth_py)
         except Exception as exc:  # noqa: BLE001
@@ -2179,6 +2392,8 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
     if "ffmpeg" in requested:
         # 人声分离（audio-separator）要用系统 PATH 里的 ffmpeg，pip 的 imageio-ffmpeg 它用不到，
         # 所以这里改成调 winget 装系统版；只有用户点「安装」才走到这。
+        # S5：winget 不可用（无 winget / 商店被禁 / 公司网络）时，兜底下载便携 zip
+        # 解压到 <compute_root>\tools\ffmpeg\bin；runtime.ffmpeg_status 已能识别该目录。
         try:
             res = install_ffmpeg_winget(progress)
         except Exception as exc:  # noqa: BLE001
@@ -2187,8 +2402,15 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
             if res.get("detected"):
                 installed.append("ffmpeg")
             else:
-                errors.append({"item": "ffmpeg", "error": res.get("error") or "FFmpeg 安装未成功",
-                               "need_restart": bool(res.get("need_restart"))})
+                fallback = _install_ffmpeg_zip(paths, progress)
+                if fallback.get("ok"):
+                    installed.append("ffmpeg")
+                else:
+                    errors.append({"item": "ffmpeg",
+                                   "error": res.get("error") or "FFmpeg 安装未成功",
+                                   "need_restart": bool(res.get("need_restart"))})
+                    if fallback.get("error"):
+                        errors[-1]["fallback_error"] = str(fallback["error"])[:300]
 
     if sep_py.is_file() and ("sep_env" in requested or "audio_separator" in requested):
         # 和合成共用一个环境时 torch 已经装过，不再重复装
@@ -2203,11 +2425,14 @@ def install(paths: dict, items: list[str] | None, progress, probe: dict | None =
             pins = list(SEP_PACKAGES)
             tv = _torch_pin(sep_py)
             if tv:
-                # 第五十九轮实测：不钉 torch 时 pip 会从普通 PyPI 拉 CPU 版 torch 2.15 把显卡版换掉
-                pins += [f"torch=={tv}", f"torchaudio=={tv}"]
+                # 第五十九轮实测：不钉 torch 时 pip 会从普通 PyPI 拉 CPU 版 torch 2.15 把显卡版换掉。
+                # 带 +cu128/+cpu 的本地版本号只存在于 PyTorch index，必须单独用
+                # --index-url 装（用 --extra-index-url 时 pip 仍会选 PyPI 的无后缀版）。
+                _pip(sep_py, [f"torch=={tv}", f"torchaudio=={tv}", "--index-url", index],
+                     progress, "冻结分离环境 torch 版本", head="audio-separator")
             if shared:
                 pins += [x for x in DDSP_PACKAGES if "==" in x and x.split("==")[0] not in {y.split("==")[0] for y in pins}]
-            _pip(sep_py, pins + (["--extra-index-url", index] if tv else []), progress,
+            _pip(sep_py, pins, progress,
                  "安装 audio-separator 依赖", head="audio-separator")
             installed.append("audio_separator")
         except Exception as exc:  # noqa: BLE001
