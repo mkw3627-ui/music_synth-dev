@@ -9,12 +9,13 @@ from __future__ import annotations
 import json
 import sys
 import types
+from importlib import import_module
 from pathlib import Path
 
 import pytest
 
-import download_catalog as catalog
-import install_tiering as T
+catalog = import_module("download_catalog")
+T = import_module("install_tiering")
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 

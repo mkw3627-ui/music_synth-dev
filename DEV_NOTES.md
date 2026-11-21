@@ -2096,3 +2096,15 @@ numpy 2.2.6、transformers 4.41.2；引导页各项全部就绪；变声、人�
 **发版前修的市场 CI 阻断**
 - CI 的 ruff 规则是 `E4,E7,E9,F,I` 且带 `--ignore-noqa`（本地 `# noqa` 无效）。把各文件 `sys.path.insert` 后的导入改成 `importlib.import_module`，测试统一由 `conftest.py` 注入路径。
 - Linux CI 上跑测试：给依赖 Windows 进程语义（taskkill / CREATE_NEW_PROCESS_GROUP / msvcrt 锁）与 Windows 解释器命名规则的用例加了 `skipif(os.name != "nt")`；产品代码本身已有 `fcntl` 回退，未为兼容性改动。
+
+### 0.3.7 CI 失败（标签保留，未发布成功）
+
+- `v0.3.7` 的 Verify / Release 两个工作流都挂在同一个 **Ruff check** 步骤（exit 1），后续打包、Market release check、上传全部 skipped，所以 GitHub Release `v0.3.7` **没有 `.neko-plugin` 附件**。
+- 根因：`ruff 0.12.4` 在 `--isolated` 下按运行目录判定本地模块归属。CI 从工作区根扫描 `plugin-repo/`，把 `download_engine` / `download_catalog` / `download_entries` / `install_tiering` 当成 third-party，要求与 `pytest` 合并成一个 import 块；而在仓库根跑 `ruff --fix` 得到的是 first-party 布局（本地模块另起一块）。两种排序互斥，纯重排修不掉。
+- 标签 `v0.3.7` 保留不删（按既定回滚路径），本版号不对外发布。
+
+### 0.3.8 修复 CI Ruff I001 后发版
+
+- 修复：4 个测试文件（`test_config_wiring_s12.py`、`test_download_engine.py`、`test_entries_dl.py`、`test_tiering.py`）里的本地模块导入改用布局无关的 `E = import_module("download_engine")` 写法（与 `conftest.py` / `test_ace_daemon.py` / `test_download_daemon.py` 既有惯例一致）。用法不变，行为零变化。
+- 验证：用 CI 同款 `ruff 0.12.4`，**CI 布局**（工作区根扫 `plugin-repo/`）与**仓库根布局**都是 `All checks passed!`；pytest 368 passed / 17 skipped；4 个 node 套件 exit=0；守护进程单独运行无 ImportError。
+- 本版只改 `plugin.toml` 版本号与上述测试文件，产品代码零改动。

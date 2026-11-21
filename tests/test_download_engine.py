@@ -8,12 +8,13 @@ import hashlib
 import threading
 import time
 import types
+from importlib import import_module
 from pathlib import Path
 
 import pytest
 from dl_harness.fake_mirrors import KB, MB, Fault, make_content
 
-import download_engine as E
+E = import_module("download_engine")
 
 # 测试用的快参数：窗口/卡死缩短，避免每条用例等几十秒
 FAST = dict(

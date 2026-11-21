@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import json
 import time
+from importlib import import_module
 from pathlib import Path
 
 import pytest
 
-import download_catalog as catalog
-import download_entries as de
+catalog = import_module("download_catalog")
+de = import_module("download_entries")
 
 
 # ---------------------------------------------------------------------------

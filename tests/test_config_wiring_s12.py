@@ -5,12 +5,13 @@ S11 只把 10 个键写进 plugin.toml（默认值 + 注释），没有运行时
 """
 from __future__ import annotations
 
+from importlib import import_module
 from pathlib import Path
 
 import pytest
 
-import download_engine as E
-import download_entries as DE
+E = import_module("download_engine")
+DE = import_module("download_entries")
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 
